@@ -76,7 +76,8 @@ class Int8Config(QuantizationConfig):
         )
         if ignored_layers:
             ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
-        quant_method = config.get("quantization_method", "")
+        # HF/sglang 约定字段名为 quant_method（非 quantization_method）
+        quant_method = config.get("quant_method", "")
         is_serialized = "int8" in quant_method
         return cls(
             ignored_layers=ignored_layers,
