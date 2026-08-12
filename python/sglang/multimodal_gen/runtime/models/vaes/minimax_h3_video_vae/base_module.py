@@ -74,6 +74,10 @@ class FeedForward(nn.Module):
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w1(hidden_states)
+        # DEBUG(fast-h3 INT8 排障, 临时)
+        if torch.isnan(hidden_states).any():
+            with open("/tmp/h3-nan-debug.log", "a") as f:
+                f.write(f"[ffn-w1] NaN={int(torch.isnan(hidden_states).sum())}\n")
 
         if self.use_gated:
             if (
@@ -89,8 +93,16 @@ class FeedForward(nn.Module):
                 hidden_states = self.act_fn(gate).mul_(hidden_states)
         else:
             hidden_states = self.act_fn(hidden_states)
+        # DEBUG(fast-h3 INT8 排障, 临时)
+        if torch.isnan(hidden_states).any():
+            with open("/tmp/h3-nan-debug.log", "a") as f:
+                f.write(f"[ffn-act] NaN={int(torch.isnan(hidden_states).sum())}\n")
 
         hidden_states = self.w2(hidden_states)
+        # DEBUG(fast-h3 INT8 排障, 临时)
+        if torch.isnan(hidden_states).any():
+            with open("/tmp/h3-nan-debug.log", "a") as f:
+                f.write(f"[ffn-w2] NaN={int(torch.isnan(hidden_states).sum())}\n")
         return hidden_states
 
     def _get_forward_impl(self):
