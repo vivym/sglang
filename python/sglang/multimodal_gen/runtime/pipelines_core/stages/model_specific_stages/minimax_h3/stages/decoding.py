@@ -355,7 +355,21 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     server_args,
                     decode_fn=selected_video_vae.decode_base,
                 )
+                # DEBUG(fast-h3 INT8 排障, 临时): 文件日志
+                with open("/tmp/h3-nan-debug.log", "a") as f:
+                    n_nan = int(torch.isnan(visual_decode_latent).sum())
+                    n_inf = int(torch.isinf(visual_decode_latent).sum())
+                    m_abs = float(visual_decode_latent.abs().max())
+                    f.write(
+                        f"[video-decode-in] fp16 latents NaN={n_nan} inf={n_inf} "
+                        f"max_abs={m_abs:.4f}\n"
+                    )
                 visual_frames = video_decode(visual_decode_latent)
+                with open("/tmp/h3-nan-debug.log", "a") as f:
+                    f.write(
+                        f"[video-decode-out] NaN={int(torch.isnan(visual_frames).sum())} "
+                        f"max_abs={float(visual_frames.abs().max()):.4f}\n"
+                    )
                 visual_frames = selected_video_vae.processor.revert_tensor(
                     visual_frames
                 )
