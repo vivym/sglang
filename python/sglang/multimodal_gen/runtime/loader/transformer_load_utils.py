@@ -610,6 +610,18 @@ def _resolve_quant_config(
             quant_kwargs["ignored_layers"] = getattr(
                 server_args, "quantization_ignored_layers", None
             )
+        if server_args.quantization == "int8" and server_args.transformer_weights_path:
+            # fast-h3: 序列化 int8 checkpoint —— 优先从 int8 目录 config.json
+            # 的 quantization_config 检测 is_checkpoint_int8_serialized，
+            # 使 create_weights 直接建 int8 权重（避免 BF16 加载峰值）。
+            override_cfg = os.path.join(
+                server_args.transformer_weights_path, "config.json"
+            )
+            if os.path.isfile(override_cfg):
+                with open(override_cfg, encoding="utf-8") as f:
+                    quant_cfg = json.load(f).get("quantization_config")
+                if quant_cfg:
+                    return quant_cls.from_config(quant_cfg)
         return quant_cls(**quant_kwargs)
 
     quant_config = get_quant_config(hf_config, component_model_path)
