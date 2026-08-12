@@ -253,6 +253,15 @@ class DecodingStage(PipelineStage):
             with temporary_module_dtype(
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
+                # DEBUG(fast-h3 INT8 排障, 临时): decode 输入 latents 检查
+                n_nan = int(torch.isnan(latents).sum())
+                n_inf = int(torch.isinf(latents).sum())
+                m_abs = float(latents.abs().max()) if latents.numel() else 0.0
+                print(
+                    f"[fast-h3 decode debug] vae_dtype={vae_dtype} "
+                    f"latents NaN={n_nan} inf={n_inf} max_abs={m_abs:.4f}",
+                    flush=True,
+                )
                 try:
                     decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
                 except Exception as error:
