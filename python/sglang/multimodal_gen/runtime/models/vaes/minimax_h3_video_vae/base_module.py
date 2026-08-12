@@ -262,6 +262,10 @@ class TransformerBlock(nn.Module):
             hidden_states.dtype
         )
         attn_output = self.attn(norm_hidden_states, rotary_pos_emb, pack_info)
+        # DEBUG(fast-h3 INT8 排障, 临时): attention/FFN 输出 NaN 检查
+        if torch.isnan(attn_output).any():
+            with open("/tmp/h3-nan-debug.log", "a") as f:
+                f.write(f"[block-attn-out] NaN={int(torch.isnan(attn_output).sum())}\n")
         if self.use_scale:
             hidden_states = _scaled_residual_add(
                 hidden_states, attn_output, self.scale1
@@ -273,6 +277,9 @@ class TransformerBlock(nn.Module):
             hidden_states.dtype
         )
         ff_output = self.ff(norm_hidden_states)
+        if torch.isnan(ff_output).any():
+            with open("/tmp/h3-nan-debug.log", "a") as f:
+                f.write(f"[block-ff-out] NaN={int(torch.isnan(ff_output).sum())}\n")
         if self.use_scale:
             hidden_states = _scaled_residual_add(hidden_states, ff_output, self.scale2)
         else:
