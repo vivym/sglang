@@ -44,9 +44,11 @@ class Int8Config(QuantizationConfig):
     def __init__(
         self,
         ignored_layers: Optional[List[str]] = None,
+        is_checkpoint_int8_serialized: bool = False,
     ):
         super().__init__()
         self.ignored_layers = ignored_layers or []
+        self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
         # H3 的 fused 权重直接按完整名字匹配（如 blocks.0.attn.qkv_proj），无拆分映射
         self.packed_modules_mapping: Dict[str, List[str]] = {}
 
@@ -74,7 +76,12 @@ class Int8Config(QuantizationConfig):
         )
         if ignored_layers:
             ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
-        return cls(ignored_layers=ignored_layers)
+        quant_method = config.get("quantization_method", "")
+        is_serialized = "int8" in quant_method
+        return cls(
+            ignored_layers=ignored_layers,
+            is_checkpoint_int8_serialized=is_serialized,
+        )
 
     def get_quant_method(
         self, layer: Module, prefix: str
@@ -116,12 +123,18 @@ class Int8LinearMethod(QuantizeMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
 
-        # 权重以源 dtype 创建（(N, K)），量化在 process_weights_after_loading
+        # 序列化 checkpoint：直接建 int8 权重 + scale；否则以源 dtype 创建，
+        # 量化在 process_weights_after_loading
+        weight_dtype = (
+            torch.int8
+            if self.quant_config.is_checkpoint_int8_serialized
+            else params_dtype
+        )
         weight = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
-                dtype=params_dtype,
+                dtype=weight_dtype,
             ),
             input_dim=1,
             output_dim=0,
@@ -129,7 +142,28 @@ class Int8LinearMethod(QuantizeMethodBase):
         )
         layer.register_parameter("weight", weight)
 
+        if self.quant_config.is_checkpoint_int8_serialized:
+            # per-channel scale (N, 1)，从 checkpoint 加载
+            weight_scale = ModelWeightParameter(
+                data=torch.empty(
+                    (output_size_per_partition, 1),
+                    dtype=torch.float32,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight_scale", weight_scale)
+
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.quant_config.is_checkpoint_int8_serialized:
+            # 序列化 checkpoint：权重已量化，只需列主序视图
+            layer.weight = Parameter(layer.weight.t(), requires_grad=False)
+            layer.weight_scale = Parameter(
+                layer.weight_scale.data, requires_grad=False
+            )
+            return
+
         weight = layer.weight.data  # (N, K)，源 dtype
 
         # per-channel 对称量化：每输出行 amax / 127
