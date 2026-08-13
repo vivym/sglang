@@ -362,6 +362,23 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     server_args,
                     decode_fn=selected_video_vae.decode_base,
                 )
+                # DEBUG(fast-h3 INT8 排障, 临时): latents dump（分布对比分析用）
+                try:
+                    torch.save(
+                        visual_decode_latent.cpu().float(),
+                        "/tmp/h3-latents-dump.pt",
+                    )
+                    with open("/tmp/h3-nan-debug.log", "a") as f:
+                        q = torch.quantile(
+                            visual_decode_latent.abs().float(), torch.tensor([0.5, 0.9, 0.99, 0.999], device=visual_decode_latent.device)
+                        )
+                        f.write(
+                            f"[latents-dump] shape={list(visual_decode_latent.shape)} "
+                            f"p50={q[0].item():.3f} p90={q[1].item():.3f} "
+                            f"p99={q[2].item():.3f} p999={q[3].item():.3f}\n"
+                        )
+                except Exception:
+                    pass
                 # DEBUG(fast-h3 INT8 排障, 临时): 文件日志
                 with open("/tmp/h3-nan-debug.log", "a") as f:
                     n_nan = int(torch.isnan(visual_decode_latent).sum())
