@@ -75,9 +75,10 @@ class FeedForward(nn.Module):
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w1(hidden_states)
         # DEBUG(fast-h3 INT8 排障, 临时)
-        if torch.isnan(hidden_states).any():
+        n_nan, n_inf = int(torch.isnan(hidden_states).sum()), int(torch.isinf(hidden_states).sum())
+        if n_nan or n_inf:
             with open("/tmp/h3-nan-debug.log", "a") as f:
-                f.write(f"[ffn-w1] NaN={int(torch.isnan(hidden_states).sum())}\n")
+                f.write(f"[ffn-w1] NaN={n_nan} inf={n_inf} max_abs={float(hidden_states.abs().max()):.4f}\n")
 
         if self.use_gated:
             if (
@@ -94,15 +95,17 @@ class FeedForward(nn.Module):
         else:
             hidden_states = self.act_fn(hidden_states)
         # DEBUG(fast-h3 INT8 排障, 临时)
-        if torch.isnan(hidden_states).any():
+        n_nan, n_inf = int(torch.isnan(hidden_states).sum()), int(torch.isinf(hidden_states).sum())
+        if n_nan or n_inf:
             with open("/tmp/h3-nan-debug.log", "a") as f:
-                f.write(f"[ffn-act] NaN={int(torch.isnan(hidden_states).sum())}\n")
+                f.write(f"[ffn-act] NaN={n_nan} inf={n_inf} max_abs={float(hidden_states.abs().max()):.4f}\n")
 
         hidden_states = self.w2(hidden_states)
         # DEBUG(fast-h3 INT8 排障, 临时)
-        if torch.isnan(hidden_states).any():
+        n_nan, n_inf = int(torch.isnan(hidden_states).sum()), int(torch.isinf(hidden_states).sum())
+        if n_nan or n_inf:
             with open("/tmp/h3-nan-debug.log", "a") as f:
-                f.write(f"[ffn-w2] NaN={int(torch.isnan(hidden_states).sum())}\n")
+                f.write(f"[ffn-w2] NaN={n_nan} inf={n_inf} max_abs={float(hidden_states.abs().max()):.4f}\n")
         return hidden_states
 
     def _get_forward_impl(self):
