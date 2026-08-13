@@ -303,6 +303,13 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 waveform = _required_tensor(
                     audio_decode(audio_decode_latent), "audio_vae.decode"
                 )
+                # DEBUG(fast-h3 INT8 排障, 临时): audio decode 输出检查
+                with open("/tmp/h3-nan-debug.log", "a") as f:
+                    f.write(
+                        f"[audio-decode-out] NaN={int(torch.isnan(waveform).sum())} "
+                        f"inf={int(torch.isinf(waveform).sum())} "
+                        f"max_abs={float(waveform.abs().max()):.4f}\n"
+                    )
             return {
                 "waveform": waveform,
                 "sample_rate": int(audio_vae.sample_rate),
