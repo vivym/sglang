@@ -74,6 +74,9 @@ class FeedForward(nn.Module):
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w1(hidden_states)
+        # DEBUG(fast-h3 INT8 排障, 临时): w1 输出值域（激活输入）
+        with open("/tmp/h3-nan-debug.log", "a") as f:
+            f.write(f"[ffn-w1-range] max_abs={float(hidden_states.abs().max()):.4f}\n")
         # DEBUG(fast-h3 INT8 排障, 临时)
         n_nan, n_inf = int(torch.isnan(hidden_states).sum()), int(torch.isinf(hidden_states).sum())
         if n_nan or n_inf:

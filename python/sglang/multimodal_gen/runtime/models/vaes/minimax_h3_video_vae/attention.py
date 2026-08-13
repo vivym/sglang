@@ -144,6 +144,9 @@ class Attention(nn.Module):
         return hidden_states
 
     def perform_attention(self, query, key, value, pack_info={}):
+        if _env_flag("MINIMAX_H3_VAE_ATTN_FP32", "1"):
+            with torch.autocast("cuda", enabled=False):
+                return self._perform_attention(query, key, value, pack_info)
         return self._perform_attention(query, key, value, pack_info)
 
     def forward(
