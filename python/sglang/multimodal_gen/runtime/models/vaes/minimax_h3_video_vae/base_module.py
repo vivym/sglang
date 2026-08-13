@@ -87,11 +87,18 @@ class FeedForward(nn.Module):
                 and hidden_states.dtype in (torch.float16, torch.bfloat16)
                 and hidden_states.is_contiguous()
                 and hidden_states.shape[-1] % 32 == 0
+                and not _env_flag("MINIMAX_H3_VAE_FFN_FP32_ACT", "1")
             ):
                 hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
             else:
                 gate, hidden_states = hidden_states.chunk(2, dim=-1)
-                hidden_states = self.act_fn(gate).mul_(hidden_states)
+                # fast-h3 修复: fp16/bf16 下 silu 的 exp 溢出（|x|>11/88）产生 NaN
+                # （INT8 latents 偶发临界值触发）→ 激活在 fp32 计算
+                if _env_flag("MINIMAX_H3_VAE_FFN_FP32_ACT", "1"):
+                    gate = self.act_fn(gate.float()).to(hidden_states.dtype)
+                else:
+                    gate = self.act_fn(gate)
+                hidden_states = gate.mul_(hidden_states)
         else:
             hidden_states = self.act_fn(hidden_states)
         # DEBUG(fast-h3 INT8 排障, 临时)
