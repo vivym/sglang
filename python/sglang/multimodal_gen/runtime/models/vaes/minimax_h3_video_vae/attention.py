@@ -144,9 +144,6 @@ class Attention(nn.Module):
         return hidden_states
 
     def perform_attention(self, query, key, value, pack_info={}):
-        if _env_flag("MINIMAX_H3_VAE_ATTN_FP32", "1"):
-            with torch.autocast("cuda", enabled=False):
-                return self._perform_attention(query, key, value, pack_info)
         return self._perform_attention(query, key, value, pack_info)
 
     def forward(
@@ -158,10 +155,6 @@ class Attention(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
 
         qkv = self.to_qkv(hidden_states)
-        # DEBUG(fast-h3 INT8 排障, 临时)
-        if torch.isnan(qkv).any():
-            with open("/tmp/h3-nan-debug.log", "a") as f:
-                f.write(f"[attn-qkv] NaN={int(torch.isnan(qkv).sum())}\n")
         qkv = qkv.view(batch_size, seq_len, -1, 3 * self.dim_head)
         query, key, value = torch.chunk(qkv, 3, dim=-1)
 
@@ -174,18 +167,8 @@ class Attention(nn.Module):
             query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 
         hidden_states = self.perform_attention(query, key, value, pack_info)
-        # DEBUG(fast-h3 INT8 排障, 临时)
-        if torch.isnan(hidden_states).any():
-            with open("/tmp/h3-nan-debug.log", "a") as f:
-                f.write(
-                    f"[attn-core(flash)] NaN={int(torch.isnan(hidden_states).sum())}\n"
-                )
 
         hidden_states = hidden_states.reshape(batch_size, seq_len, -1)
         hidden_states = self.to_out(hidden_states)
-        # DEBUG(fast-h3 INT8 排障, 临时)
-        if torch.isnan(hidden_states).any():
-            with open("/tmp/h3-nan-debug.log", "a") as f:
-                f.write(f"[attn-out] NaN={int(torch.isnan(hidden_states).sum())}\n")
 
         return hidden_states

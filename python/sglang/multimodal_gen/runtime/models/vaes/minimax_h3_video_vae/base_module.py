@@ -74,14 +74,6 @@ class FeedForward(nn.Module):
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w1(hidden_states)
-        # DEBUG(fast-h3 INT8 排障, 临时): w1 输出值域（激活输入）
-        with open("/tmp/h3-nan-debug.log", "a") as f:
-            f.write(f"[ffn-w1-range] max_abs={float(hidden_states.abs().max()):.4f}\n")
-        # DEBUG(fast-h3 INT8 排障, 临时)
-        n_nan, n_inf = int(torch.isnan(hidden_states).sum()), int(torch.isinf(hidden_states).sum())
-        if n_nan or n_inf:
-            with open("/tmp/h3-nan-debug.log", "a") as f:
-                f.write(f"[ffn-w1] NaN={n_nan} inf={n_inf} max_abs={float(hidden_states.abs().max()):.4f}\n")
 
         if self.use_gated:
             if (
@@ -95,8 +87,10 @@ class FeedForward(nn.Module):
                 hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
             else:
                 gate, hidden_states = hidden_states.chunk(2, dim=-1)
-                # fast-h3 修复: fp16/bf16 下 silu 的 exp 溢出（|x|>11/88）产生 NaN
-                # （INT8 latents 偶发临界值触发）→ 激活在 fp32 计算
+                # fast-h3: fp16/bf16 下 silu 的 exp 在 |x|>11/88 时溢出（VAE FFN
+                # w1 输出值域可达数百），INT8 DiT 的 latents 确定性触发该路径，
+                # 产生 NaN 并扩散。激活在 fp32 计算可完全避免（默认启用，
+                # MINIMAX_H3_VAE_FFN_FP32_ACT=0 可回退官方 kernel 行为）。
                 if _env_flag("MINIMAX_H3_VAE_FFN_FP32_ACT", "1"):
                     gate = self.act_fn(gate.float()).to(hidden_states.dtype)
                 else:
@@ -104,18 +98,8 @@ class FeedForward(nn.Module):
                 hidden_states = gate.mul_(hidden_states)
         else:
             hidden_states = self.act_fn(hidden_states)
-        # DEBUG(fast-h3 INT8 排障, 临时)
-        n_nan, n_inf = int(torch.isnan(hidden_states).sum()), int(torch.isinf(hidden_states).sum())
-        if n_nan or n_inf:
-            with open("/tmp/h3-nan-debug.log", "a") as f:
-                f.write(f"[ffn-act] NaN={n_nan} inf={n_inf} max_abs={float(hidden_states.abs().max()):.4f}\n")
 
         hidden_states = self.w2(hidden_states)
-        # DEBUG(fast-h3 INT8 排障, 临时)
-        n_nan, n_inf = int(torch.isnan(hidden_states).sum()), int(torch.isinf(hidden_states).sum())
-        if n_nan or n_inf:
-            with open("/tmp/h3-nan-debug.log", "a") as f:
-                f.write(f"[ffn-w2] NaN={n_nan} inf={n_inf} max_abs={float(hidden_states.abs().max()):.4f}\n")
         return hidden_states
 
     def _get_forward_impl(self):
@@ -287,10 +271,6 @@ class TransformerBlock(nn.Module):
             hidden_states.dtype
         )
         attn_output = self.attn(norm_hidden_states, rotary_pos_emb, pack_info)
-        # DEBUG(fast-h3 INT8 排障, 临时): attention/FFN 输出 NaN 检查
-        if torch.isnan(attn_output).any():
-            with open("/tmp/h3-nan-debug.log", "a") as f:
-                f.write(f"[block-attn-out] NaN={int(torch.isnan(attn_output).sum())}\n")
         if self.use_scale:
             hidden_states = _scaled_residual_add(
                 hidden_states, attn_output, self.scale1
@@ -302,9 +282,6 @@ class TransformerBlock(nn.Module):
             hidden_states.dtype
         )
         ff_output = self.ff(norm_hidden_states)
-        if torch.isnan(ff_output).any():
-            with open("/tmp/h3-nan-debug.log", "a") as f:
-                f.write(f"[block-ff-out] NaN={int(torch.isnan(ff_output).sum())}\n")
         if self.use_scale:
             hidden_states = _scaled_residual_add(hidden_states, ff_output, self.scale2)
         else:

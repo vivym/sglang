@@ -350,16 +350,8 @@ class ViT3DDecoder(ViTBase):
                     rotary_pos_emb,
                 )
 
-        for i, block in enumerate(self.transformer_blocks):
-            # DEBUG(fast-h3 INT8 排障, 临时): 逐 block NaN 检查
-            n_before = int(torch.isnan(hidden_states).sum())
+        for block in self.transformer_blocks:
             hidden_states = block(hidden_states, rotary_pos_emb, pack_info)
-            n_after = int(torch.isnan(hidden_states).sum())
-            if n_after > 0:
-                with open("/tmp/h3-nan-debug.log", "a") as f:
-                    f.write(
-                        f"[vae-decoder block {i}] in_NaN={n_before} out_NaN={n_after}\n"
-                    )
 
         hidden_states = self.norm_out(hidden_states)
 

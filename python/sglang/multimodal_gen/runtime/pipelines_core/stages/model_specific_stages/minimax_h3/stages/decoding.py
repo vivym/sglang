@@ -303,13 +303,6 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 waveform = _required_tensor(
                     audio_decode(audio_decode_latent), "audio_vae.decode"
                 )
-                # DEBUG(fast-h3 INT8 排障, 临时): audio decode 输出检查
-                with open("/tmp/h3-nan-debug.log", "a") as f:
-                    f.write(
-                        f"[audio-decode-out] NaN={int(torch.isnan(waveform).sum())} "
-                        f"inf={int(torch.isinf(waveform).sum())} "
-                        f"max_abs={float(waveform.abs().max()):.4f}\n"
-                    )
             return {
                 "waveform": waveform,
                 "sample_rate": int(audio_vae.sample_rate),
@@ -362,38 +355,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     server_args,
                     decode_fn=selected_video_vae.decode_base,
                 )
-                # DEBUG(fast-h3 INT8 排障, 临时): latents dump（分布对比分析用）
-                try:
-                    torch.save(
-                        visual_decode_latent.cpu().float(),
-                        "/tmp/h3-latents-dump.pt",
-                    )
-                    with open("/tmp/h3-nan-debug.log", "a") as f:
-                        q = torch.quantile(
-                            visual_decode_latent.abs().float(), torch.tensor([0.5, 0.9, 0.99, 0.999], device=visual_decode_latent.device)
-                        )
-                        f.write(
-                            f"[latents-dump] shape={list(visual_decode_latent.shape)} "
-                            f"p50={q[0].item():.3f} p90={q[1].item():.3f} "
-                            f"p99={q[2].item():.3f} p999={q[3].item():.3f}\n"
-                        )
-                except Exception:
-                    pass
-                # DEBUG(fast-h3 INT8 排障, 临时): 文件日志
-                with open("/tmp/h3-nan-debug.log", "a") as f:
-                    n_nan = int(torch.isnan(visual_decode_latent).sum())
-                    n_inf = int(torch.isinf(visual_decode_latent).sum())
-                    m_abs = float(visual_decode_latent.abs().max())
-                    f.write(
-                        f"[video-decode-in] fp16 latents NaN={n_nan} inf={n_inf} "
-                        f"max_abs={m_abs:.4f}\n"
-                    )
                 visual_frames = video_decode(visual_decode_latent)
-                with open("/tmp/h3-nan-debug.log", "a") as f:
-                    f.write(
-                        f"[video-decode-out] NaN={int(torch.isnan(visual_frames).sum())} "
-                        f"max_abs={float(visual_frames.abs().max()):.4f}\n"
-                    )
                 visual_frames = selected_video_vae.processor.revert_tensor(
                     visual_frames
                 )

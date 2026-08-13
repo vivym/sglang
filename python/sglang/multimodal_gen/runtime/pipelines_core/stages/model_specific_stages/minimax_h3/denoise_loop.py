@@ -477,14 +477,6 @@ def minimax_h3_denoise_loop(
                     v_video, v_audio = model(**fk)
                 else:
                     v_video, v_audio = model_forward(model, fk, step)
-                # DEBUG(fast-h3 INT8 排障, 临时): 逐步 NaN 检测
-                if torch.isnan(v_video).any() or torch.isnan(v_audio).any():
-                    print(
-                        f"[fast-h3 NaN debug] step={step} "
-                        f"v_video NaN={int(torch.isnan(v_video).sum())} "
-                        f"v_audio NaN={int(torch.isnan(v_audio).sum())}",
-                        flush=True,
-                    )
                 # The model outputs are inference tensors. Keep their disposable
                 # fp32 velocity updates in the same context so ``out=velocity``
                 # can reuse the output storage without an extra clone.
