@@ -1156,7 +1156,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             bias=True,
             gather_output=True,
             params_dtype=_BF16_DTYPE,
-            quant_config=quant_config,
+            # 文本条件投影保留全精度（官方 int8 release 一致：condition projection 不量化）
+            quant_config=None,
             prefix="condition_proj",
         )
         self.time_embedder = MiniMaxH3TimeEmbedder(
@@ -1166,7 +1167,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
-            quant_config,
+            # token refiner 保留全精度（官方 int8 release 一致：token refiner 不量化）
+            None,
             prefix="token_refiner",
         )
         self.blocks = nn.ModuleList(
