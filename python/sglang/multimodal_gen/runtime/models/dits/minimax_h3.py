@@ -620,6 +620,18 @@ class MiniMaxH3Attention(nn.Module):
         # rank-local FSDP must reorder grouped QKV before selecting each shard
         weight.rank_local_weight_transform = _reorder_checkpoint_weight
 
+        # 序列化 INT8 的 per-channel weight_scale 也要用与 weight 相同的行重排。
+        # 否则 weight 被重排成 [Q_all,K_all,V_all] 而 scale 仍按 grouped 布局加载，
+        # 每行 weight 与其 scale 大面积错位（见 docs/h3-int8-qkv-scale-layout-investigation.md，
+        # 实测 98.4% 行错位，MAE 45%）。
+        weight_scale = getattr(self.qkv_proj, "weight_scale", None)
+        if weight_scale is not None:
+            if hasattr(weight_scale, "_weight_loader"):
+                weight_scale._weight_loader = _weight_loader
+            else:
+                weight_scale.weight_loader = _weight_loader
+            weight_scale.rank_local_weight_transform = _reorder_checkpoint_weight
+
     def forward(
         self,
         x: torch.Tensor,
