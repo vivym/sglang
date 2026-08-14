@@ -8,6 +8,7 @@ contract accepts packed inference keyword arguments and returns packed logits.
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -783,17 +784,32 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
-        self.linear = ColumnParallelLinear(
-            arch.time_embed_dim,
-            out_features,
-            bias=True,
-            gather_output=False,
-            params_dtype=_BF16_DTYPE,
-            quant_config=quant_config,
-            prefix=f"{prefix}.linear",
+        # 存表不存参数（默认）：不创建 linear，避免分配 26GB bf16 adaln 权重，
+        # 推理走离线调制表。仅当 MINIMAX_H3_LOAD_ADALN_WEIGHTS=1 时才创建 linear
+        # 回退到在线建表路径。
+        load_weights = (
+            os.environ.get("MINIMAX_H3_LOAD_ADALN_WEIGHTS", "0").strip().lower()
+            in ("1", "true", "yes", "on")
         )
+        if load_weights:
+            self.linear = ColumnParallelLinear(
+                arch.time_embed_dim,
+                out_features,
+                bias=True,
+                gather_output=False,
+                params_dtype=_BF16_DTYPE,
+                quant_config=quant_config,
+                prefix=f"{prefix}.linear",
+            )
+        else:
+            self.linear = None
 
     def project_local(self, adaln_input: torch.Tensor) -> torch.Tensor:
+        if self.linear is None:
+            raise RuntimeError(
+                "adaln_proj.linear is None (offline table mode); "
+                "project_local is only valid with on-demand adaln weights."
+            )
         x, _ = self.linear(adaln_input)
         return x
 
@@ -1266,6 +1282,42 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
         self._adaln_timesteps = timesteps.to(device=device)
 
+    def load_adaln_table(self, path: str) -> None:
+        """Load a pre-built offline AdaLN table artifact (存表不存参数).
+
+        The artifact (built by scripts/build_adaln_table.py) holds the per-block
+        modulation ``blocks.{i}`` [T, 18H], ``final_layer`` [T, 2H] and the sorted
+        ``timesteps`` [T]. Loading it avoids loading the 26GB bf16 adaln projections
+        into GPU at all. ``path`` may be a safetensors file or a directory.
+        """
+        from safetensors.torch import load_file
+
+        import os as _os
+
+        if _os.path.isdir(path):
+            files = sorted(
+                f for f in _os.listdir(path) if f.endswith(".safetensors")
+            )
+            if len(files) != 1:
+                raise ValueError(
+                    f"adaln table dir must contain exactly one .safetensors, got {files}"
+                )
+            path = _os.path.join(path, files[0])
+
+        data = load_file(path, device="cpu")
+        if "timesteps" not in data:
+            raise ValueError("adaln table missing 'timesteps' key")
+        device = self.video_patch_proj.weight.device
+        self._adaln_timesteps = data["timesteps"].to(device=device, dtype=torch.float32)
+        num_blocks = len(self.blocks)
+        self._adaln_table = [
+            data[f"blocks.{i}"].to(device=device, dtype=_BF16_DTYPE)
+            for i in range(num_blocks)
+        ]
+        self._adaln_final_table = data["final_layer"].to(
+            device=device, dtype=_BF16_DTYPE
+        )
+
     def drop_adaln_weights(self) -> int:
         """Delete the per-block and final AdaLN projections after the table is built.
 
@@ -1277,13 +1329,16 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
         for block in self.blocks:
             linear = block.adaln_proj.linear
+            if linear is None:
+                continue
             for param in list(linear.parameters()):
                 freed += param.numel() * param.element_size()
             block.adaln_proj.linear = None
         final_linear = self.final_layer.adaln_proj.linear
-        for param in list(final_linear.parameters()):
-            freed += param.numel() * param.element_size()
-        self.final_layer.adaln_proj.linear = None
+        if final_linear is not None:
+            for param in list(final_linear.parameters()):
+                freed += param.numel() * param.element_size()
+            self.final_layer.adaln_proj.linear = None
         import gc
 
         gc.collect()

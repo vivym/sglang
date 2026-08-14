@@ -384,8 +384,25 @@ def _precompute_rope_cache(
 def _minimax_h3_adaln_precompute_enabled() -> bool:
     import os
 
-    value = os.environ.get("MINIMAX_H3_ADALN_PRECOMPUTE", "0")
+    value = os.environ.get("MINIMAX_H3_ADALN_PRECOMPUTE", "1")
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _minimax_h3_load_adaln_weights() -> bool:
+    """是否加载 bf16 adaln 权重（在线建表）；默认 False = 用离线调制表（存表不存参数）。"""
+    import os
+
+    value = os.environ.get("MINIMAX_H3_LOAD_ADALN_WEIGHTS", "0")
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _minimax_h3_adaln_table_path() -> str:
+    import os
+
+    return os.environ.get(
+        "MINIMAX_H3_ADALN_TABLE_PATH",
+        "/srv/models/MiniMax-H3-adaln-table/steps20.safetensors",
+    )
 
 
 def _maybe_build_adaln_table(
@@ -408,8 +425,6 @@ def _maybe_build_adaln_table(
     drop = getattr(model, "drop_adaln_weights", None)
     if not _minimax_h3_adaln_precompute_enabled():
         return False
-    if not callable(build) or not callable(drop):
-        return False
     video_timesteps = [1.0 - float(s) for s in sigmas_video[:-1]]
     audio_timesteps = [1.0 - float(s) for s in sigmas_audio[:-1]]
     candidates: list[float] = []
@@ -421,9 +436,9 @@ def _maybe_build_adaln_table(
     timesteps = torch.unique(torch.tensor(candidates, dtype=torch.float32), sorted=True)
 
     if getattr(model, "_adaln_table", None) is not None:
-        # 已建表：校验当前请求调度与表一致。表是 schedule 特定的（num_inference_steps
-        # + flow_shift + conditioning），调度一旦变化 searchsorted 会命中错误行，
-        # 静默出坏视频——必须 fail-closed 而不是复用旧表。
+        # 已建表/已加载表：校验当前请求调度与表一致。表是 schedule 特定的
+        # （num_inference_steps + flow_shift + conditioning），调度一旦变化
+        # searchsorted 会命中错误行，静默出坏视频——必须 fail-closed。
         cached = getattr(model, "_adaln_timesteps", None)
         if cached is not None and not torch.equal(cached.detach().cpu(), timesteps):
             raise ValueError(
@@ -435,6 +450,31 @@ def _maybe_build_adaln_table(
             )
         return True
 
+    # 默认：加载离线调制表（存表不存参数，避免把 26GB bf16 adaln 加载进 GPU）。
+    # 仅当 MINIMAX_H3_LOAD_ADALN_WEIGHTS=1 时才回退到在线建表。
+    if not _minimax_h3_load_adaln_weights():
+        table_path = _minimax_h3_adaln_table_path()
+        load = getattr(model, "load_adaln_table", None)
+        if not callable(load):
+            raise RuntimeError(
+                "MiniMax-H3 离线 AdaLN 表模式启用，但模型缺少 load_adaln_table。"
+            )
+        load(table_path)
+        cached = getattr(model, "_adaln_timesteps", None)
+        if cached is None or not torch.equal(cached.detach().cpu(), timesteps):
+            raise ValueError(
+                "MiniMax-H3 离线 AdaLN 表与当前请求调度不匹配：表含 "
+                f"{int(cached.numel()) if cached is not None else -1} 个 timestep，"
+                f"当前请求 {int(timesteps.numel())} 个。请用匹配的 steps/flow_shift "
+                "重建表（scripts/build_adaln_table.py），或设 "
+                "MINIMAX_H3_LOAD_ADALN_WEIGHTS=1 回退在线建表。"
+            )
+        logger.info("AdaLN table loaded from offline artifact: %s", table_path)
+        return True
+
+    # 回退：在线建表（需要 checkpoint 里有 bf16 adaln 权重）
+    if not callable(build) or not callable(drop):
+        return False
     build(timesteps)
     freed = drop()
     logger.info(
