@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -32,6 +33,13 @@ try:
     from sgl_kernel import int8_scaled_mm
 except ImportError:  # pragma: no cover
     int8_scaled_mm = None
+
+
+def _convrot_enabled() -> bool:
+    """ConvRot Hadamard 旋转开关。必须与 checkpoint 的权重旋转（build_int8_transformer.py
+    的 --convrot）保持一致，否则权重/激活旋转不匹配会输出错误。"""
+    value = os.environ.get("MINIMAX_H3_CONVROT", "0")
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 class Int8Config(QuantizationConfig):
@@ -185,6 +193,17 @@ class Int8LinearMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         if int8_scaled_mm is None:
             raise ImportError("sgl_kernel 不可用：缺少 int8_scaled_mm")
+        if _convrot_enabled():
+            from sglang.multimodal_gen.runtime.layers.quantization.convrot import (
+                CONVROT_GROUP_SIZE,
+                build_hadamard,
+                rotate_activation,
+            )
+
+            hadamard = build_hadamard(
+                CONVROT_GROUP_SIZE, device=x.device, dtype=torch.float32
+            )
+            x = rotate_activation(x, hadamard, CONVROT_GROUP_SIZE)
         x_q, x_scale = per_token_quant_int8(x)
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
