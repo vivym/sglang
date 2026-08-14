@@ -42,6 +42,71 @@ def _convrot_enabled() -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+_ACT_STATS = {"plain": 0.0, "conv": 0.0, "norm": 0.0, "n": 0, "dumped": False}
+
+
+def _act_profile_enabled() -> bool:
+    return str(os.environ.get("MINIMAX_H3_ACT_PROFILE", "0")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dump_act_stats() -> None:
+    import json
+
+    path = os.environ.get("MINIMAX_H3_ACT_PROFILE_PATH", "/tmp/opencode/act_profile.json")
+    s = _ACT_STATS
+    out = {
+        "n": s["n"],
+        "plain_rel": s["plain"] / s["norm"] if s["norm"] > 0 else 0.0,
+        "conv_rel": s["conv"] / s["norm"] if s["norm"] > 0 else 0.0,
+    }
+    try:
+        with open(path, "w") as f:
+            json.dump(out, f)
+    except Exception:
+        pass
+    _ACT_STATS["dumped"] = True
+    print(f"[act-profile] dumped {out} -> {path}", flush=True)
+
+
+def _maybe_profile_activation(x: torch.Tensor) -> None:
+    """env 门控：在真实激活上度量 plain / convrot 两种 per-token 量化误差。"""
+    if not _act_profile_enabled() or _ACT_STATS["dumped"]:
+        return
+    try:
+        from sglang.multimodal_gen.runtime.layers.quantization.convrot import (
+            CONVROT_GROUP_SIZE,
+            build_hadamard,
+            rotate_activation,
+        )
+
+        def qerr(t: torch.Tensor) -> float:
+            scale = t.abs().amax(-1, keepdim=True) / 127.0
+            scale = torch.clamp(scale, min=1e-12)
+            dq = torch.round(t / scale).clamp(-128, 127) * scale
+            return (dq - t).pow(2).sum().item()
+
+        xf = x.detach().float()
+        e_plain = qerr(xf)
+        h = build_hadamard(CONVROT_GROUP_SIZE, device=x.device, dtype=torch.float32)
+        x_rot = rotate_activation(x, h, CONVROT_GROUP_SIZE).float()
+        e_conv = qerr(x_rot)
+        _ACT_STATS["plain"] += e_plain
+        _ACT_STATS["conv"] += e_conv
+        _ACT_STATS["norm"] += xf.pow(2).sum().item()
+        _ACT_STATS["n"] += 1
+        if _ACT_STATS["n"] >= 3000:
+            _dump_act_stats()
+    except Exception as e:
+        import sys
+
+        print(f"[act-profile] error: {e}", file=sys.stderr, flush=True)
+
+
 class Int8Config(QuantizationConfig):
     """W8A8 INT8 在线量化配置（扩散运行时）。
 
@@ -193,6 +258,7 @@ class Int8LinearMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         if int8_scaled_mm is None:
             raise ImportError("sgl_kernel 不可用：缺少 int8_scaled_mm")
+        _maybe_profile_activation(x)
         if _convrot_enabled():
             from sglang.multimodal_gen.runtime.layers.quantization.convrot import (
                 CONVROT_GROUP_SIZE,
