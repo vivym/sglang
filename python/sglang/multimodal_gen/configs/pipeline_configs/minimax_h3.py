@@ -213,7 +213,19 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         The video VAE decoder's layerwise offload is ~13.7x slower than resident
         on PCIe Gen2 (per-layer sync overhead, not bandwidth), so MiniMax-H3 pins
         the VAE resident regardless of ``performance_mode`` or explicit flags.
+
+        诊断逃生门：``MINIMAX_H3_FORCE_VAE_RESIDENT=0`` 可关闭强制常驻（仅用于
+        对照实验，如 AdaLN on/off 需要腾内存的场景），默认强制。
         """
+        if (
+            os.environ.get("MINIMAX_H3_FORCE_VAE_RESIDENT", "1").strip().lower()
+            in ("0", "false", "no", "off")
+        ):
+            logger.warning(
+                "MiniMax-H3 VAE force-resident DISABLED via "
+                "MINIMAX_H3_FORCE_VAE_RESIDENT=0 (diagnostic only)."
+            )
+            return
         changed = []
 
         components = server_args.layerwise_offload_components
