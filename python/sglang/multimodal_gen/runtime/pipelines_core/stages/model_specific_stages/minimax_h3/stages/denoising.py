@@ -380,6 +380,58 @@ def _precompute_rope_cache(
     return True
 
 
+def _minimax_h3_adaln_precompute_enabled() -> bool:
+    import os
+
+    value = os.environ.get("MINIMAX_H3_ADALN_PRECOMPUTE", "0")
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _maybe_build_adaln_table(
+    model: Any,
+    *,
+    sigmas_video: list[float],
+    sigmas_audio: list[float],
+    imgvid_cond: float,
+    audio_ref_cond: float,
+) -> bool:
+    """Precompute the per-block AdaLN modulation table and drop the projections.
+
+    Only fires when ``MINIMAX_H3_ADALN_PRECOMPUTE`` is set and the model exposes
+    ``build_adaln_table`` / ``drop_adaln_weights``. The distinct-timestep union is
+    built exactly like the denoise loop's ``_expand_step_timesteps`` (target
+    video/audio timesteps plus the conditioning noise-augmentation levels), so the
+    per-step ``unique_timesteps`` are always a subset of the table.
+    """
+    build = getattr(model, "build_adaln_table", None)
+    drop = getattr(model, "drop_adaln_weights", None)
+    if not _minimax_h3_adaln_precompute_enabled():
+        return False
+    if not callable(build) or not callable(drop):
+        return False
+    if getattr(model, "_adaln_table", None) is not None:
+        # 已建表（固定调度下跨请求复用）。调度变化时表需重建，但权重已 drop，
+        # 故当前实现只支持固定 num_inference_steps / flow_shift 的部署。
+        return True
+    video_timesteps = [1.0 - float(s) for s in sigmas_video[:-1]]
+    audio_timesteps = [1.0 - float(s) for s in sigmas_audio[:-1]]
+    candidates: list[float] = []
+    for t_v, t_a in zip(video_timesteps, audio_timesteps):
+        candidates.append(float(t_v))
+        candidates.append(float(t_a))
+        candidates.append(max(float(t_v), float(imgvid_cond)))
+        candidates.append(max(float(t_a), float(audio_ref_cond)))
+    timesteps = torch.unique(torch.tensor(candidates, dtype=torch.float32), sorted=True)
+    build(timesteps)
+    freed = drop()
+    logger.info(
+        "AdaLN precompute: %d distinct timesteps, dropped %.2f GB of adaln weights",
+        int(timesteps.numel()),
+        freed / 1e9,
+    )
+    return True
+
+
 class MiniMaxH3DenoisingStage(DenoisingStage):
     def __init__(self, transformer, pipeline=None) -> None:
         super().__init__(
@@ -566,6 +618,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 model,
                 positive,
                 device=device,
+            )
+            _maybe_build_adaln_table(
+                model,
+                sigmas_video=sigmas_video,
+                sigmas_audio=[float(v) for v in ctx.sigmas["audio"]],
+                imgvid_cond=float(imgvid_noise_aug),
+                audio_ref_cond=float(audio_noise_aug),
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
             with (

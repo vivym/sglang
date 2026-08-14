@@ -899,7 +899,8 @@ class MiniMaxH3DiTBlock(nn.Module):
         self.adaln_proj = MiniMaxH3AdalnProj(
             arch,
             arch.adaln_out_features,
-            quant_config,
+            # AdaLN 保留 bf16：推理期「存表不存参数」（build_adaln_table 后 drop 权重）
+            None,
             prefix=f"{prefix}.adaln_proj",
             expand_ratio=6,
             modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
@@ -976,7 +977,8 @@ class MiniMaxH3FinalLayer(nn.Module):
         self.adaln_proj = MiniMaxH3AdalnProj(
             arch,
             arch.final_adaln_out_features,
-            quant_config,
+            # AdaLN 保留 bf16：推理期「存表不存参数」
+            None,
             prefix=f"{prefix}.adaln_proj",
             expand_ratio=2,
             modality_num=1,
@@ -1006,6 +1008,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         *,
         adaln_input: torch.Tensor,
         inverse_indices: torch.Tensor,
+        adaln_params: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project all rows into TP-local video/audio output shards.
 
@@ -1014,7 +1017,9 @@ class MiniMaxH3FinalLayer(nn.Module):
         The model gathers output columns only after selecting live media rows,
         preserving the GEMM shape while reducing collective payload.
         """
-        shift, scale = self.adaln_proj(adaln_input)
+        if adaln_params is None:
+            adaln_params = self.adaln_proj(adaln_input)
+        shift, scale = adaln_params
         h = self.norm(x)
         h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
         # Preserve full precision through both final output projections.
@@ -1188,6 +1193,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             prefix="final_layer",
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
+        # AdaLN 预计算调制表（存表不存参数）。build_adaln_table() 填充后 forward 走查表，
+        # drop_adaln_weights() 后 adaln_proj 权重被释放。
+        self._adaln_table: list[torch.Tensor] | None = None
+        self._adaln_final_table: torch.Tensor | None = None
+        self._adaln_timesteps: torch.Tensor | None = None
         self._mark_missing_params_required()
 
     def _resolve_attention_backend_once(self) -> None:
@@ -1220,6 +1230,67 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             raise ValueError(
                 f"rope.inv_freq must stay fp32 after load, got {rope_inv_freq.dtype}."
             )
+
+    def build_adaln_table(self, timesteps: torch.Tensor) -> None:
+        """Precompute per-block AdaLN modulation for the distinct timesteps.
+
+        ``timesteps`` must be the sorted, deduplicated union of every distinct noise
+        level the schedule will present (target video/audio + conditioning levels).
+        The table is computed from the **unquantized** bf16 adaln projections through
+        the fp32 timestep embedding, matching the reference numerics; every block reads
+        the same ``temb``, so this path must stay exact.
+        """
+        if timesteps.ndim != 1:
+            raise ValueError(f"timesteps must be 1D, got {list(timesteps.shape)}")
+        device = self.video_patch_proj.weight.device
+        t_emb = self.time_embedder(timesteps.to(device=device, dtype=torch.float32))
+        adaln_input = torch.nn.functional.silu(t_emb).to(_BF16_DTYPE)
+        with torch.inference_mode():
+            self._adaln_table = [
+                block.adaln_proj.project_local(adaln_input) for block in self.blocks
+            ]
+            self._adaln_final_table = self.final_layer.adaln_proj.project_local(
+                adaln_input
+            )
+        self._adaln_timesteps = timesteps.to(device=device)
+
+    def drop_adaln_weights(self) -> int:
+        """Delete the per-block and final AdaLN projections after the table is built.
+
+        Returns the number of **bytes** freed (device memory reclaimed on next
+        ``torch.cuda.empty_cache``). Only safe once ``build_adaln_table`` has covered
+        the whole schedule.
+        """
+        freed = 0
+        before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        for block in self.blocks:
+            linear = block.adaln_proj.linear
+            for param in list(linear.parameters()):
+                freed += param.numel() * param.element_size()
+            block.adaln_proj.linear = None
+        final_linear = self.final_layer.adaln_proj.linear
+        for param in list(final_linear.parameters()):
+            freed += param.numel() * param.element_size()
+        self.final_layer.adaln_proj.linear = None
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_allocated()
+        print(
+            f"[drop_adaln_weights] bytes_freed={freed/1e9:.2f}GB "
+            f"cuda_alloc {before/1e9:.2f} -> {after/1e9:.2f} GB",
+            flush=True,
+        )
+        return freed
+
+    def _adaln_global_indices(self, unique_timesteps: torch.Tensor) -> torch.Tensor:
+        """Map each distinct per-step timestep to its row in the global table."""
+        if self._adaln_timesteps is None:
+            raise RuntimeError("AdaLN table not built")
+        return torch.searchsorted(
+            self._adaln_timesteps, unique_timesteps.to(self._adaln_timesteps.dtype)
+        )
 
     @staticmethod
     def _pos_ids(pos_info: Any, key: str) -> torch.Tensor:
@@ -1649,14 +1720,28 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
         block_adaln_params = None
+        adaln_global_idx: torch.Tensor | None = None
+        if self._adaln_table is not None:
+            adaln_global_idx = self._adaln_global_indices(unique_timesteps)
         if self._can_batch_block_adaln():
-            local_adaln = torch.stack(
-                [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
-            )
+            if self._adaln_table is not None:
+                local_adaln = torch.stack(
+                    [table.index_select(0, adaln_global_idx) for table in self._adaln_table]
+                )
+            else:
+                local_adaln = torch.stack(
+                    [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
+                )
             gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
             block_adaln_params = tuple(
                 block.adaln_proj.split_output(output)
                 for block, output in zip(self.blocks, gathered_adaln)
+            )
+        elif self._adaln_table is not None:
+            # TP=1 + AdaLN 表：按全局 timestep 索引查表，走 block 的 adaln_params 通道
+            block_adaln_params = tuple(
+                block.adaln_proj.split_output(table.index_select(0, adaln_global_idx))
+                for block, table in zip(self.blocks, self._adaln_table)
             )
         # With sequence parallelism, shard rows across the group for the
         # block stack. Attention trades sequence for heads internally
@@ -1678,10 +1763,16 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     None if block_adaln_params is None else block_adaln_params[index]
                 ),
             )
+        final_adaln_params = None
+        if self._adaln_final_table is not None:
+            final_adaln_params = self.final_layer.adaln_proj.split_output(
+                self._adaln_final_table.index_select(0, adaln_global_idx)
+            )
         video_logits, audio_logits = self.final_layer(
             hidden,
             adaln_input=adaln_input,
             inverse_indices=block_inverse,
+            adaln_params=final_adaln_params,
         )
         if sp_ws > 1:
             from sglang.multimodal_gen.runtime.distributed.parallel_state import (
