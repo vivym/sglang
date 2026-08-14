@@ -29,6 +29,13 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+# VAE layerwise offload 在 PCIe Gen2 上是灾难性慢（本机实测 decode 10.3s -> 141s，
+# 13.7x），主因是逐层同步开销而非带宽。H3 强制 video/audio VAE 常驻。
+_MINIMAX_H3_VAE_OFFLOAD_NAMES = ("vae", "video_vae", "audio_vae")
 
 
 @dataclass
@@ -176,6 +183,10 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             )
 
     def validate_server_args(self, server_args) -> None:
+        # H3 的 video/audio VAE 必须常驻：VAE layerwise offload 在 PCIe Gen2 上
+        # 因逐层同步开销导致 decode ~13.7x 慢（实测 10.3s -> 141s）。这里从所有
+        # offload 选择里剥掉 VAE，防止后续实验误触。
+        self._force_vae_resident(server_args)
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
         component_backends = server_args.component_attention_backends or {}
@@ -195,6 +206,50 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             selected_attention_backend=selected_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
+
+    def _force_vae_resident(self, server_args) -> None:
+        """Strip VAE offload from every offload selector.
+
+        The video VAE decoder's layerwise offload is ~13.7x slower than resident
+        on PCIe Gen2 (per-layer sync overhead, not bandwidth), so MiniMax-H3 pins
+        the VAE resident regardless of ``performance_mode`` or explicit flags.
+        """
+        changed = []
+
+        components = server_args.layerwise_offload_components
+        if components:
+            stripped = [
+                name for name in components if name not in _MINIMAX_H3_VAE_OFFLOAD_NAMES
+            ]
+            if len(stripped) != len(components):
+                server_args.layerwise_offload_components = stripped or None
+                changed.append(
+                    f"layerwise_offload_components={server_args.layerwise_offload_components}"
+                )
+
+        if server_args.vae_cpu_offload:
+            server_args.vae_cpu_offload = False
+            changed.append("vae_cpu_offload=False")
+
+        cpu_components = server_args.cpu_offload_components
+        if cpu_components:
+            stripped = [
+                name
+                for name in cpu_components
+                if name not in _MINIMAX_H3_VAE_OFFLOAD_NAMES
+            ]
+            if len(stripped) != len(cpu_components):
+                server_args.cpu_offload_components = stripped or None
+                changed.append(
+                    f"cpu_offload_components={server_args.cpu_offload_components}"
+                )
+
+        if changed:
+            logger.warning(
+                "MiniMax-H3 forces the video/audio VAE resident (VAE offload is "
+                "~13.7x slower on PCIe Gen2): %s",
+                "; ".join(changed),
+            )
 
     def select_vae_weight_files(
         self,
