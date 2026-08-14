@@ -5,6 +5,7 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from contextlib import contextmanager
 from functools import partial
@@ -409,10 +410,6 @@ def _maybe_build_adaln_table(
         return False
     if not callable(build) or not callable(drop):
         return False
-    if getattr(model, "_adaln_table", None) is not None:
-        # 已建表（固定调度下跨请求复用）。调度变化时表需重建，但权重已 drop，
-        # 故当前实现只支持固定 num_inference_steps / flow_shift 的部署。
-        return True
     video_timesteps = [1.0 - float(s) for s in sigmas_video[:-1]]
     audio_timesteps = [1.0 - float(s) for s in sigmas_audio[:-1]]
     candidates: list[float] = []
@@ -422,6 +419,22 @@ def _maybe_build_adaln_table(
         candidates.append(max(float(t_v), float(imgvid_cond)))
         candidates.append(max(float(t_a), float(audio_ref_cond)))
     timesteps = torch.unique(torch.tensor(candidates, dtype=torch.float32), sorted=True)
+
+    if getattr(model, "_adaln_table", None) is not None:
+        # 已建表：校验当前请求调度与表一致。表是 schedule 特定的（num_inference_steps
+        # + flow_shift + conditioning），调度一旦变化 searchsorted 会命中错误行，
+        # 静默出坏视频——必须 fail-closed 而不是复用旧表。
+        cached = getattr(model, "_adaln_timesteps", None)
+        if cached is not None and not torch.equal(cached.detach().cpu(), timesteps):
+            raise ValueError(
+                "MiniMax-H3 AdaLN 预计算表与当前请求调度不匹配：已按 "
+                f"{int(cached.numel())} 个 timestep 建表，但当前请求产生 "
+                f"{int(timesteps.numel())} 个。AdaLN precompute 只支持固定 "
+                "num_inference_steps / flow_shift 的部署；请统一请求参数，或关闭 "
+                "MINIMAX_H3_ADALN_PRECOMPUTE。"
+            )
+        return True
+
     build(timesteps)
     freed = drop()
     logger.info(
@@ -999,6 +1012,17 @@ def _publish_full_loop_outputs(
     target_rows = video_rows[positive.video_target_slice]
     # Keep latents on CUDA so decode can reuse them without a device round-trip;
     # decode autocast is enabled only for CUDA inputs.
+    if os.environ.get("MINIMAX_H3_DEBUG_LATENTS", "0").strip().lower() in (
+        "1",
+        "true",
+    ):
+        print(
+            f"[latents] std={target_rows.float().std().item():.4f} "
+            f"abs_mean={target_rows.float().abs().mean().item():.4f} "
+            f"min={target_rows.float().min().item():.4f} "
+            f"max={target_rows.float().max().item():.4f}",
+            flush=True,
+        )
     batch.latents = minimax_h3_unpatchify_video_tokens(
         target_rows,
         latent_shape=[ctx.latent_t, ctx.latent_h // 2, ctx.latent_w // 2, 24],
