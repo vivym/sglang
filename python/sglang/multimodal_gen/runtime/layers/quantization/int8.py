@@ -23,7 +23,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.multimodal_gen.runtime.models.parameter import ModelWeightParameter
+from sglang.multimodal_gen.runtime.models.parameter import (
+    ChannelQuantScaleParameter,
+    ModelWeightParameter,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 
 try:
@@ -283,12 +286,11 @@ class Int8LinearMethod(QuantizeMethodBase):
 
         if self.quant_config.is_checkpoint_int8_serialized:
             # per-channel scale (N, 1)，从 checkpoint 加载
-            weight_scale = ModelWeightParameter(
+            weight_scale = ChannelQuantScaleParameter(
                 data=torch.empty(
                     (output_size_per_partition, 1),
                     dtype=torch.float32,
                 ),
-                input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
             )
