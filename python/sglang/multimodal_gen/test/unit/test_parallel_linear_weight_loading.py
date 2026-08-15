@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.models.parameter import (
     ChannelQuantScaleParameter,
+    ModelWeightParameter,
     PerTensorScaleParameter,
 )
 
@@ -48,6 +49,26 @@ def test_row_parallel_per_channel_scale_is_replicated():
     layer.weight_loader(param, loaded_weight)
 
     assert torch.equal(param.data, loaded_weight)
+
+
+@pytest.mark.parametrize("layer_cls", [ColumnParallelLinear, RowParallelLinear])
+def test_tp1_channel_scale_matches_legacy_model_weight_parameter(layer_cls):
+    layer = layer_cls.__new__(layer_cls)
+    layer.tp_rank = 0
+    loaded_weight = torch.arange(8, dtype=torch.float32).reshape(8, 1)
+    channel_scale = _per_channel_scale(8)
+    legacy_scale = ModelWeightParameter(
+        data=torch.empty_like(loaded_weight),
+        input_dim=1,
+        output_dim=0,
+        weight_loader=lambda *_args, **_kwargs: None,
+    )
+
+    layer.weight_loader(channel_scale, loaded_weight)
+    layer.weight_loader(legacy_scale, loaded_weight)
+
+    assert torch.equal(channel_scale.data, loaded_weight)
+    assert torch.equal(channel_scale.data, legacy_scale.data)
 
 
 @pytest.mark.parametrize("loaded_weight", [torch.tensor(0.25), torch.tensor([0.25])])
