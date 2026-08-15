@@ -206,8 +206,35 @@ class StageProfiler:
         self.start_time = 0.0
         self.log_timing = perf_dump_path_provided or envs.SGLANG_DIFFUSION_STAGE_LOGGING
         self.log_stage_start_end = log_stage_start_end
-        self.capture_memory = capture_memory
+        self.capture_memory = capture_memory or os.environ.get(
+            "SGLANG_H3_MEMORY_PROFILE", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
         self.record_as_step = record_as_step
+
+    def _record_memory(self, event: str) -> None:
+        if not self.capture_memory or not torch.get_device_module().is_available():
+            return
+
+        snapshot = capture_memory_snapshot()
+        if self.metrics is not None:
+            self.metrics.record_memory_snapshot(
+                f"{event}_{self.stage_name}", snapshot
+            )
+
+        free_bytes, total_bytes = torch.get_device_module().mem_get_info()
+        payload = {
+            "event": event,
+            "stage": self.stage_name,
+            "pid": os.getpid(),
+            **snapshot.to_dict(),
+            "device_used_mb": round((total_bytes - free_bytes) / (1024**2), 2),
+            "device_free_mb": round(free_bytes / (1024**2), 2),
+            "device_total_mb": round(total_bytes / (1024**2), 2),
+        }
+        self.logger.info(
+            "SGLANG_H3_MEMORY_PROFILE %s",
+            json.dumps(payload, sort_keys=True),
+        )
 
     def _should_record_as_step(self) -> bool:
         return self.record_as_step or self.stage_name.startswith("denoising_step_")
@@ -244,6 +271,9 @@ class StageProfiler:
 
         if (self.log_timing and self.metrics) or self.log_stage_start_end:
             self._maybe_sync_device()
+            if self.capture_memory and torch.get_device_module().is_available():
+                torch.get_device_module().reset_peak_memory_stats()
+                self._record_memory("before")
             self.start_time = time.perf_counter()
 
         return self
@@ -254,6 +284,7 @@ class StageProfiler:
 
         self._maybe_sync_device()
         execution_time_s = time.perf_counter() - self.start_time
+        self._record_memory("error" if exc_type else "after")
 
         if exc_type:
             self.logger.error(
@@ -275,13 +306,6 @@ class StageProfiler:
                 self.metrics.record_step(execution_time_s)
             else:
                 self.metrics.record_stage(self.stage_name, execution_time_s)
-
-            # capture memory snapshot after stage if requested
-            if self.capture_memory and torch.get_device_module().is_available():
-                snapshot = capture_memory_snapshot()
-                self.metrics.record_memory_snapshot(
-                    f"after_{self.stage_name}", snapshot
-                )
 
         return False
 

@@ -646,9 +646,15 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
 
         placement_managed = self._component_residency_manager is not None
-        if placement_managed:
-            self._manage_dit_use_site(self.transformer, "transformer", batch)
+        nsys_capture = os.environ.get("MINIMAX_H3_NSYS_CAPTURE_DIT", "0") == "1"
+        nsys_capture_started = False
+        if nsys_capture:
+            torch.cuda.synchronize()
+            torch.cuda.profiler.start()
+            nsys_capture_started = True
         try:
+            if placement_managed:
+                self._manage_dit_use_site(self.transformer, "transformer", batch)
             model = _resolve_denoise_model(
                 self.transformer,
                 device,
@@ -712,7 +718,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     ),
                 )
         finally:
-            self._finish_active_component_use()
+            try:
+                self._finish_active_component_use()
+            finally:
+                if nsys_capture_started:
+                    torch.cuda.synchronize()
+                    torch.cuda.profiler.stop()
         _publish_full_loop_outputs(
             ctx,
             batch=batch,
@@ -1070,6 +1081,18 @@ def _publish_full_loop_outputs(
     batch.audio_latents = minimax_h3_unpack_audio_tokens(
         audio_target_rows, audio_t=ctx.audio_t * 2, audio_channel=2
     )
+    dump_path = os.environ.get("MINIMAX_H3_DUMP_LATENTS_PATH", "").strip()
+    if dump_path:
+        dump_parent = os.path.dirname(os.path.abspath(dump_path))
+        os.makedirs(dump_parent, exist_ok=True)
+        torch.save(
+            {
+                "latents": batch.latents.detach().cpu(),
+                "audio_latents": batch.audio_latents.detach().cpu(),
+            },
+            dump_path,
+        )
+        print(f"[latents] saved replay artifact to {dump_path}", flush=True)
 
 
 __all__ = [

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
+
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -55,6 +57,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             try:
                 self._encode_from_plan(batch, plan)
                 self._publish_native_text_conditioning(batch)
+                self._release_encoder_for_memory_profile()
             except Exception:
                 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.material_io import (
                     minimax_h3_cleanup_temp_dirs,
@@ -74,6 +77,28 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 "requests are unsupported."
             )
         return batch
+
+    def _release_encoder_for_memory_profile(self) -> None:
+        """Release resident INT8 weights after encode in diagnostic runs only."""
+
+        enabled = os.environ.get(
+            "SGLANG_H3_MEMORY_PROFILE_RELEASE_ENCODER", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if not enabled or self.text_encoder is None:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        self.text_encoder.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        after = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        logger.info(
+            "SGLANG_H3_MEMORY_PROFILE released text_encoder after encode: "
+            "allocated %.2f -> %.2f MiB",
+            before / (1024**2),
+            after / (1024**2),
+        )
 
     def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs):
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
