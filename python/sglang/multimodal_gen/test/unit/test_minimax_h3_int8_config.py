@@ -69,3 +69,9 @@ def test_convrot_env_cannot_override_checkpoint_marker(monkeypatch):
         _convrot_enabled(False)
 
     assert _convrot_enabled(True)
+
+
+def test_convrot_env_conflict_fails_during_config_construction(monkeypatch):
+    monkeypatch.setenv("MINIMAX_H3_CONVROT", "0")
+    with pytest.raises(ValueError, match="conflicts with checkpoint"):
+        Int8Config.from_config({"quant_method": "int8", "convrot": True})

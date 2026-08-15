@@ -170,7 +170,7 @@ class Int8Config(QuantizationConfig):
         super().__init__()
         self.ignored_layers = ignored_layers or []
         self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
-        self.use_convrot = use_convrot
+        self.use_convrot = _convrot_enabled(use_convrot)
         self.minimax_h3_adaln_table = (
             dict(minimax_h3_adaln_table) if minimax_h3_adaln_table is not None else None
         )
@@ -324,7 +324,7 @@ class Int8LinearMethod(QuantizeMethodBase):
         if int8_scaled_mm is None:
             raise ImportError("sgl_kernel 不可用：缺少 int8_scaled_mm")
         _maybe_profile_activation(x, layer)
-        if _convrot_enabled(self.quant_config.use_convrot):
+        if self.quant_config.use_convrot:
             from sglang.multimodal_gen.runtime.layers.quantization.convrot import (
                 CONVROT_GROUP_SIZE,
                 build_hadamard,

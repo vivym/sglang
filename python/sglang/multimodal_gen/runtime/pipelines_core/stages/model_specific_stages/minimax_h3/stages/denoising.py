@@ -21,9 +21,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_s
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
-    DenoisingStage,
-)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG,
 )
@@ -401,7 +399,7 @@ def _minimax_h3_adaln_table_path() -> str:
 
     return os.environ.get(
         "MINIMAX_H3_ADALN_TABLE_PATH",
-        "/srv/models/MiniMax-H3-adaln-table/steps20.safetensors",
+        "/srv/models/MiniMax-H3-adaln-table-hardened/steps20.safetensors",
     )
 
 
