@@ -59,7 +59,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 "MiniMax H3 Qwen3-VL config must be trimmed to "
                 f"{selected_layer} language layers before construction"
             )
-        self.model = Qwen3VLModel(arch, use_tensor_parallel=True)
+        quant_config = getattr(config, "quant_config", None)
+        self.model = Qwen3VLModel(
+            arch, use_tensor_parallel=True, quant_config=quant_config
+        )
         # H3 consumes the unnormalized output immediately after layer 49.
         self.model.language_model.norm = nn.Identity()
         self.image_token_id = int(arch.image_token_id)
@@ -194,6 +197,13 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                     f"parameter={tuple(param.shape)}"
                 ) from exc
             loaded.add(name)
+        # 量化后处理（对齐 DiT fsdp_load.py）：int8 序列化权重需转置为列主序 + 定稿 scale
+        for _, module in self.model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None and hasattr(
+                quant_method, "process_weights_after_loading"
+            ):
+                quant_method.process_weights_after_loading(module)
         return loaded
 
 

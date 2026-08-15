@@ -1,5 +1,6 @@
 import dataclasses
 import glob
+import json
 import os
 import re
 from collections.abc import Callable, Generator, Iterable
@@ -350,6 +351,9 @@ class TextEncoderLoader(ComponentLoader):
         )
         if post_diffusers_config_update is not None:
             post_diffusers_config_update()
+        encoder_config.quant_config = self._resolve_encoder_quant_config(
+            component_model_path
+        )
         model_cls, _ = ModelRegistry.resolve_model_cls(
             getattr(encoder_config, "architectures", [])
         )
@@ -377,6 +381,29 @@ class TextEncoderLoader(ComponentLoader):
             cpu_offload_flag=cpu_offload_flag,
             component_name=component_name,
         )
+
+    @staticmethod
+    def _resolve_encoder_quant_config(component_model_path: str):
+        """解析 checkpoint config.json 的 quantization_config（对齐 DiT get_quant_config）。
+
+        仅当 config.json 带 quantization_config 字段时生效；否则返回 None（bf16 路径）。
+        """
+        cfg_path = os.path.join(component_model_path, "config.json")
+        if not os.path.exists(cfg_path):
+            return None
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg_dict = json.load(f)
+        if not isinstance(cfg_dict, dict) or "quantization_config" not in cfg_dict:
+            return None
+        try:
+            from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+                get_quant_config,
+            )
+
+            return get_quant_config(cfg_dict, component_model_path)
+        except Exception as exc:
+            logger.warning("Failed to resolve text encoder quant config: %s", exc)
+            return None
 
     @staticmethod
     def _extract_encoder_index(component_name: str) -> int:
