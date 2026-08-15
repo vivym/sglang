@@ -71,6 +71,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
+_ADALN_ARTIFACT_CONFIG_KEY = "minimax_h3_adaln_table"
+_ADALN_ARTIFACT_FORMAT_VERSION = "1"
+_ADALN_ARTIFACT_LAYOUT = "full"
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
@@ -787,10 +790,9 @@ class MiniMaxH3AdalnProj(nn.Module):
         # 存表不存参数（默认）：不创建 linear，避免分配 26GB bf16 adaln 权重，
         # 推理走离线调制表。仅当 MINIMAX_H3_LOAD_ADALN_WEIGHTS=1 时才创建 linear
         # 回退到在线建表路径。
-        load_weights = (
-            os.environ.get("MINIMAX_H3_LOAD_ADALN_WEIGHTS", "0").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
+        load_weights = os.environ.get(
+            "MINIMAX_H3_LOAD_ADALN_WEIGHTS", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
         if load_weights:
             self.linear = ColumnParallelLinear(
                 arch.time_embed_dim,
@@ -1102,8 +1104,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         ):
             if value % tp_size:
                 raise ValueError(
-                    f"MiniMax H3 {name}={value} must be divisible by "
-                    f"TP size {tp_size}."
+                    f"MiniMax H3 {name}={value} must be divisible by TP size {tp_size}."
                 )
 
     @staticmethod
@@ -1226,6 +1227,12 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self._adaln_table: list[torch.Tensor] | None = None
         self._adaln_final_table: torch.Tensor | None = None
         self._adaln_timesteps: torch.Tensor | None = None
+        artifact_config = getattr(quant_config, _ADALN_ARTIFACT_CONFIG_KEY, None)
+        if artifact_config is None:
+            artifact_config = hf_config.get(_ADALN_ARTIFACT_CONFIG_KEY)
+        self._adaln_artifact_config = (
+            dict(artifact_config) if isinstance(artifact_config, dict) else None
+        )
         self._mark_missing_params_required()
 
     def _resolve_attention_backend_once(self) -> None:
@@ -1274,12 +1281,19 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         t_emb = self.time_embedder(timesteps.to(device=device, dtype=torch.float32))
         adaln_input = torch.nn.functional.silu(t_emb).to(_BF16_DTYPE)
         with torch.inference_mode():
-            self._adaln_table = [
-                block.adaln_proj.project_local(adaln_input) for block in self.blocks
-            ]
+            self._adaln_table = []
+            for block in self.blocks:
+                output = block.adaln_proj.project_local(adaln_input)
+                if get_tp_world_size() > 1:
+                    output = tensor_model_parallel_all_gather(output)
+                self._adaln_table.append(output)
             self._adaln_final_table = self.final_layer.adaln_proj.project_local(
                 adaln_input
             )
+            if get_tp_world_size() > 1:
+                self._adaln_final_table = tensor_model_parallel_all_gather(
+                    self._adaln_final_table
+                )
         self._adaln_timesteps = timesteps.to(device=device)
 
     def load_adaln_table(self, path: str) -> None:
@@ -1290,33 +1304,116 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         ``timesteps`` [T]. Loading it avoids loading the 26GB bf16 adaln projections
         into GPU at all. ``path`` may be a safetensors file or a directory.
         """
-        from safetensors.torch import load_file
-
         import os as _os
 
+        from safetensors import safe_open
+
         if _os.path.isdir(path):
-            files = sorted(
-                f for f in _os.listdir(path) if f.endswith(".safetensors")
-            )
+            files = sorted(f for f in _os.listdir(path) if f.endswith(".safetensors"))
             if len(files) != 1:
                 raise ValueError(
                     f"adaln table dir must contain exactly one .safetensors, got {files}"
                 )
             path = _os.path.join(path, files[0])
 
-        data = load_file(path, device="cpu")
-        if "timesteps" not in data:
-            raise ValueError("adaln table missing 'timesteps' key")
+        artifact_config = self._adaln_artifact_config
+        if artifact_config is None:
+            raise ValueError(
+                "checkpoint quantization_config is missing "
+                "minimax_h3_adaln_table provenance; "
+                "rebuild or stamp the INT8 checkpoint with build_int8_transformer.py"
+            )
+        expected_fingerprint = artifact_config.get("source_fingerprint")
+        if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
+            raise ValueError(
+                "checkpoint minimax_h3_adaln_table.source_fingerprint is missing"
+            )
+        if artifact_config.get("format_version") != _ADALN_ARTIFACT_FORMAT_VERSION:
+            raise ValueError(
+                "unsupported checkpoint AdaLN table format_version: "
+                f"{artifact_config.get('format_version')!r}; expected "
+                f"{_ADALN_ARTIFACT_FORMAT_VERSION!r}"
+            )
+        if artifact_config.get("table_layout") != _ADALN_ARTIFACT_LAYOUT:
+            raise ValueError(
+                "unsupported checkpoint AdaLN table layout: "
+                f"{artifact_config.get('table_layout')!r}; expected "
+                f"{_ADALN_ARTIFACT_LAYOUT!r}"
+            )
+
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata() or {}
+            if metadata.get("format_version") != _ADALN_ARTIFACT_FORMAT_VERSION:
+                raise ValueError(
+                    "unsupported AdaLN table format_version: "
+                    f"{metadata.get('format_version')!r}; expected "
+                    f"{_ADALN_ARTIFACT_FORMAT_VERSION!r}"
+                )
+            if metadata.get("table_layout") != _ADALN_ARTIFACT_LAYOUT:
+                raise ValueError(
+                    "unsupported AdaLN table layout: "
+                    f"{metadata.get('table_layout')!r}; expected "
+                    f"{_ADALN_ARTIFACT_LAYOUT!r}"
+                )
+            actual_fingerprint = metadata.get("source_fingerprint")
+            if actual_fingerprint != expected_fingerprint:
+                raise ValueError(
+                    "AdaLN table source checkpoint mismatch: artifact has "
+                    f"{actual_fingerprint!r}, checkpoint expects "
+                    f"{expected_fingerprint!r}"
+                )
+
+            required_keys = {
+                "timesteps",
+                "final_layer",
+                *(f"blocks.{i}" for i in range(len(self.blocks))),
+            }
+            actual_keys = set(handle.keys())
+            missing = sorted(required_keys - actual_keys)
+            if missing:
+                raise ValueError(f"adaln table missing tensors: {missing}")
+            unexpected = sorted(actual_keys - required_keys)
+            if unexpected:
+                raise ValueError(f"adaln table has unexpected tensors: {unexpected}")
+            timesteps = handle.get_tensor("timesteps")
+            block_tables = [
+                handle.get_tensor(f"blocks.{i}") for i in range(len(self.blocks))
+            ]
+            final_table = handle.get_tensor("final_layer")
+
+        if timesteps.ndim != 1 or timesteps.numel() == 0:
+            raise ValueError(
+                f"adaln timesteps must be non-empty 1D, got {list(timesteps.shape)}"
+            )
+        if timesteps.dtype != _FP32_DTYPE:
+            raise ValueError(f"adaln timesteps must be float32, got {timesteps.dtype}")
+        if timesteps.numel() > 1 and not bool(
+            torch.all(timesteps[1:] > timesteps[:-1])
+        ):
+            raise ValueError("adaln timesteps must be strictly increasing")
+        expected_block_width = self.arch.adaln_out_features
+        expected_final_width = self.arch.final_adaln_out_features
+        for index, table in enumerate(block_tables):
+            if table.dtype != _BF16_DTYPE:
+                raise ValueError(f"blocks.{index} must be bfloat16, got {table.dtype}")
+            if tuple(table.shape) != (timesteps.numel(), expected_block_width):
+                raise ValueError(
+                    f"blocks.{index} has shape {list(table.shape)}, expected "
+                    f"[{timesteps.numel()}, {expected_block_width}]"
+                )
+        if final_table.dtype != _BF16_DTYPE:
+            raise ValueError(f"final_layer must be bfloat16, got {final_table.dtype}")
+        if tuple(final_table.shape) != (timesteps.numel(), expected_final_width):
+            raise ValueError(
+                f"final_layer has shape {list(final_table.shape)}, expected "
+                f"[{timesteps.numel()}, {expected_final_width}]"
+            )
         device = self.video_patch_proj.weight.device
-        self._adaln_timesteps = data["timesteps"].to(device=device, dtype=torch.float32)
-        num_blocks = len(self.blocks)
+        self._adaln_timesteps = timesteps.to(device=device, dtype=torch.float32)
         self._adaln_table = [
-            data[f"blocks.{i}"].to(device=device, dtype=_BF16_DTYPE)
-            for i in range(num_blocks)
+            table.to(device=device, dtype=_BF16_DTYPE) for table in block_tables
         ]
-        self._adaln_final_table = data["final_layer"].to(
-            device=device, dtype=_BF16_DTYPE
-        )
+        self._adaln_final_table = final_table.to(device=device, dtype=_BF16_DTYPE)
 
     def drop_adaln_weights(self) -> int:
         """Delete the per-block and final AdaLN projections after the table is built.
@@ -1345,8 +1442,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         torch.cuda.empty_cache()
         after = torch.cuda.memory_allocated()
         print(
-            f"[drop_adaln_weights] bytes_freed={freed/1e9:.2f}GB "
-            f"cuda_alloc {before/1e9:.2f} -> {after/1e9:.2f} GB",
+            f"[drop_adaln_weights] bytes_freed={freed / 1e9:.2f}GB "
+            f"cuda_alloc {before / 1e9:.2f} -> {after / 1e9:.2f} GB",
             flush=True,
         )
         return freed
@@ -1355,8 +1452,38 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         """Map each distinct per-step timestep to its row in the global table."""
         if self._adaln_timesteps is None:
             raise RuntimeError("AdaLN table not built")
-        return torch.searchsorted(
-            self._adaln_timesteps, unique_timesteps.to(self._adaln_timesteps.dtype)
+        requested = unique_timesteps.to(
+            device=self._adaln_timesteps.device,
+            dtype=self._adaln_timesteps.dtype,
+        )
+        indices = torch.searchsorted(self._adaln_timesteps, requested)
+        if bool(torch.any(indices >= self._adaln_timesteps.numel())):
+            raise ValueError("AdaLN table does not contain every requested timestep")
+        matched = self._adaln_timesteps.index_select(0, indices)
+        if not torch.equal(matched, requested):
+            raise ValueError("AdaLN table does not contain every requested timestep")
+        return indices
+
+    def _prepare_block_adaln_params(
+        self,
+        adaln_input: torch.Tensor,
+        adaln_global_idx: torch.Tensor | None,
+    ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
+        if self._adaln_table is not None:
+            assert adaln_global_idx is not None
+            return tuple(
+                block.adaln_proj.split_output(table.index_select(0, adaln_global_idx))
+                for block, table in zip(self.blocks, self._adaln_table, strict=True)
+            )
+        if not self._can_batch_block_adaln():
+            return None
+        local_adaln = torch.stack(
+            [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
+        )
+        gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
+        return tuple(
+            block.adaln_proj.split_output(output)
+            for block, output in zip(self.blocks, gathered_adaln, strict=True)
         )
 
     @staticmethod
@@ -1786,30 +1913,12 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
-        block_adaln_params = None
         adaln_global_idx: torch.Tensor | None = None
         if self._adaln_table is not None:
             adaln_global_idx = self._adaln_global_indices(unique_timesteps)
-        if self._can_batch_block_adaln():
-            if self._adaln_table is not None:
-                local_adaln = torch.stack(
-                    [table.index_select(0, adaln_global_idx) for table in self._adaln_table]
-                )
-            else:
-                local_adaln = torch.stack(
-                    [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
-                )
-            gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
-            block_adaln_params = tuple(
-                block.adaln_proj.split_output(output)
-                for block, output in zip(self.blocks, gathered_adaln)
-            )
-        elif self._adaln_table is not None:
-            # TP=1 + AdaLN 表：按全局 timestep 索引查表，走 block 的 adaln_params 通道
-            block_adaln_params = tuple(
-                block.adaln_proj.split_output(table.index_select(0, adaln_global_idx))
-                for block, table in zip(self.blocks, self._adaln_table)
-            )
+        block_adaln_params = self._prepare_block_adaln_params(
+            adaln_input, adaln_global_idx
+        )
         # With sequence parallelism, shard rows across the group for the
         # block stack. Attention trades sequence for heads internally
         # (Ulysses) and/or ring-rotates KV across ring ranks; everything

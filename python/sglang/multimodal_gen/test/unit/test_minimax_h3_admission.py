@@ -321,6 +321,7 @@ def test_validate_server_args_requires_packed_varlen_backend():
         vae_config=SimpleNamespace(resolved_parallel_decode_mode=lambda: None),
         dit_config=SimpleNamespace(arch_config=SimpleNamespace(attention_head_dim=128)),
         _server_arg_value=MiniMaxH3PipelineConfig._server_arg_value,
+        _force_vae_resident=lambda _server_args: None,
     )
     server_args = SimpleNamespace(
         component_attention_backends={}, attention_backend="sage_attn"

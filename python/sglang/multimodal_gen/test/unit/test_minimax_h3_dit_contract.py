@@ -20,11 +20,13 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
     Fp8LinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.int8 import Int8Config
 from sglang.multimodal_gen.runtime.layers.usp import _usp_input_all_to_all_packed_qkv
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
+    MiniMaxH3Attention,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
     _reorder_grouped_qkv_to_qkv,
@@ -125,6 +127,41 @@ def test_native_weight_names_and_grouped_qkv_reorder():
             assert torch.equal(
                 param.view(torch.int16), expected_shard.view(torch.int16)
             )
+
+
+def test_serialized_int8_qkv_weight_and_scale_use_real_loader_reorder():
+    _ensure_single_process_parallel_runtime()
+    arch = MiniMaxH3DiTArchConfig(
+        hidden_size=4,
+        num_attention_heads=2,
+        attention_head_dim=2,
+    )
+    attention = MiniMaxH3Attention(
+        arch,
+        Int8Config(is_checkpoint_int8_serialized=True),
+        prefix="blocks.0.attn",
+    )
+    loaded_weight = torch.arange(48, dtype=torch.int8).reshape(12, 4)
+    loaded_scale = torch.arange(12, dtype=torch.float32).reshape(12, 1)
+
+    attention.qkv_proj.weight.weight_loader(attention.qkv_proj.weight, loaded_weight)
+    attention.qkv_proj.weight_scale.weight_loader(
+        attention.qkv_proj.weight_scale, loaded_scale
+    )
+    expected_weight = _reorder_grouped_qkv_to_qkv(
+        loaded_weight,
+        num_query_groups=2,
+        heads_per_group=1,
+        head_dim=2,
+    )
+    expected_scale = _reorder_grouped_qkv_to_qkv(
+        loaded_scale,
+        num_query_groups=2,
+        heads_per_group=1,
+        head_dim=2,
+    )
+    assert torch.equal(attention.qkv_proj.weight, expected_weight)
+    assert torch.equal(attention.qkv_proj.weight_scale, expected_scale)
 
 
 def test_tp_and_ulysses_admission_uses_tp_local_shapes():

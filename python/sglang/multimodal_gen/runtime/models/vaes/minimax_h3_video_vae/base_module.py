@@ -20,6 +20,8 @@ from .vit_utils import _env_flag, _vit_torch_compile_kwargs
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+_FP16_FFN_LINEAR_INPUT_LIMIT = 4096.0
+
 
 def _vit_norm_input(module, hidden_states):
     if _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1"):
@@ -74,6 +76,7 @@ class FeedForward(nn.Module):
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w1(hidden_states)
+        fp16_restore_scale = None
 
         if self.use_gated:
             if (
@@ -87,20 +90,45 @@ class FeedForward(nn.Module):
                 hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
             else:
                 gate, hidden_states = hidden_states.chunk(2, dim=-1)
-                # fast-h3: fp16/bf16 下 silu 的 exp 在 |x|>11/88 时溢出（VAE FFN
-                # w1 输出值域可达数百），INT8 DiT 的 latents 确定性触发该路径，
-                # 产生 NaN 并扩散。激活在 fp32 计算可完全避免（默认启用，
-                # MINIMAX_H3_VAE_FFN_FP32_ACT=0 可回退官方 kernel 行为）。
+                # H3's fp16 decode can produce |gate| and |value| in the hundreds.
+                # The product must remain fp32: casting SiLU back before multiplying
+                # still turns 512*512 into inf.  For the following fp16 GEMM, scale
+                # each token by a power of two and undo the scale after projection.
+                # This preserves fp16 GEMM cost and lets its fp32 accumulator perform
+                # the cancellation that would otherwise become inf + -inf = NaN.
                 if _env_flag("MINIMAX_H3_VAE_FFN_FP32_ACT", "1"):
-                    gate = self.act_fn(gate.float()).to(hidden_states.dtype)
+                    activation_dtype = hidden_states.dtype
+                    hidden_states = self.act_fn(gate.float()).mul_(
+                        hidden_states.float()
+                    )
+                    if activation_dtype == torch.float16:
+                        max_abs = (
+                            hidden_states.detach().abs().amax(dim=-1, keepdim=True)
+                        )
+                        ratio = torch.clamp(
+                            max_abs / _FP16_FFN_LINEAR_INPUT_LIMIT, min=1.0
+                        )
+                        fp16_restore_scale = torch.exp2(torch.ceil(torch.log2(ratio)))
+                        hidden_states.div_(fp16_restore_scale)
+                    hidden_states = hidden_states.to(activation_dtype)
                 else:
                     gate = self.act_fn(gate)
-                hidden_states = gate.mul_(hidden_states)
+                    hidden_states = gate.mul_(hidden_states)
         else:
             hidden_states = self.act_fn(hidden_states)
 
-        hidden_states = self.w2(hidden_states)
-        return hidden_states
+        if fp16_restore_scale is None:
+            return self.w2(hidden_states)
+
+        # Bias is not part of the scaled linear term. Add it only after restoring
+        # the token scale so it is neither amplified nor needlessly rounded.
+        hidden_states = torch.nn.functional.linear(
+            hidden_states, self.w2.weight, bias=None
+        ).float()
+        hidden_states.mul_(fp16_restore_scale)
+        if self.w2.bias is not None:
+            hidden_states.add_(self.w2.bias.float())
+        return hidden_states.to(torch.float16)
 
     def _get_forward_impl(self):
         if not self._compile_forward_enabled:
