@@ -8,6 +8,9 @@ import torch
 from safetensors.torch import save_file
 
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    _adaln_table_covers_timesteps,
+)
 
 
 def _fake_loader_model(fingerprint: str = "sha256:test") -> SimpleNamespace:
@@ -87,3 +90,23 @@ def test_adaln_lookup_requires_exact_timestep_match():
         MiniMaxH3DiTModel._adaln_global_indices(model, torch.tensor([0.25]))
     with pytest.raises(ValueError, match="does not contain"):
         MiniMaxH3DiTModel._adaln_global_indices(model, torch.tensor([1.1]))
+
+
+def test_adaln_schedule_accepts_exact_table():
+    timesteps = torch.tensor([0.0, 0.5, 1.0])
+    assert _adaln_table_covers_timesteps(timesteps, timesteps.clone())
+
+
+def test_adaln_schedule_accepts_exact_subset():
+    cached = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
+    assert _adaln_table_covers_timesteps(cached, torch.tensor([0.25, 0.75]))
+
+
+def test_adaln_schedule_rejects_missing_timestep():
+    cached = torch.tensor([0.0, 0.5, 1.0])
+    assert not _adaln_table_covers_timesteps(cached, torch.tensor([0.0, 0.25]))
+
+
+def test_adaln_schedule_rejects_out_of_range_timestep():
+    cached = torch.tensor([0.0, 0.5, 1.0])
+    assert not _adaln_table_covers_timesteps(cached, torch.tensor([0.5, 1.1]))

@@ -403,6 +403,20 @@ def _minimax_h3_adaln_table_path() -> str:
     )
 
 
+def _adaln_table_covers_timesteps(
+    cached: torch.Tensor | None, requested: torch.Tensor
+) -> bool:
+    """Return whether a sorted AdaLN table contains every requested timestep."""
+    if cached is None:
+        return False
+    cached_cpu = cached.detach().cpu()
+    requested_cpu = requested.detach().to(device="cpu", dtype=cached_cpu.dtype)
+    indices = torch.searchsorted(cached_cpu, requested_cpu)
+    if bool(torch.any(indices >= cached_cpu.numel())):
+        return False
+    return torch.equal(cached_cpu.index_select(0, indices), requested_cpu)
+
+
 def _maybe_build_adaln_table(
     model: Any,
     *,
@@ -434,16 +448,15 @@ def _maybe_build_adaln_table(
     timesteps = torch.unique(torch.tensor(candidates, dtype=torch.float32), sorted=True)
 
     if getattr(model, "_adaln_table", None) is not None:
-        # 已建表/已加载表：校验当前请求调度与表一致。表是 schedule 特定的
-        # （num_inference_steps + flow_shift + conditioning），调度一旦变化
-        # searchsorted 会命中错误行，静默出坏视频——必须 fail-closed。
+        # 已建表/已加载表：允许生产表服务精确覆盖的子调度，但缺失或偏移的
+        # timestep 会命中错误行、静默生成坏视频，因此必须 fail-closed。
         cached = getattr(model, "_adaln_timesteps", None)
-        if cached is not None and not torch.equal(cached.detach().cpu(), timesteps):
+        if not _adaln_table_covers_timesteps(cached, timesteps):
             raise ValueError(
                 "MiniMax-H3 AdaLN 预计算表与当前请求调度不匹配：已按 "
-                f"{int(cached.numel())} 个 timestep 建表，但当前请求产生 "
-                f"{int(timesteps.numel())} 个。AdaLN precompute 只支持固定 "
-                "num_inference_steps / flow_shift 的部署；请统一请求参数，或关闭 "
+                f"{int(cached.numel()) if cached is not None else -1} 个 timestep "
+                f"建表，但未精确覆盖当前请求的 {int(timesteps.numel())} 个。"
+                "请使用包含当前 steps/flow_shift 调度的表，或关闭 "
                 "MINIMAX_H3_ADALN_PRECOMPUTE。"
             )
         return True
@@ -459,12 +472,12 @@ def _maybe_build_adaln_table(
             )
         load(table_path)
         cached = getattr(model, "_adaln_timesteps", None)
-        if cached is None or not torch.equal(cached.detach().cpu(), timesteps):
+        if not _adaln_table_covers_timesteps(cached, timesteps):
             raise ValueError(
                 "MiniMax-H3 离线 AdaLN 表与当前请求调度不匹配：表含 "
                 f"{int(cached.numel()) if cached is not None else -1} 个 timestep，"
-                f"当前请求 {int(timesteps.numel())} 个。请用匹配的 steps/flow_shift "
-                "重建表（scripts/build_adaln_table.py），或设 "
+                f"但未精确覆盖当前请求的 {int(timesteps.numel())} 个。请用包含当前 "
+                "steps/flow_shift 调度的表（scripts/build_adaln_table.py），或设 "
                 "MINIMAX_H3_LOAD_ADALN_WEIGHTS=1 回退在线建表。"
             )
         logger.info("AdaLN table loaded from offline artifact: %s", table_path)
