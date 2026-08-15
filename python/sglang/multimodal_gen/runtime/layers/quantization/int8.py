@@ -50,7 +50,14 @@ def _convrot_enabled(config_default: bool = False) -> bool:
     return config_default
 
 
-_ACT_STATS = {"plain": 0.0, "conv": 0.0, "norm": 0.0, "n": 0, "dumped": False}
+_ACT_STATS = {
+    "plain": 0.0,
+    "conv": 0.0,
+    "norm": 0.0,
+    "n": 0,
+    "dumped": False,
+    "per_layer": {},
+}
 
 
 def _act_profile_enabled() -> bool:
@@ -67,10 +74,17 @@ def _dump_act_stats() -> None:
 
     path = os.environ.get("MINIMAX_H3_ACT_PROFILE_PATH", "/tmp/opencode/act_profile.json")
     s = _ACT_STATS
+    per_layer = {}
+    for prefix, v in s["per_layer"].items():
+        per_layer[prefix] = {
+            "conv_rel": v["conv"] / v["norm"] if v["norm"] > 0 else 0.0,
+            "plain_rel": v["plain"] / v["norm"] if v["norm"] > 0 else 0.0,
+        }
     out = {
         "n": s["n"],
         "plain_rel": s["plain"] / s["norm"] if s["norm"] > 0 else 0.0,
         "conv_rel": s["conv"] / s["norm"] if s["norm"] > 0 else 0.0,
+        "per_layer": per_layer,
     }
     try:
         with open(path, "w") as f:
@@ -78,10 +92,10 @@ def _dump_act_stats() -> None:
     except Exception:
         pass
     _ACT_STATS["dumped"] = True
-    print(f"[act-profile] dumped {out} -> {path}", flush=True)
+    print(f"[act-profile] dumped {out['n']} calls -> {path}", flush=True)
 
 
-def _maybe_profile_activation(x: torch.Tensor) -> None:
+def _maybe_profile_activation(x: torch.Tensor, layer=None) -> None:
     """env 门控：在真实激活上度量 plain / convrot 两种 per-token 量化误差。"""
     if not _act_profile_enabled() or _ACT_STATS["dumped"]:
         return
@@ -103,10 +117,16 @@ def _maybe_profile_activation(x: torch.Tensor) -> None:
         h = build_hadamard(CONVROT_GROUP_SIZE, device=x.device, dtype=torch.float32)
         x_rot = rotate_activation(x, h, CONVROT_GROUP_SIZE).float()
         e_conv = qerr(x_rot)
+        norm = xf.pow(2).sum().item()
         _ACT_STATS["plain"] += e_plain
         _ACT_STATS["conv"] += e_conv
-        _ACT_STATS["norm"] += xf.pow(2).sum().item()
+        _ACT_STATS["norm"] += norm
         _ACT_STATS["n"] += 1
+        prefix = getattr(layer, "prefix", None) or "?"
+        pl = _ACT_STATS["per_layer"].setdefault(prefix, {"conv": 0.0, "plain": 0.0, "norm": 0.0})
+        pl["conv"] += e_conv
+        pl["plain"] += e_plain
+        pl["norm"] += norm
         if _ACT_STATS["n"] >= 3000:
             _dump_act_stats()
     except Exception as e:
@@ -270,7 +290,7 @@ class Int8LinearMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         if int8_scaled_mm is None:
             raise ImportError("sgl_kernel 不可用：缺少 int8_scaled_mm")
-        _maybe_profile_activation(x)
+        _maybe_profile_activation(x, layer)
         if _convrot_enabled(self.quant_config.use_convrot):
             from sglang.multimodal_gen.runtime.layers.quantization.convrot import (
                 CONVROT_GROUP_SIZE,
