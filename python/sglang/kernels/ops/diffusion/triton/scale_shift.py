@@ -37,7 +37,7 @@ def try_fused_scaled_residual_add_exact(
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
         or residual.dtype != torch.float32
-        or x.dtype not in (torch.float16, torch.bfloat16)
+        or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
         or scale.dtype != torch.float32
         or not residual.is_cuda
         or residual.device != x.device

@@ -350,12 +350,21 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 dtype=video_vae_dtype,
                 enabled=visual_autocast_enabled,
             ):
+                from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.base_module import (
+                    flush_vae_ffn_probe,
+                    reset_vae_ffn_probe,
+                )
+
                 video_decode = self._get_vae_decode_fn(
                     selected_video_vae,
                     server_args,
                     decode_fn=selected_video_vae.decode_base,
                 )
-                visual_frames = video_decode(visual_decode_latent)
+                reset_vae_ffn_probe()
+                try:
+                    visual_frames = video_decode(visual_decode_latent)
+                finally:
+                    flush_vae_ffn_probe()
                 visual_frames = selected_video_vae.processor.revert_tensor(
                     visual_frames
                 )

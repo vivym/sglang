@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_scaled_residual_add_is_bit_exact(dtype):
     torch.manual_seed(0)
     residual = torch.randn(2, 17, 64, device="cuda", dtype=torch.float32)
@@ -29,7 +29,7 @@ def test_scaled_residual_add_is_bit_exact(dtype):
 @torch.no_grad()
 def test_scaled_residual_add_rejects_unsupported_inputs():
     residual = torch.empty(2, 3, 8, device="cuda", dtype=torch.float32)
-    x = torch.empty_like(residual)
+    x = torch.empty_like(residual, dtype=torch.float64)
     scale = torch.empty(8, device="cuda", dtype=torch.float32)
 
     assert try_fused_scaled_residual_add_exact(residual, x, scale) is None

@@ -9,7 +9,7 @@ from diffusers.utils import logging
 
 from .base_module import RotaryEmbeddingND, TransformerBlock
 from .flash import make_block_causal_mask_mod
-from .vit_utils import create_token_ids, prepare_rotary_pos_emb
+from .vit_utils import _env_flag, create_token_ids, prepare_rotary_pos_emb
 
 logger = logging.get_logger(__name__)
 
@@ -210,6 +210,8 @@ class ViT3DDecoder(ViTBase):
                 for _ in range(num_layers)
             ]
         )
+        for index, block in enumerate(self.transformer_blocks):
+            block.ff._debug_name = f"decoder.transformer_blocks.{index}.ff"
 
         self.norm_out = nn.LayerNorm(dim, elementwise_affine=norm_affine, eps=eps)
         patch_dim = out_channels * patch_size_t * patch_size * patch_size
@@ -260,6 +262,10 @@ class ViT3DDecoder(ViTBase):
                 if linear.weight.dtype != dtype:
                     linear.to(dtype=dtype)
                     converted += 1
+            if dtype == torch.float16 and _env_flag(
+                "MINIMAX_H3_VAE_FFN_OUTPUT_BOUND_SCALE", "0"
+            ):
+                block.ff.prepare_fp16_w2_output_bound()
         self._autocast_linear_dtype = dtype
         return converted
 
