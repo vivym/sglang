@@ -35,11 +35,19 @@ except ImportError:  # pragma: no cover
     int8_scaled_mm = None
 
 
-def _convrot_enabled() -> bool:
-    """ConvRot Hadamard 旋转开关。必须与 checkpoint 的权重旋转（build_int8_transformer.py
-    的 --convrot）保持一致，否则权重/激活旋转不匹配会输出错误。"""
-    value = os.environ.get("MINIMAX_H3_CONVROT", "0")
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
+def _convrot_enabled(config_default: bool = False) -> bool:
+    """ConvRot Hadamard 旋转开关。
+
+    优先级：显式 env MINIMAX_H3_CONVROT（"1"/"0"）> checkpoint config.json 的
+    quantization_config.convrot 标记（Int8Config.use_convrot）。
+
+    必须与 checkpoint 的权重旋转（build_int8_transformer.py --convrot）保持一致，
+    否则权重/激活旋转不匹配会输出错误。默认来自 checkpoint 标记，防止忘记开。
+    """
+    value = os.environ.get("MINIMAX_H3_CONVROT")
+    if value is not None and str(value).strip() != "":
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+    return config_default
 
 
 _ACT_STATS = {"plain": 0.0, "conv": 0.0, "norm": 0.0, "n": 0, "dumped": False}
@@ -118,10 +126,12 @@ class Int8Config(QuantizationConfig):
         self,
         ignored_layers: Optional[List[str]] = None,
         is_checkpoint_int8_serialized: bool = False,
+        use_convrot: bool = False,
     ):
         super().__init__()
         self.ignored_layers = ignored_layers or []
         self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
+        self.use_convrot = use_convrot
         # H3 的 fused 权重直接按完整名字匹配（如 blocks.0.attn.qkv_proj），无拆分映射
         self.packed_modules_mapping: Dict[str, List[str]] = {}
 
@@ -152,9 +162,11 @@ class Int8Config(QuantizationConfig):
         # HF/sglang 约定字段名为 quant_method（非 quantization_method）
         quant_method = config.get("quant_method", "")
         is_serialized = "int8" in quant_method
+        use_convrot = bool(config.get("convrot", False))
         return cls(
             ignored_layers=ignored_layers,
             is_checkpoint_int8_serialized=is_serialized,
+            use_convrot=use_convrot,
         )
 
     def get_quant_method(
@@ -259,7 +271,7 @@ class Int8LinearMethod(QuantizeMethodBase):
         if int8_scaled_mm is None:
             raise ImportError("sgl_kernel 不可用：缺少 int8_scaled_mm")
         _maybe_profile_activation(x)
-        if _convrot_enabled():
+        if _convrot_enabled(self.quant_config.use_convrot):
             from sglang.multimodal_gen.runtime.layers.quantization.convrot import (
                 CONVROT_GROUP_SIZE,
                 build_hadamard,
