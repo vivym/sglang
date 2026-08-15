@@ -18,15 +18,15 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
-from sglang.multimodal_gen.runtime.layers.linear import (
-    LinearBase,
-    UnquantizedLinearMethod,
-)
+from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.multimodal_gen.runtime.models.parameter import ModelWeightParameter
+from sglang.multimodal_gen.runtime.models.parameter import (
+    ChannelQuantScaleParameter,
+    ModelWeightParameter,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 
 try:
@@ -34,19 +34,33 @@ try:
 except ImportError:  # pragma: no cover
     int8_scaled_mm = None
 
+_MINIMAX_H3_ADALN_ARTIFACT_CONFIG_KEY = "minimax_h3_adaln_table"
+
 
 def _convrot_enabled(config_default: bool = False) -> bool:
     """ConvRot Hadamard 旋转开关。
 
-    优先级：显式 env MINIMAX_H3_CONVROT（"1"/"0"）> checkpoint config.json 的
-    quantization_config.convrot 标记（Int8Config.use_convrot）。
-
     必须与 checkpoint 的权重旋转（build_int8_transformer.py --convrot）保持一致，
-    否则权重/激活旋转不匹配会输出错误。默认来自 checkpoint 标记，防止忘记开。
+    否则权重/激活旋转不匹配会静默输出错误。checkpoint 标记是事实来源；显式
+    env 仅作为一致性断言，不能覆盖 checkpoint 标记。
     """
     value = os.environ.get("MINIMAX_H3_CONVROT")
-    if value is not None and str(value).strip() != "":
-        return str(value).strip().lower() in ("1", "true", "yes", "on")
+    if value is not None and str(value).strip():
+        normalized = str(value).strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            env_enabled = True
+        elif normalized in ("0", "false", "no", "off"):
+            env_enabled = False
+        else:
+            raise ValueError(
+                f"MINIMAX_H3_CONVROT must be a boolean value, got {value!r}."
+            )
+        if env_enabled != config_default:
+            raise ValueError(
+                "MINIMAX_H3_CONVROT conflicts with checkpoint "
+                f"quantization_config.convrot={config_default}; refusing to run "
+                "with mismatched ConvRot weights and activations."
+            )
     return config_default
 
 
@@ -72,7 +86,9 @@ def _act_profile_enabled() -> bool:
 def _dump_act_stats() -> None:
     import json
 
-    path = os.environ.get("MINIMAX_H3_ACT_PROFILE_PATH", "/tmp/opencode/act_profile.json")
+    path = os.environ.get(
+        "MINIMAX_H3_ACT_PROFILE_PATH", "/tmp/opencode/act_profile.json"
+    )
     s = _ACT_STATS
     per_layer = {}
     for prefix, v in s["per_layer"].items():
@@ -123,7 +139,9 @@ def _maybe_profile_activation(x: torch.Tensor, layer=None) -> None:
         _ACT_STATS["norm"] += norm
         _ACT_STATS["n"] += 1
         prefix = getattr(layer, "prefix", None) or "?"
-        pl = _ACT_STATS["per_layer"].setdefault(prefix, {"conv": 0.0, "plain": 0.0, "norm": 0.0})
+        pl = _ACT_STATS["per_layer"].setdefault(
+            prefix, {"conv": 0.0, "plain": 0.0, "norm": 0.0}
+        )
         pl["conv"] += e_conv
         pl["plain"] += e_plain
         pl["norm"] += norm
@@ -147,11 +165,15 @@ class Int8Config(QuantizationConfig):
         ignored_layers: Optional[List[str]] = None,
         is_checkpoint_int8_serialized: bool = False,
         use_convrot: bool = False,
+        minimax_h3_adaln_table: dict[str, str] | None = None,
     ):
         super().__init__()
         self.ignored_layers = ignored_layers or []
         self.is_checkpoint_int8_serialized = is_checkpoint_int8_serialized
         self.use_convrot = use_convrot
+        self.minimax_h3_adaln_table = (
+            dict(minimax_h3_adaln_table) if minimax_h3_adaln_table is not None else None
+        )
         # H3 的 fused 权重直接按完整名字匹配（如 blocks.0.attn.qkv_proj），无拆分映射
         self.packed_modules_mapping: Dict[str, List[str]] = {}
 
@@ -173,7 +195,7 @@ class Int8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "Int8Config":
+    def from_config(cls, config: Dict[str, Any]) -> Int8Config:
         ignored_layers = cls.get_from_keys_or(
             config, ["ignored_layers", "modules_to_not_convert"], None
         )
@@ -182,11 +204,25 @@ class Int8Config(QuantizationConfig):
         # HF/sglang 约定字段名为 quant_method（非 quantization_method）
         quant_method = config.get("quant_method", "")
         is_serialized = "int8" in quant_method
-        use_convrot = bool(config.get("convrot", False))
+        use_convrot = config.get("convrot", False)
+        if not isinstance(use_convrot, bool):
+            raise ValueError(
+                "quantization_config.convrot must be a JSON boolean, "
+                f"got {use_convrot!r}."
+            )
+        adaln_artifact_config = config.get(_MINIMAX_H3_ADALN_ARTIFACT_CONFIG_KEY)
+        if adaln_artifact_config is not None and not isinstance(
+            adaln_artifact_config, dict
+        ):
+            raise ValueError(
+                "quantization_config.minimax_h3_adaln_table must be an object, "
+                f"got {adaln_artifact_config!r}."
+            )
         return cls(
             ignored_layers=ignored_layers,
             is_checkpoint_int8_serialized=is_serialized,
             use_convrot=use_convrot,
+            minimax_h3_adaln_table=adaln_artifact_config,
         )
 
     def get_quant_method(
@@ -250,12 +286,11 @@ class Int8LinearMethod(QuantizeMethodBase):
 
         if self.quant_config.is_checkpoint_int8_serialized:
             # per-channel scale (N, 1)，从 checkpoint 加载
-            weight_scale = ModelWeightParameter(
+            weight_scale = ChannelQuantScaleParameter(
                 data=torch.empty(
                     (output_size_per_partition, 1),
                     dtype=torch.float32,
                 ),
-                input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
             )
@@ -265,9 +300,7 @@ class Int8LinearMethod(QuantizeMethodBase):
         if self.quant_config.is_checkpoint_int8_serialized:
             # 序列化 checkpoint：权重已量化，只需列主序视图
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(
-                layer.weight_scale.data, requires_grad=False
-            )
+            layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
             return
 
         weight = layer.weight.data  # (N, K)，源 dtype
