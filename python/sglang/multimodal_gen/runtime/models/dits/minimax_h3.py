@@ -45,7 +45,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    get_component_forced_attn_backend,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -1221,6 +1225,12 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             quant_config,
             prefix="final_layer",
         )
+        # Attention resolution is deferred until the first forward for BCG, but
+        # a component-specific selection only exists during model construction.
+        self._selected_attention_backend = (
+            get_global_forced_attn_backend()
+            or get_component_forced_attn_backend()
+        )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         # AdaLN 预计算调制表（存表不存参数）。build_adaln_table() 填充后 forward 走查表，
         # drop_adaln_weights() 后 adaln_proj 权重被释放。
@@ -1241,12 +1251,23 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         backend = get_attn_backend(
             self.arch.attention_head_dim,
             _BF16_DTYPE,
+            selected_attention_backend=self._selected_attention_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
+        resolved_backend = backend.get_enum()
+        if (
+            self._selected_attention_backend is not None
+            and resolved_backend is not self._selected_attention_backend
+        ):
+            raise RuntimeError(
+                "MiniMax H3 attention backend fallback is disabled: requested "
+                f"{self._selected_attention_backend.name.lower()}, resolved "
+                f"{resolved_backend.name.lower()}"
+            )
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):
                 module._set_attention_backend(backend)
-        self._resolved_attention_backend = backend.get_enum()
+        self._resolved_attention_backend = resolved_backend
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():

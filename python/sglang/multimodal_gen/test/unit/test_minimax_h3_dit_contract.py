@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Mixed-precision weight and TP/Ulysses numerical contracts for H3 DiT."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -15,6 +16,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    component_attn_backend_context_manager,
+)
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
@@ -31,6 +35,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _copy_grouped_qkv_tp_shard,
     _reorder_grouped_qkv_to_qkv,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -236,6 +241,35 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
             assert tensor.dtype == torch.float32, name
         elif tensor.is_floating_point():
             assert tensor.dtype == torch.bfloat16, name
+
+
+def test_deferred_attention_preserves_component_backend_selection():
+    _ensure_single_process_parallel_runtime()
+    with component_attn_backend_context_manager(AttentionBackendEnum.SAGE_ATTN):
+        with torch.device("meta"):
+            model = MiniMaxH3DiTModel(
+                config=MiniMaxH3DiTConfig(),
+                hf_config={},
+                quant_config=None,
+            )
+
+    assert model._selected_attention_backend is AttentionBackendEnum.SAGE_ATTN
+
+
+def test_deferred_attention_rejects_backend_fallback():
+    model = object.__new__(MiniMaxH3DiTModel)
+    model._resolved_attention_backend = None
+    model._selected_attention_backend = AttentionBackendEnum.SAGE_ATTN
+    model.arch = SimpleNamespace(attention_head_dim=128)
+    fallback_backend = SimpleNamespace(
+        get_enum=lambda: AttentionBackendEnum.FA,
+    )
+
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
+        return_value=fallback_backend,
+    ), pytest.raises(RuntimeError, match="fallback is disabled"):
+        model._resolve_attention_backend_once()
 
 
 def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
