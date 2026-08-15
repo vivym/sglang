@@ -130,6 +130,24 @@ def test_public_tasks_resolve_to_exact_partition_and_encoder_plan(
     assert plan.shape["video_latent_t"] == 37
 
 
+def test_batch_admission_cost_uses_h3_packed_target_rows():
+    canonical = minimax_h3_validate_canonical_request(
+        task="t2va",
+        prompt="admission cost",
+        conditions=[],
+        target=TARGET,
+        seed=0,
+    )
+    plan = minimax_h3_resolve_plan(canonical)
+    batch = SimpleNamespace(
+        extra={"minimax_h3_resolved_plan": plan},
+        num_outputs_per_prompt=2,
+    )
+
+    # 37 * (768 / 32) * (1344 / 32) video rows + 207 * 2 audio rows.
+    assert MiniMaxH3PipelineConfig().estimate_request_cost(batch) == 75420.0
+
+
 @pytest.mark.parametrize(
     ("partition", "tasks"),
     [("fl2va", ["t2va", "fl2va"]), ("ref2va", ["ref2va"])],

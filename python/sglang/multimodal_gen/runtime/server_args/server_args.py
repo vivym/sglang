@@ -316,6 +316,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # if true, select the DiT layerwise group
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
+    layerwise_offload_prefetch_size: float = 0.0
     dit_offload_prefetch_size: float = 0.0
     # If set, keep this many leading DiT layers resident on GPU
     dit_layerwise_resident_layers: float = 0.0
@@ -1903,6 +1904,16 @@ class ServerArgs(DisaggServerArgsMixin):
             "--layerwise-offload-components text_encoder image_encoder vae.",
         )
         parser.add_argument(
+            "--layerwise-offload-prefetch-size",
+            type=float,
+            default=ServerArgs.layerwise_offload_prefetch_size,
+            help="The prefetch window for non-DiT layerwise-offloaded components. "
+            "If the value is between 0.0 and 1.0, it is treated as a ratio of "
+            "the total number of layers. If the value is >= 1, it is treated "
+            "as the absolute number of layers. 0.0 means prefetch 1 layer "
+            "(lowest memory).",
+        )
+        parser.add_argument(
             "--dit-offload-prefetch-size",
             type=float,
             default=ServerArgs.dit_offload_prefetch_size,
@@ -2021,7 +2032,7 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=None,
             choices=[0, 1],
-            help="Quantize the attention sink too (1, default) " "or keep it bf16 (0).",
+            help="Quantize the attention sink too (1, default) or keep it bf16 (0).",
         )
         parser.add_argument(
             "--kv-cache-quant-sink-keep",
@@ -2663,6 +2674,20 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _validate_offload(self):
+        if self.layerwise_offload_prefetch_size < 0.0:
+            raise ValueError("layerwise_offload_prefetch_size must be non-negative")
+        if self.layerwise_offload_prefetch_size > 1 and (
+            isinstance(self.layerwise_offload_prefetch_size, float)
+            and not self.layerwise_offload_prefetch_size.is_integer()
+        ):
+            self.layerwise_offload_prefetch_size = int(
+                math.floor(self.layerwise_offload_prefetch_size)
+            )
+            logger.info(
+                "Invalid --layerwise-offload-prefetch-size value passed, "
+                f"truncated to: {self.layerwise_offload_prefetch_size}"
+            )
+
         # validate dit_offload_prefetch_size
         if self.dit_offload_prefetch_size > 1 and (
             isinstance(self.dit_offload_prefetch_size, float)

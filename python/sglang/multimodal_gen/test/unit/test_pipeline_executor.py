@@ -77,6 +77,34 @@ class _ComponentStage:
         ]
 
 
+class _SequentialPrefixStage:
+    def __init__(self, name):
+        self.name = name
+        self.split_calls = 0
+
+    def iter_sequential_requests(self, batch, server_args):
+        del server_args
+        self.split_calls += 1
+        return iter((batch,))
+
+
+class _SequentialPrefixExecutor(PipelineExecutor):
+    def __init__(self):
+        super().__init__(server_args=SimpleNamespace())
+        self.grouped_stage_names = None
+        self.sequential_stage_names = []
+
+    def execute_group(self, stages, batches, server_args):
+        del server_args
+        self.grouped_stage_names = [stage.name for stage in stages]
+        return batches
+
+    def execute(self, stages, batch, server_args):
+        del server_args
+        self.sequential_stage_names.append([stage.name for stage in stages])
+        return batch
+
+
 def test_execute_with_profiling_uses_inference_tensor_platform(monkeypatch):
     monkeypatch.setattr(pipeline_executor, "current_platform", _InferenceTensorPlatform)
     executor = _RecordingExecutor()
@@ -108,6 +136,25 @@ def test_execute_group_with_profiling_uses_platform_inference_mode(monkeypatch):
 
     assert executor.group_inference_mode is False
     assert executor.group_grad_enabled is False
+
+
+def test_sequential_group_execution_honors_pipeline_prefix_boundary():
+    stages = [_SequentialPrefixStage(str(index)) for index in range(5)]
+    batches = [
+        SimpleNamespace(metrics=None, request_id="a"),
+        SimpleNamespace(metrics=None, request_id="b"),
+    ]
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(sequential_grouped_stage_count=lambda: 3)
+    )
+    executor = _SequentialPrefixExecutor()
+
+    outputs = list(executor.execute_group_sequentially(stages, batches, server_args))
+
+    assert outputs == batches
+    assert executor.grouped_stage_names == ["0", "1", "2"]
+    assert executor.sequential_stage_names == [["3", "4"], ["3", "4"]]
+    assert stages[2].split_calls == 2
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import torch
 
@@ -156,6 +157,9 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             self.text_encoder,
         )
         if dp_group is None:
+            batched = self._run_text_only_encoder_batch(grouped, server_args)
+            if batched is not None:
+                return batched
             return super().run_grouped_requests(batches, server_args)
 
         results: list[Req | None] = [None] * len(batches)
@@ -208,6 +212,81 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 self.copy_deduplicated_outputs(first_result, batch)
                 results[index] = batch
 
+        return [result for result in results if result is not None]
+
+    def _run_text_only_encoder_batch(self, grouped, server_args: ServerArgs):
+        """Batch distinct text-only presentations while loading each layer once."""
+
+        if len(grouped) < 2:
+            return None
+        encode_ids_batch = getattr(self.text_encoder, "encode_ids_batch", None)
+        if not callable(encode_ids_batch) or self.tokenizer is None:
+            return None
+
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
+            minimax_h3_text_only_ids,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
+            minimax_h3_plan_from_batch,
+        )
+
+        representatives = [equivalent[0][1] for _, equivalent in grouped]
+        plans = [minimax_h3_plan_from_batch(batch) for batch in representatives]
+        if any(
+            plan is None or plan.task != "t2va" or bool(plan.materials)
+            for plan in plans
+        ):
+            return None
+
+        input_ids = [
+            minimax_h3_text_only_ids(self.tokenizer, plan.prompt) for plan in plans
+        ]
+        self._manage_text_encoder_use(0)
+        started = time.perf_counter()
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            hidden_states = encode_ids_batch(input_ids)
+        duration = time.perf_counter() - started
+        if len(hidden_states) != len(representatives):
+            raise RuntimeError(
+                "MiniMax H3 batched encoder returned an unexpected result count: "
+                f"{len(hidden_states)} for {len(representatives)} requests"
+            )
+
+        results: list[Req | None] = [None] * sum(
+            len(equivalent) for _, equivalent in grouped
+        )
+        for (_, equivalent), ids, hidden in zip(
+            grouped, input_ids, hidden_states, strict=True
+        ):
+            first_index, first_batch = equivalent[0]
+            text_len = int(ids.shape[0])
+            if list(hidden.shape) != [text_len, self.text_encoder.hidden_dim]:
+                raise ValueError(
+                    "unexpected MiniMax H3 batched text embedding shape: "
+                    f"{list(hidden.shape)}"
+                )
+            first_batch.extra[MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY] = {
+                "positive": {
+                    "hidden_states": hidden,
+                    "text_len": text_len,
+                    "text_token_tags": torch.ones(text_len, dtype=torch.long),
+                }
+            }
+            first_result = self(first_batch, server_args)
+            if first_result.metrics is not None:
+                first_result.metrics.record_stage(
+                    "MiniMaxH3TextEncodingStage.batched_encode", duration
+                )
+            results[first_index] = first_result
+            for index, batch in equivalent[1:]:
+                self.copy_deduplicated_outputs(first_result, batch)
+                results[index] = batch
+
+        logger.info(
+            "Batched %d distinct MiniMax H3 text presentations in %.3f seconds",
+            len(representatives),
+            duration,
+        )
         return [result for result in results if result is not None]
 
     def _log_dp_choice(self, batch_size: int, world_size: int) -> None:

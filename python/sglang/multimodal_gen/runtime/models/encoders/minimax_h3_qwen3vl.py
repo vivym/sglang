@@ -173,6 +173,56 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             )
         return hidden
 
+    @torch.no_grad()
+    def encode_ids_batch(
+        self,
+        input_ids: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Encode right-padded text-only presentations in one layer traversal."""
+
+        if not input_ids:
+            raise ValueError("input_ids batch must not be empty")
+        if any(ids.dim() != 1 for ids in input_ids):
+            shapes = [list(ids.shape) for ids in input_ids]
+            raise ValueError(f"every input_ids tensor must be 1-D, got {shapes}")
+
+        host_ids = [ids.to(device="cpu", dtype=torch.long) for ids in input_ids]
+        lengths = [int(ids.shape[0]) for ids in host_ids]
+        padding_idx = self.model.language_model.padding_idx
+        padded_ids = torch.nn.utils.rnn.pad_sequence(
+            host_ids,
+            batch_first=True,
+            padding_value=int(padding_idx if padding_idx is not None else 0),
+        )
+        attention_mask = torch.arange(padded_ids.shape[1]).unsqueeze(0) < torch.tensor(
+            lengths
+        ).unsqueeze(1)
+        device_ids = padded_ids.to(self.device)
+        device_mask = attention_mask.to(self.device)
+        outputs = self.model(
+            input_ids=device_ids,
+            attention_mask=device_mask,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+            use_cache=False,
+        )
+        hidden_states = outputs.last_hidden_state
+        if list(hidden_states.shape[:2]) != list(device_ids.shape):
+            raise ValueError(
+                "unexpected batched hidden shape "
+                f"{list(hidden_states.shape)}, expected prefix {list(device_ids.shape)}"
+            )
+        if int(hidden_states.shape[-1]) != self.hidden_dim:
+            raise ValueError(
+                f"unexpected hidden width {hidden_states.shape[-1]}, "
+                f"expected {self.hidden_dim}"
+            )
+        return [
+            hidden_states[index, :length].to(torch.bfloat16)
+            for index, length in enumerate(lengths)
+        ]
+
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],

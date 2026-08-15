@@ -422,6 +422,10 @@ class PipelineConfig:
         """Return whether batched AR is followed by per-request DiT inference."""
         return False
 
+    def sequential_grouped_stage_count(self) -> int:
+        """Number of leading stages to run over a request group before sequential work."""
+        return 1
+
     def supports_sequential_multi_output_inference(self):
         """Return whether one request's outputs run through DiT/VAE sequentially."""
         return False
@@ -441,6 +445,12 @@ class PipelineConfig:
                 vae_scale = getattr(
                     self.vae_config.arch_config, "vae_scale_factor", None
                 )
+                if vae_scale is None:
+                    vae_scale = getattr(
+                        self.vae_config.arch_config,
+                        "spatial_compression_ratio",
+                        None,
+                    )
                 if vae_scale is None and hasattr(
                     self.vae_config, "get_vae_scale_factor"
                 ):
@@ -1163,9 +1173,9 @@ class PipelineConfig:
                 elif isinstance(current_value, tuple) and all(
                     isinstance(v, ModelConfig) for v in current_value
                 ):
-                    assert len(current_value) == len(
-                        new_value
-                    ), "Users shouldn't delete or add text encoder config objects in your json"
+                    assert len(current_value) == len(new_value), (
+                        "Users shouldn't delete or add text encoder config objects in your json"
+                    )
                     for target_config, source_config in zip(
                         current_value, new_value, strict=True
                     ):

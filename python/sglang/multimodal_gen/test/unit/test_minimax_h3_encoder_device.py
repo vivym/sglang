@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -48,6 +49,50 @@ class TestMiniMaxH3EncoderDevice(unittest.TestCase):
             minimax_h3_qwen3vl, "get_local_torch_device", return_value=cpu
         ):
             self.assertEqual(encoder.device, cpu)
+
+    def test_encode_ids_batch_right_pads_and_splits_outputs(self):
+        class FakeQwenModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = SimpleNamespace(padding_idx=99)
+                self.input_ids = None
+                self.attention_mask = None
+
+            def forward(self, *, input_ids, attention_mask, **_kwargs):
+                self.input_ids = input_ids.detach().clone()
+                self.attention_mask = attention_mask.detach().clone()
+                hidden = input_ids.unsqueeze(-1).expand(-1, -1, 5120)
+                return SimpleNamespace(last_hidden_state=hidden)
+
+        encoder = self._encoder_with_param_on(torch.device("cpu"))
+        encoder.model = FakeQwenModel()
+        encoder.hidden_dim = 5120
+        cpu = torch.device("cpu")
+
+        with mock.patch.object(
+            minimax_h3_qwen3vl, "get_local_torch_device", return_value=cpu
+        ):
+            outputs = encoder.encode_ids_batch(
+                [torch.tensor([1, 2, 3]), torch.tensor([4, 5])]
+            )
+
+        self.assertTrue(
+            torch.equal(
+                encoder.model.input_ids,
+                torch.tensor([[1, 2, 3], [4, 5, 99]]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                encoder.model.attention_mask,
+                torch.tensor([[True, True, True], [True, True, False]]),
+            )
+        )
+        self.assertEqual(
+            [list(output.shape) for output in outputs], [[3, 5120], [2, 5120]]
+        )
+        self.assertTrue(torch.equal(outputs[0][:, 0], torch.tensor([1, 2, 3])))
+        self.assertTrue(torch.equal(outputs[1][:, 0], torch.tensor([4, 5])))
 
 
 if __name__ == "__main__":

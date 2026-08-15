@@ -184,8 +184,13 @@ class BatchAdmissionController:
             return None
         proposed = current_reqs + [candidate_req]
         limit = self.limit_for(proposed[0])
+        batch_size = self._effective_batch_size(proposed)
+        if batch_size > limit.max_batch_size:
+            return limit.cap_reason or f"config_cap:{limit.max_batch_size}"
+        if limit.max_cost is None:
+            return None
         return limit.reject_reason(
-            batch_size=self._effective_batch_size(proposed),
+            batch_size=batch_size,
             batch_cost=self.estimate_batch_cost(proposed),
         )
 
@@ -197,9 +202,11 @@ class BatchAdmissionController:
         limit = self.limit_for(reqs[0])
         if self._effective_batch_size(reqs) >= limit.max_batch_size:
             return True
+        if limit.max_cost is None:
+            return False
 
         next_cost = self.estimate_batch_cost(reqs + [reqs[0]])
-        return limit.max_cost is not None and next_cost > limit.max_cost
+        return next_cost > limit.max_cost
 
     def limit_reason_for_batch(self, reqs: list[Req]) -> str | None:
         if not self.enabled or not reqs:
@@ -208,6 +215,8 @@ class BatchAdmissionController:
         limit = self.limit_for(reqs[0])
         if self._effective_batch_size(reqs) >= limit.max_batch_size:
             return limit.cap_reason or f"config_cap:{limit.max_batch_size}"
+        if limit.max_cost is None:
+            return None
 
         next_cost = self.estimate_batch_cost(reqs + [reqs[0]])
         return limit.stop_reason_for_next_cost(next_cost)

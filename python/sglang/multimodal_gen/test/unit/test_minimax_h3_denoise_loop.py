@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    _resolve_debug_latent_dump_path,
+)
 
 
 def _branch(
@@ -193,3 +196,16 @@ def test_rank_local_token_tags_match_reference_slice():
                 torch.testing.assert_close(
                     branch.static_kwargs["block_token_tags"], expected, rtol=0, atol=0
                 )
+
+
+def test_debug_latent_dump_path_can_distinguish_grouped_requests():
+    assert (
+        _resolve_debug_latent_dump_path(
+            "/tmp/h3-{seed}-{request_id}.pt", seed=43, request_id="request-1"
+        )
+        == "/tmp/h3-43-request-1.pt"
+    )
+    assert (
+        _resolve_debug_latent_dump_path("/tmp/h3-{seed}.pt", seed=None, request_id=None)
+        == "/tmp/h3-unknown.pt"
+    )

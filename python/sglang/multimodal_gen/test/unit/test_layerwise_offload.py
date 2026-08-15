@@ -174,6 +174,7 @@ def _server_args(**kwargs):
         text_encoder_cpu_offload=False,
         image_encoder_cpu_offload=False,
         vae_cpu_offload=False,
+        layerwise_offload_prefetch_size=0.0,
         dit_offload_prefetch_size=1,
         dit_layerwise_resident_layers=0.0,
         pin_cpu_memory=False,
@@ -405,6 +406,36 @@ def test_layerwise_configuration_filters_by_component_name(monkeypatch):
     assert is_layerwise_offloaded_module(text_encoder)
     assert not is_layerwise_offloaded_module(transformer)
     assert not is_layerwise_offloaded_module(vae)
+
+
+def test_layerwise_configuration_uses_component_specific_prefetch_size(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    text_encoder = _NestedEncoderDummyModel()
+    text_encoder.encoder.blocks = torch.nn.ModuleList([_DummyBlock() for _ in range(4)])
+    transformer = _NestedDummyModel()
+    transformer.encoder.blocks = torch.nn.ModuleList([_DummyBlock() for _ in range(4)])
+    modules = {
+        "text_encoder": text_encoder,
+        "transformer": transformer,
+    }
+    server_args = _server_args(
+        layerwise_offload_prefetch_size=2,
+        dit_offload_prefetch_size=3,
+    )
+
+    configured = configure_layerwise_offload_modules(
+        modules,
+        server_args,
+        component_names=["text_encoder", "transformer"],
+    )
+
+    assert configured == ["text_encoder", "transformer"]
+    assert text_encoder.layerwise_offload_managers[0].prefetch_size == 2
+    assert transformer.layerwise_offload_managers[0].prefetch_size == 3
 
 
 def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypatch):

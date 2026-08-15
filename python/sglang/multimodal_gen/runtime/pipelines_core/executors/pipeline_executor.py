@@ -267,13 +267,26 @@ class PipelineExecutor(ABC):
         batches: list[Req],
         server_args: ServerArgs,
     ):
-        """Yield outputs after batched AR and sequential DiT/VAE inference."""
-        batches = self.execute_group(stages[:1], batches, server_args)
+        """Yield outputs after a grouped prefix and sequential DiT/VAE inference."""
+        grouped_stage_count = int(
+            server_args.pipeline_config.sequential_grouped_stage_count()
+        )
+        if grouped_stage_count < 1 or grouped_stage_count >= len(stages):
+            raise ValueError(
+                "sequential_grouped_stage_count must select at least one stage "
+                f"and leave a sequential suffix, got {grouped_stage_count} for "
+                f"{len(stages)} stages"
+            )
+        grouped_stages = stages[:grouped_stage_count]
+        batches = self.execute_group(grouped_stages, batches, server_args)
 
-        remaining_stages = stages[1:]
+        split_stage = grouped_stages[-1]
+        remaining_stages = stages[grouped_stage_count:]
         sequential_start_time = time.monotonic()
         for parent_batch in batches:
-            for batch in stages[0].iter_sequential_requests(parent_batch, server_args):
+            for batch in split_stage.iter_sequential_requests(
+                parent_batch, server_args
+            ):
                 if batch.metrics is not None:
                     batch.metrics.record_stage(
                         "PipelineExecutor.sequential_wait",

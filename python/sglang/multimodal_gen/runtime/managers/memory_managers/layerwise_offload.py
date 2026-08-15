@@ -629,7 +629,9 @@ class LayerwiseOffloadableModuleMixin:
 
             num_layers = len(module_list)
             prefetch_value = (
-                server_args.dit_offload_prefetch_size if dit_tuning_enabled else 0.0
+                server_args.dit_offload_prefetch_size
+                if dit_tuning_enabled
+                else server_args.layerwise_offload_prefetch_size
             )
             if prefetch_value < 1.0:
                 prefetch_size = 1 + int(round(prefetch_value * (num_layers - 1)))

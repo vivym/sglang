@@ -714,7 +714,6 @@ class TestDiffusionModelDetection(unittest.TestCase):
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
-
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
@@ -1827,9 +1826,10 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.dit_cpu_offload)
         self.assertIn("text_encoder", args.layerwise_offload_components or [])
-        self.assertIn("vae", args.layerwise_offload_components or [])
+        self.assertNotIn("vae", args.layerwise_offload_components or [])
+        self.assertFalse(args.vae_cpu_offload)
 
-    def test_memory_minimax_h3_combines_fsdp_with_aux_layerwise_offload(self):
+    def test_memory_minimax_h3_keeps_vae_resident_with_aux_layerwise_offload(self):
         args = self._from_dict_with_pipeline_config(
             MiniMaxH3PipelineConfig(),
             kwargs={
@@ -1845,7 +1845,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.dit_layerwise_offload)
         self.assertIn("text_encoder", args.layerwise_offload_components or [])
-        self.assertIn("vae", args.layerwise_offload_components or [])
+        self.assertNotIn("vae", args.layerwise_offload_components or [])
 
     def test_minimax_h3_rejects_explicit_cfg_parallel(self):
         with self.assertRaisesRegex(

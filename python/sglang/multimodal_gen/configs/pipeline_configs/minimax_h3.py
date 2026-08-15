@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import torch
@@ -81,6 +82,42 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
 
     def supports_disaggregation(self) -> bool:
         return False
+
+    def supports_dynamic_batching(self) -> bool:
+        return True
+
+    def supports_native_grouped_requests(self) -> bool:
+        return True
+
+    def supports_sequential_dit_inference(self) -> bool:
+        return True
+
+    def sequential_grouped_stage_count(self) -> int:
+        # Validate and resolve every request before batching the text-only encoder.
+        # DiT and VAE remain strictly batch=1 after this prefix.
+        return 3
+
+    def estimate_request_cost(self, batch) -> float:
+        """Estimate H3 work from its resolved packed video/audio sequence."""
+        extra = getattr(batch, "extra", None)
+        plan = (
+            extra.get("minimax_h3_resolved_plan")
+            if isinstance(extra, Mapping)
+            else None
+        )
+        shape = getattr(plan, "shape", None)
+        if isinstance(shape, Mapping):
+            required = ("width", "height", "video_latent_t", "audio_latent_t")
+            if all(shape.get(name) is not None for name in required):
+                video_rows = (
+                    int(shape["video_latent_t"])
+                    * ((int(shape["height"]) + 31) // 32)
+                    * ((int(shape["width"]) + 31) // 32)
+                )
+                audio_rows = int(shape["audio_latent_t"]) * 2
+                outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+                return float((video_rows + audio_rows) * outputs)
+        return super().estimate_request_cost(batch)
 
     @property
     def requires_audio_output(self) -> bool:
@@ -217,9 +254,11 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         诊断逃生门：``MINIMAX_H3_FORCE_VAE_RESIDENT=0`` 可关闭强制常驻（仅用于
         对照实验，如 AdaLN on/off 需要腾内存的场景），默认强制。
         """
-        if (
-            os.environ.get("MINIMAX_H3_FORCE_VAE_RESIDENT", "1").strip().lower()
-            in ("0", "false", "no", "off")
+        if os.environ.get("MINIMAX_H3_FORCE_VAE_RESIDENT", "1").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
         ):
             logger.warning(
                 "MiniMax-H3 VAE force-resident DISABLED via "

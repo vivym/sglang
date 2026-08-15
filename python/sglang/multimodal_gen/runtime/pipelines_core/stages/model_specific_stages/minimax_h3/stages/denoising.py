@@ -1094,8 +1094,14 @@ def _publish_full_loop_outputs(
     batch.audio_latents = minimax_h3_unpack_audio_tokens(
         audio_target_rows, audio_t=ctx.audio_t * 2, audio_channel=2
     )
-    dump_path = os.environ.get("MINIMAX_H3_DUMP_LATENTS_PATH", "").strip()
-    if dump_path:
+    dump_path_template = os.environ.get("MINIMAX_H3_DUMP_LATENTS_PATH", "").strip()
+    if dump_path_template:
+        plan_seed = getattr(ctx.plan, "seed", None) if ctx.plan is not None else None
+        dump_path = _resolve_debug_latent_dump_path(
+            dump_path_template,
+            seed=plan_seed if plan_seed is not None else getattr(batch, "seed", None),
+            request_id=getattr(batch, "request_id", None),
+        )
         dump_parent = os.path.dirname(os.path.abspath(dump_path))
         os.makedirs(dump_parent, exist_ok=True)
         torch.save(
@@ -1106,6 +1112,20 @@ def _publish_full_loop_outputs(
             dump_path,
         )
         print(f"[latents] saved replay artifact to {dump_path}", flush=True)
+
+
+def _resolve_debug_latent_dump_path(
+    template: str,
+    *,
+    seed: int | None,
+    request_id: str | None,
+) -> str:
+    """Resolve per-request fields in the opt-in latent replay artifact path."""
+
+    return template.format(
+        seed="unknown" if seed is None else seed,
+        request_id="unknown" if request_id is None else request_id,
+    )
 
 
 __all__ = [
