@@ -121,6 +121,62 @@ def _from_dict_without_model_resolution(
         return ServerArgs.from_dict(kwargs)
 
 
+class TestNetworkPorts(unittest.TestCase):
+    @staticmethod
+    def _from_dict(kwargs):
+        with patch(
+            "sglang.multimodal_gen.runtime.server_args.server_args.is_port_available",
+            return_value=True,
+        ):
+            return _from_dict_without_model_resolution(kwargs)
+
+    def test_strict_ports_reject_implicit_broker_master_collision(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "Master port 30501 duplicates Broker port"
+        ):
+            self._from_dict(
+                {
+                    "model_path": "/fake",
+                    "port": 30500,
+                    "master_port": 30501,
+                    "scheduler_port": 30502,
+                    "strict_ports": True,
+                }
+            )
+
+    def test_strict_ports_accept_explicit_independent_broker_port(self):
+        args = self._from_dict(
+            {
+                "model_path": "/fake",
+                "port": 30500,
+                "master_port": 30501,
+                "scheduler_port": 30502,
+                "broker_port": 30503,
+                "strict_ports": True,
+            }
+        )
+
+        self.assertEqual(args.broker_port, 30503)
+
+    def test_non_strict_ports_avoid_settled_broker_port(self):
+        args = self._from_dict(
+            {
+                "model_path": "/fake",
+                "port": 30500,
+                "master_port": 30501,
+                "scheduler_port": 30501,
+            }
+        )
+
+        self.assertEqual(args.broker_port, 30501)
+        self.assertEqual(args.scheduler_port, 30543)
+        self.assertEqual(args.master_port, 30538)
+        self.assertEqual(
+            len({args.port, args.broker_port, args.scheduler_port, args.master_port}),
+            4,
+        )
+
+
 class TestServerArgsPathExpansion(unittest.TestCase):
     def _from_dict_without_model_resolution(self, kwargs):
         return _from_dict_without_model_resolution(kwargs)

@@ -119,30 +119,44 @@ async def lifespan(app: FastAPI):
     warmup_done = asyncio.Event()
     app.state.server_warmup_done = warmup_done
 
-    # 2. Start the ZMQ Broker in the background to handle offline requests
-    broker_task = asyncio.create_task(run_zeromq_broker(server_args))
+    # 2. Bind the ZMQ Broker before reporting application startup complete.
+    broker_ready = asyncio.get_running_loop().create_future()
+    broker_task = asyncio.create_task(
+        run_zeromq_broker(server_args, ready=broker_ready)
+    )
     warmup_task = None
-    if server_args.warmup_mode == "server":
-        warmup_task = asyncio.create_task(
-            _run_server_warmup_after_http_live(server_args, warmup_done)
-        )
-    else:
-        warmup_done.set()
 
     try:
-        yield
-    finally:
-        if warmup_task is not None and not warmup_task.done():
-            warmup_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await warmup_task
+        try:
+            await broker_ready
+        except BaseException:
+            if not broker_task.done():
+                broker_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await broker_task
+            raise
 
-        # On shutdown
-        logger.info("FastAPI app is shutting down...")
-        await shutdown_video_jobs()
-        broker_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await broker_task
+        if server_args.warmup_mode == "server":
+            warmup_task = asyncio.create_task(
+                _run_server_warmup_after_http_live(server_args, warmup_done)
+            )
+        else:
+            warmup_done.set()
+
+        try:
+            yield
+        finally:
+            if warmup_task is not None and not warmup_task.done():
+                warmup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await warmup_task
+
+            logger.info("FastAPI app is shutting down...")
+            await shutdown_video_jobs()
+            broker_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await broker_task
+    finally:
         async_scheduler_client.close()
 
 

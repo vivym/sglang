@@ -17,7 +17,9 @@ from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.entrypoints.utils import ShutdownReq
-from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+    run_scheduler_process as _run_scheduler_process_entrypoint,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -137,6 +139,14 @@ def _run_http_server_process(server_args: ServerArgs) -> None:
     launch_http_server_only(server_args)
 
 
+def _run_scheduler_process(*args) -> None:
+    # The launcher owns terminal interrupts and asks workers to stop through
+    # ShutdownReq. Letting every process handle Ctrl-C races that request and
+    # leaves noisy KeyboardInterrupt tracebacks from worker event loops.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _run_scheduler_process_entrypoint(*args)
+
+
 def _request_monolithic_scheduler_shutdown(server_args: ServerArgs) -> None:
     if server_args.disagg_role != RoleType.MONOLITHIC:
         return
@@ -216,7 +226,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         scheduler_pipe_writers.append(writer)
         if i == 0:  # This node's local pipe master
             process = mp.Process(
-                target=run_scheduler_process,
+                target=_run_scheduler_process,
                 args=(
                     i,  # local_rank
                     rank,
@@ -233,7 +243,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             )
         else:  # Slave workers
             process = mp.Process(
-                target=run_scheduler_process,
+                target=_run_scheduler_process,
                 args=(
                     i,  # local_rank
                     rank,
@@ -554,7 +564,7 @@ def _run_disagg_role_process(
     This avoids relying on CUDA_VISIBLE_DEVICES remapping, which
     may not work if CUDA was pre-initialized in the parent process.
     """
-    run_scheduler_process(
+    _run_scheduler_process(
         local_rank=gpu_id,
         rank=rank,
         master_port=server_args.master_port,
@@ -683,7 +693,7 @@ def launch_disagg_role(server_args: ServerArgs):
     role_type = server_args.disagg_role
     if server_args.disagg_server_addr is None:
         raise ValueError(
-            "--disagg-server-addr is required for --disagg-role " f"{role_type.value}"
+            f"--disagg-server-addr is required for --disagg-role {role_type.value}"
         )
 
     # Derive endpoints

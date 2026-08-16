@@ -1,3 +1,4 @@
+import signal
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -34,6 +35,16 @@ class _FakeProcess:
 
 
 class TestLaunchServerShutdown(unittest.TestCase):
+    def test_scheduler_worker_ignores_parent_owned_sigint(self):
+        with (
+            patch.object(ls.signal, "signal") as set_signal,
+            patch.object(ls, "_run_scheduler_process_entrypoint") as entrypoint,
+        ):
+            ls._run_scheduler_process("worker-arg")
+
+        set_signal.assert_called_once_with(signal.SIGINT, signal.SIG_IGN)
+        entrypoint.assert_called_once_with("worker-arg")
+
     def test_monolithic_shutdown_requests_scheduler_then_forces_worker(self):
         process = _FakeProcess()
         server_args = SimpleNamespace(disagg_role=RoleType.MONOLITHIC)

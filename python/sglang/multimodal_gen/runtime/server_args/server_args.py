@@ -386,6 +386,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    # ZMQ endpoint used by offline DiffGenerator clients. ``None`` searches for
+    # an available port starting immediately after the settled HTTP port.
+    broker_port: int | None = None
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -476,10 +479,6 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # SGLang server for PE model inference
     pe_server_url: str | None = None
-
-    @property
-    def broker_port(self) -> int:
-        return self.port + 1
 
     @property
     def is_local_mode(self) -> bool:
@@ -1067,6 +1066,9 @@ class ServerArgs(DisaggServerArgsMixin):
             requested_ports = []
             if needs_http:
                 requested_ports.append((self.port, "HTTP"))
+                if self.broker_port is None:
+                    self.broker_port = self.port + 1
+                requested_ports.append((self.broker_port, "Broker"))
             for replica in range(self.dp_size or 1):
                 requested_ports.append(
                     (self.scheduler_port + replica, f"Scheduler[{replica}]")
@@ -1087,6 +1089,13 @@ class ServerArgs(DisaggServerArgsMixin):
             if needs_http:
                 self.port = self.settle_port(self.port)
                 settled_ports.add(self.port)
+                requested_broker_port = (
+                    self.port + 1 if self.broker_port is None else self.broker_port
+                )
+                self.broker_port = self.settle_port(
+                    requested_broker_port, avoid=settled_ports
+                )
+                settled_ports.add(self.broker_port)
             initial_scheduler_port = self.scheduler_port + (
                 random.randint(0, 100) if self.scheduler_port == 5555 else 0
             )
@@ -2132,6 +2141,15 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=ServerArgs.port,
             help="Port for the HTTP API server.",
+        )
+        parser.add_argument(
+            "--broker-port",
+            type=int,
+            default=ServerArgs.broker_port,
+            help=(
+                "Port for the offline ZMQ broker. By default, search for an "
+                "available port starting after the settled HTTP port."
+            ),
         )
         parser.add_argument(
             "--strict-ports",

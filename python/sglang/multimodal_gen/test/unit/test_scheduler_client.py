@@ -158,3 +158,24 @@ def test_broker_closes_socket_and_context_when_cancelled(monkeypatch):
         context.destroy.assert_called_once_with(linger=0)
 
     asyncio.run(run_test())
+
+
+def test_broker_reports_bind_failure_and_cleans_up(monkeypatch):
+    async def run_test():
+        error = zmq.ZMQError(zmq.EADDRINUSE)
+        socket = MagicMock()
+        socket.bind.side_effect = error
+        context = MagicMock()
+        context.socket.return_value = socket
+        monkeypatch.setattr(zmq.asyncio, "Context", lambda: context)
+        ready = asyncio.get_running_loop().create_future()
+
+        with pytest.raises(zmq.ZMQError) as raised:
+            await run_zeromq_broker(SimpleNamespace(broker_port=12345), ready=ready)
+
+        assert raised.value is error
+        assert ready.exception() is error
+        socket.close.assert_called_once_with(linger=0)
+        context.destroy.assert_called_once_with(linger=0)
+
+    asyncio.run(run_test())

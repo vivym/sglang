@@ -1,3 +1,4 @@
+import asyncio
 import itertools
 import pickle
 import time
@@ -75,7 +76,9 @@ def _resolve_timeout_ms(server_args: ServerArgs, timeout_ms: int | None) -> int 
     return None if timeout_s is None else timeout_s * 1000
 
 
-async def run_zeromq_broker(server_args: ServerArgs):
+async def run_zeromq_broker(
+    server_args: ServerArgs, ready: asyncio.Future[None] | None = None
+):
     """
     This function runs as a background task in the FastAPI process.
     It listens for TCP requests from offline clients (e.g., DiffGenerator).
@@ -83,10 +86,13 @@ async def run_zeromq_broker(server_args: ServerArgs):
     ctx = zmq.asyncio.Context()
     socket = ctx.socket(zmq.REP)
     broker_endpoint = f"tcp://127.0.0.1:{server_args.broker_port}"
-    socket.bind(broker_endpoint)
-    logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
 
     try:
+        socket.bind(broker_endpoint)
+        logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
+        if ready is not None and not ready.done():
+            ready.set_result(None)
+
         while True:
             try:
                 # 1. Receive a request from an offline client
@@ -109,6 +115,10 @@ async def run_zeromq_broker(server_args: ServerArgs):
                     )
                 except Exception:
                     pass
+    except BaseException as error:
+        if ready is not None and not ready.done():
+            ready.set_exception(error)
+        raise
     finally:
         socket.close(linger=0)
         ctx.destroy(linger=0)
