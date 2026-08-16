@@ -177,6 +177,21 @@ class TestNetworkPorts(unittest.TestCase):
         )
 
 
+class TestAsyncOutputPersistence(unittest.TestCase):
+    def test_default_is_disabled(self):
+        args = ServerArgs(model_path="/fake")
+
+        self.assertFalse(args.async_output_persistence)
+
+    def test_multi_node_is_rejected(self):
+        args = ServerArgs(model_path="/fake")
+        args.async_output_persistence = True
+        args.nnodes = 2
+
+        with self.assertRaisesRegex(ValueError, "currently requires nnodes=1"):
+            args._validate_batching()
+
+
 class TestServerArgsPathExpansion(unittest.TestCase):
     def _from_dict_without_model_resolution(self, kwargs):
         return _from_dict_without_model_resolution(kwargs)

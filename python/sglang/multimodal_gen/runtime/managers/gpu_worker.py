@@ -6,7 +6,9 @@ import logging
 import multiprocessing as mp
 import os
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, List, Union
@@ -23,6 +25,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (  # isort: skip
 globally_suppress_loggers()
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_tp_rank,
@@ -44,9 +47,15 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    attach_audio_to_video_sample,
     materialize_output_sample,
     post_process_sample,
+    save_materialized_output,
     save_outputs,
+)
+from sglang.multimodal_gen.runtime.ipc_array import (
+    PendingOutputFileRef,
+    is_local_endpoint,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
@@ -162,6 +171,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.cfg_cpu_group = self.cfg_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
         self.memory_occupation: MemoryOccupationController | None = None
+        self._output_persistence_executor: ThreadPoolExecutor | None = None
+        self._output_persistence_slots: threading.BoundedSemaphore | None = None
+        if self.is_output_rank and server_args.async_output_persistence:
+            self._output_persistence_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="sglang-output-persistence",
+            )
+            # Bound staged host-memory outputs even if a future model produces
+            # them faster than the CPU encoder can persist them.
+            self._output_persistence_slots = threading.BoundedSemaphore(2)
+
+    def shutdown(self) -> None:
+        executor = self._output_persistence_executor
+        self._output_persistence_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -398,8 +423,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     ),
                     log_reqs=[req],
                     return_req=False,
-                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
-                        req, output_batch
+                    save_output_paths=lambda output_batch, req=req: (
+                        self._save_output_paths(req, output_batch)
                     ),
                     error_context=f"grouped request {req.request_id}",
                     execution_start_time=group_start_time,
@@ -699,6 +724,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not self.is_output_rank or output_batch.output is None:
             return
 
+        if self._can_persist_output_asynchronously(req, output_batch):
+            self._save_output_path_asynchronously(req, output_batch)
+            return
+
         dynamic_output_paths = None
         if req.extra:
             dynamic_output_paths = req.extra.get("dynamic_batch_output_paths")
@@ -741,6 +770,121 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
         )
+
+    def _can_persist_output_asynchronously(
+        self,
+        req: Req,
+        output_batch: OutputBatch,
+    ) -> bool:
+        if (
+            self._output_persistence_executor is None
+            or self._output_persistence_slots is None
+            or req.data_type != DataType.VIDEO
+            or len(output_batch.output) != 1
+            or req.enable_frame_interpolation
+            or req.enable_upscaling
+            or (req.extra and req.extra.get("dynamic_batch_output_paths") is not None)
+        ):
+            return False
+        return is_local_endpoint(self.server_args.scheduler_endpoint)
+
+    def _save_output_path_asynchronously(
+        self,
+        req: Req,
+        output_batch: OutputBatch,
+    ) -> None:
+        assert self._output_persistence_executor is not None
+        assert self._output_persistence_slots is not None
+
+        self._output_persistence_slots.acquire()
+        submitted = False
+        start_time = time.perf_counter()
+        try:
+            sample = attach_audio_to_video_sample(
+                output_batch.output[0],
+                output_batch.audio,
+                0,
+            )
+            materialized = materialize_output_sample(
+                sample,
+                req.data_type,
+                req.fps,
+            )
+            # The background task must own CPU-only state so the next request
+            # can use CUDA without retaining the decoded GPU tensors.
+            materialized.sample = None
+            if isinstance(materialized.audio, torch.Tensor):
+                materialized.audio = (
+                    materialized.audio.detach().float().clamp(-1.0, 1.0).cpu()
+                )
+
+            output_ref = PendingOutputFileRef.create(req.output_file_path(1, 0))
+            future = self._output_persistence_executor.submit(
+                self._persist_materialized_output,
+                output_ref,
+                materialized,
+                req.data_type,
+                req.output_compression,
+                output_batch.audio_sample_rate,
+            )
+            future.add_done_callback(
+                lambda _future: self._output_persistence_slots.release()
+            )
+            submitted = True
+            output_batch.output_file_paths = [output_ref]
+        finally:
+            if not submitted:
+                self._output_persistence_slots.release()
+
+        duration = time.perf_counter() - start_time
+        for metrics in self._iter_output_metrics(output_batch):
+            metrics.record_stage(
+                "GPUWorker.async_output_cpu_stage",
+                duration,
+            )
+        logger.info(
+            "Asynchronous output staged on CPU for %s in %.3f seconds",
+            output_ref.path,
+            duration,
+        )
+
+    @staticmethod
+    def _persist_materialized_output(
+        output_ref: PendingOutputFileRef,
+        materialized,
+        data_type: DataType,
+        output_compression: int | None,
+        audio_sample_rate: int | None,
+    ) -> None:
+        start_time = time.perf_counter()
+        try:
+            save_materialized_output(
+                materialized,
+                data_type,
+                output_ref.staging_path,
+                save_output=True,
+                audio_sample_rate=audio_sample_rate,
+                output_compression=output_compression,
+            )
+            output_ref.publish_success()
+            logger.info(
+                "Asynchronous output published to %s in %.3f seconds",
+                output_ref.path,
+                time.perf_counter() - start_time,
+            )
+        except Exception as error:
+            try:
+                output_ref.publish_error(error)
+            except Exception:
+                logger.exception(
+                    "Failed to publish asynchronous output error for %s",
+                    output_ref.path,
+                )
+            logger.exception(
+                "Asynchronous output persistence failed for %s after %.3f seconds",
+                output_ref.path,
+                time.perf_counter() - start_time,
+            )
 
     def _save_group_output_paths(
         self,
@@ -1158,6 +1302,7 @@ def run_scheduler_process(
     finally:
         # Clean up resources to speed up shutdown
         if "scheduler" in locals():
+            scheduler.worker.shutdown()
             del scheduler
         gc.collect()
         if torch.cuda.is_initialized():

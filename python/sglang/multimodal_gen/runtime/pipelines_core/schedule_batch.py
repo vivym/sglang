@@ -458,7 +458,9 @@ class OutputBatch:
     rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
-    output_file_paths: list[str] | None = None
+    # Local scheduler transport may temporarily carry PendingOutputFileRef;
+    # clients materialize it back to a string before exposing the result.
+    output_file_paths: list[Any] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional[RequestMetrics] = None

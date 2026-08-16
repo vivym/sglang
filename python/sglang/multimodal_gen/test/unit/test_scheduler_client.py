@@ -1,6 +1,7 @@
 import asyncio
 import pickle
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,6 +9,8 @@ import pytest
 import zmq
 import zmq.asyncio
 
+from sglang.multimodal_gen.runtime.ipc_array import PendingOutputFileRef
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import (
     AsyncSchedulerClient,
     SchedulerClient,
@@ -94,6 +97,51 @@ def test_async_scheduler_client_waits_for_delayed_response():
             context.destroy(linger=0)
 
     asyncio.run(run_test())
+
+
+def test_async_scheduler_client_materializes_pending_output_off_event_loop(tmp_path):
+    async def run_test():
+        ref = PendingOutputFileRef.create(
+            str(tmp_path / "output.mp4"), timeout_seconds=1.0
+        )
+        Path(ref.staging_path).write_bytes(b"media")
+        socket = MagicMock()
+        socket.send = AsyncMock()
+        socket.recv = AsyncMock(
+            return_value=pickle.dumps(OutputBatch(output_file_paths=[ref]))
+        )
+        client = AsyncSchedulerClient()
+        client.context = SimpleNamespace(socket=lambda _socket_type: socket)
+        client.server_args = SimpleNamespace(scheduler_rpc_timeout=None)
+
+        async def publish_after_event_loop_turn():
+            await asyncio.sleep(0.02)
+            ref.publish_success()
+
+        publisher = asyncio.create_task(publish_after_event_loop_turn())
+        result = await client._forward_one("tcp://scheduler", object(), None)
+        await publisher
+
+        assert result.output_file_paths == [str(tmp_path / "output.mp4")]
+        socket.close.assert_called_once_with()
+
+    asyncio.run(run_test())
+
+
+def test_sync_scheduler_client_materializes_pending_output(tmp_path):
+    ref = PendingOutputFileRef.create(str(tmp_path / "output.mp4"), timeout_seconds=1.0)
+    Path(ref.staging_path).write_bytes(b"media")
+    ref.publish_success()
+    socket = MagicMock()
+    socket.recv_pyobj.return_value = OutputBatch(output_file_paths=[ref])
+    client = SchedulerClient()
+    client.context = SimpleNamespace(socket=lambda _socket_type: socket)
+    client.server_args = SimpleNamespace(scheduler_rpc_timeout=None)
+
+    result = client._forward_one("tcp://scheduler", object(), None)
+
+    assert result.output_file_paths == [str(tmp_path / "output.mp4")]
+    socket.close.assert_called_once_with()
 
 
 def test_async_scheduler_client_honors_explicit_deadline():

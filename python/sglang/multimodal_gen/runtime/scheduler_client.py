@@ -23,7 +23,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ShutdownReq,
     UnmergeLoraWeightsReq,
 )
-from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
+from sglang.multimodal_gen.runtime.ipc_array import (
+    PendingOutputFileRef,
+    materialize_file_refs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (
@@ -299,7 +302,7 @@ class AsyncSchedulerClient:
             await socket.send(pickle.dumps(batch))
             payload = await socket.recv()
             output_batch = pickle.loads(payload)
-            _materialize_output_batch_file_refs(output_batch)
+            await asyncio.to_thread(_materialize_output_batch_file_refs, output_batch)
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
@@ -345,10 +348,23 @@ def _materialize_output_batch_file_refs(output_batch: Any) -> None:
     if not isinstance(output_batch, OutputBatch):
         return
 
+    waits_for_pending_output = any(
+        isinstance(path, PendingOutputFileRef)
+        for path in (output_batch.output_file_paths or [])
+    )
     start_time = time.perf_counter()
     output_batch.output = materialize_file_refs(output_batch.output)
+    output_batch.output_file_paths = materialize_file_refs(
+        output_batch.output_file_paths
+    )
+    duration = time.perf_counter() - start_time
     if output_batch.metrics is not None:
         output_batch.metrics.record_stage(
             "SchedulerClient.materialize_file_refs",
-            time.perf_counter() - start_time,
+            duration,
+        )
+    if waits_for_pending_output:
+        logger.info(
+            "Scheduler client waited %.3f seconds for asynchronous output persistence",
+            duration,
         )
