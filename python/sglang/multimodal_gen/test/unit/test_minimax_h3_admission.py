@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -146,6 +147,44 @@ def test_batch_admission_cost_uses_h3_packed_target_rows():
 
     # 37 * (768 / 32) * (1344 / 32) video rows + 207 * 2 audio rows.
     assert MiniMaxH3PipelineConfig().estimate_request_cost(batch) == 75420.0
+
+
+def test_mixed_duration_requests_share_encoder_batch_signature():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.server_args = SimpleNamespace(pipeline_config=MiniMaxH3PipelineConfig())
+
+    def request(duration: float, frames: int):
+        params = MiniMaxH3SamplingParams(
+            prompt=f"duration {duration}",
+            task="t2va",
+            conditions=[],
+            target={**TARGET, "duration_seconds": duration},
+            num_inference_steps=2,
+            flow_shift=12.0,
+            audio_flow_shift=3.0,
+        )
+        params.width = 1344
+        params.height = 768
+        params.num_frames = frames
+        return SimpleNamespace(
+            sampling_params=params,
+            profile=False,
+            profile_all_stages=False,
+            num_profiled_timesteps=5,
+            extra={},
+        )
+
+    five_seconds = request(5.0, 124)
+    fifteen_seconds = request(15.0, 362)
+
+    assert scheduler._build_dynamic_batch_signature(
+        five_seconds
+    ) == scheduler._build_dynamic_batch_signature(fifteen_seconds)
+
+    fifteen_seconds.sampling_params.num_inference_steps = 20
+    assert scheduler._build_dynamic_batch_signature(
+        five_seconds
+    ) != scheduler._build_dynamic_batch_signature(fifteen_seconds)
 
 
 @pytest.mark.parametrize(

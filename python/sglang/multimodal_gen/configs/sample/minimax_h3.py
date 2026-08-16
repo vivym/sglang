@@ -39,7 +39,12 @@ class MiniMaxH3SamplingParams(SamplingParams):
     height: int = 512
     width: int = 896
     num_inference_steps: int = 50
-    num_frames: int = field(default=1, init=False)
+    # Only the encoder prefix is grouped; each resolved temporal suffix stays serial.
+    num_frames: int = field(
+        default=1,
+        init=False,
+        metadata={"batch_sig_exclude": True},
+    )
     fps: int = field(default=24, init=False)
     negative_prompt: None = field(default=None, init=False)
     guidance_scale: float = field(default=1.0, init=False)
@@ -51,7 +56,10 @@ class MiniMaxH3SamplingParams(SamplingParams):
     audio_cond_noise_aug_for_inference: float | None = None
     task: str | None = None
     conditions: list[dict[str, Any]] | None = None
-    target: dict[str, Any] | None = None
+    target: dict[str, Any] | None = field(
+        default=None,
+        metadata={"batch_sig_exclude": True},
+    )
     audio_flow_shift: float | None = None
     output_mode: str | None = field(
         default=None,
@@ -267,7 +275,9 @@ class MiniMaxH3SamplingParams(SamplingParams):
                     seed=(
                         _seed_override
                         if _seed_override is not None
-                        else self.seed if isinstance(self.seed, int) else None
+                        else self.seed
+                        if isinstance(self.seed, int)
+                        else None
                     ),
                 )
             )
