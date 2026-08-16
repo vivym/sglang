@@ -14,7 +14,6 @@ from typing import Any, Dict, Optional
 import torch
 from dateutil.tz import UTC
 
-import sglang
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -100,8 +99,8 @@ def get_diffusion_perf_log_dir() -> str:
     if log_dir:
         return os.path.abspath(log_dir)
     if log_dir is None:
-        sglang_path = Path(sglang.__file__).resolve()
-        target_path = (sglang_path.parent / "../../.cache/logs").resolve()
+        package_path = Path(__file__).resolve().parents[3]
+        target_path = (package_path / "../../.cache/logs").resolve()
         return str(target_path)
     return ""
 
@@ -217,9 +216,7 @@ class StageProfiler:
 
         snapshot = capture_memory_snapshot()
         if self.metrics is not None:
-            self.metrics.record_memory_snapshot(
-                f"{event}_{self.stage_name}", snapshot
-            )
+            self.metrics.record_memory_snapshot(f"{event}_{self.stage_name}", snapshot)
 
         free_bytes, total_bytes = torch.get_device_module().mem_get_info()
         payload = {
