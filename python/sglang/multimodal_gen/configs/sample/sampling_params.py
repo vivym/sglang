@@ -53,8 +53,9 @@ def generate_request_id() -> str:
 
 # Validated request-level quality levels. "lossless" is the exact reference
 # path (bit-exact against the CI golden outputs); "high" opts into validated
-# accelerated paths whose quality is guaranteed but not bit-exact.
-QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
+# accelerated paths whose quality is guaranteed but not bit-exact. "fast" is
+# explicitly trajectory-changing and must be gated by the model integration.
+QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high", "fast")
 
 
 def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:

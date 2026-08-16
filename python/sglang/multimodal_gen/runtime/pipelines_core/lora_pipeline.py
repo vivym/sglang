@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
 import json
 import os
 from collections import defaultdict
@@ -37,6 +38,33 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = init_logger(__name__)
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _swap_peft_swiglu_fc1_lora_b(
+    source_name: str, target_name: str, weight: torch.Tensor
+) -> torch.Tensor:
+    """Convert Diffusers H3 [up; gate] FFN LoRA rows to native [gate; up]."""
+    if (
+        weight.dim() != 2
+        or ".ff.net.0.proj.lora_B" not in source_name
+        or not target_name.endswith(".mlp.fc1.lora_B")
+    ):
+        return weight
+    if weight.shape[0] % 2:
+        raise ValueError(
+            "MiniMax H3 PEFT SwiGLU lora_B output rows must be even, got "
+            f"{tuple(weight.shape)} for {source_name!r}"
+        )
+    up, gate = weight.chunk(2, dim=0)
+    return torch.cat([gate, up], dim=0)
 
 
 class LoRAPipeline(ComposedPipelineBase):
@@ -81,6 +109,8 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_adapters = defaultdict(dict)
         self.loaded_adapter_paths = {}
         self.loaded_adapter_alphas = {}
+        self.loaded_adapter_sha256 = {}
+        self.loaded_adapter_has_adaln = {}
         self.cur_adapter_name = {}
         self.cur_adapter_path = {}
         self.cur_adapter_strength = {}
@@ -615,6 +645,38 @@ class LoRAPipeline(ComposedPipelineBase):
                     )
         return adapted_count
 
+    def _set_model_adaln_adapter_identity(
+        self,
+        module_name: str,
+        lora_nicknames: list[str],
+        strengths: list[float],
+    ) -> None:
+        model = self.modules.get(module_name)
+        setter = getattr(model, "set_expected_adaln_adapter_identity", None)
+        if not callable(setter):
+            return
+
+        identities = [
+            (nickname, self.loaded_adapter_sha256.get(nickname), float(strength))
+            for nickname, strength in zip(lora_nicknames, strengths)
+            if self.loaded_adapter_has_adaln.get(nickname, False)
+        ]
+        if len(identities) > 1:
+            raise ValueError(
+                "MiniMax H3 offline AdaLN tables support exactly one AdaLN LoRA "
+                f"adapter, got {[identity[0] for identity in identities]}"
+            )
+        if not identities:
+            setter(None, None)
+            return
+
+        nickname, digest, strength = identities[0]
+        if digest is None:
+            raise ValueError(
+                f"MiniMax H3 AdaLN LoRA adapter {nickname!r} has no content digest"
+            )
+        setter(digest, strength)
+
     def _reactivate_cached_dynamic_lora_layers(
         self,
         lora_layers: dict[str, BaseLayerWithLoRA],
@@ -775,6 +837,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 else:
                     continue
 
+            weight = _swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
             if target_name in self.lora_adapters[lora_nickname]:
                 raise ValueError(
                     f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
@@ -783,6 +846,13 @@ class LoRAPipeline(ComposedPipelineBase):
 
         self.loaded_adapter_paths[lora_nickname] = lora_path
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
+        has_adaln = any(
+            ".adaln_proj.linear.lora_" in name
+            for name in self.lora_adapters[lora_nickname]
+        )
+        self.loaded_adapter_has_adaln[lora_nickname] = has_adaln
+        if has_adaln:
+            self.loaded_adapter_sha256[lora_nickname] = _sha256_file(lora_local_path)
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
     def set_lora(
@@ -890,6 +960,9 @@ class LoRAPipeline(ComposedPipelineBase):
 
             merge_weights_by_module = {}
             for module_name, lora_layers_dict in target_modules:
+                self._set_model_adaln_adapter_identity(
+                    module_name, tgt_nicknames, tgt_strengths
+                )
                 merge_weights_by_module[module_name] = (
                     first_effective_merge_weights
                     if module_name == first_module_name

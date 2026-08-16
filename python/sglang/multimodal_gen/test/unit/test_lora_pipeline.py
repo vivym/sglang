@@ -4,9 +4,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import pytest
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+    LoRAPipeline,
+    _swap_peft_swiglu_fc1_lora_b,
+)
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
 _RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline.dist.get_rank"
@@ -29,6 +33,8 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {"adapter": "/adapter"}
     pipeline.loaded_adapter_alphas = {"adapter": None}
+    pipeline.loaded_adapter_sha256 = {}
+    pipeline.loaded_adapter_has_adaln = {}
     pipeline.cur_adapter_name = {}
     pipeline.cur_adapter_path = {}
     pipeline.cur_adapter_strength = {}
@@ -41,6 +47,39 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.lora_adapters["adapter"]["linear.lora_A"] = torch.ones(1, 2)
     pipeline.lora_adapters["adapter"]["linear.lora_B"] = torch.ones(2, 1)
     return pipeline
+
+
+def test_h3_peft_swiglu_lora_b_swaps_only_external_fc1_rows():
+    source = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    swapped = _swap_peft_swiglu_fc1_lora_b(
+        "transformer_blocks.0.ff.net.0.proj.lora_B",
+        "blocks.0.mlp.fc1.lora_B",
+        source,
+    )
+    assert torch.equal(swapped, torch.cat([source[3:], source[:3]], dim=0))
+    assert (
+        _swap_peft_swiglu_fc1_lora_b(
+            "blocks.0.mlp.fc1.lora_B", "blocks.0.mlp.fc1.lora_B", source
+        )
+        is source
+    )
+    assert (
+        _swap_peft_swiglu_fc1_lora_b(
+            "transformer_blocks.0.ff.net.0.proj.lora_A",
+            "blocks.0.mlp.fc1.lora_A",
+            source,
+        )
+        is source
+    )
+
+
+def test_h3_peft_swiglu_lora_b_rejects_odd_output_rows():
+    with torch.no_grad(), pytest.raises(ValueError, match="output rows must be even"):
+        _swap_peft_swiglu_fc1_lora_b(
+            "transformer_blocks.0.ff.net.0.proj.lora_B",
+            "blocks.0.mlp.fc1.lora_B",
+            torch.zeros(5, 2),
+        )
 
 
 def test_dynamic_lora_reactivates_cached_layers_without_weight_update_context():
