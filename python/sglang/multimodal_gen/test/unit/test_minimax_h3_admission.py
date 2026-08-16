@@ -310,6 +310,9 @@ def _quality_server_args():
         tp_size=1,
         ulysses_degree=4,
         use_fsdp_inference=False,
+        lora_path=None,
+        lora_scale=1.0,
+        lora_merge_mode="auto",
     )
 
 
@@ -371,6 +374,62 @@ def test_quality_admission_fails_closed_outside_validated_request():
     server_args.attention_backend = None
     with pytest.raises(ValueError, match="quality must be one of"):
         stage.forward(batch, server_args)
+
+
+def test_fast_quality_binds_startup_lora_and_canary_workload():
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va", "fl2va"],
+                "task_aliases": {},
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            }
+        }
+    )
+    canonical = minimax_h3_validate_canonical_request(
+        task="t2va",
+        prompt="fast canary",
+        conditions=[],
+        target=TARGET,
+        seed=0,
+    )
+    plan = minimax_h3_resolve_plan(canonical)
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(task="t2va", quality="fast"),
+        num_inference_steps=7,
+        is_warmup=False,
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(metadata)
+    server_args = _quality_server_args()
+    server_args.pipeline_config = MiniMaxH3PipelineConfig()
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+        "minimax_h3.release_metadata.minimax_h3_plan_from_batch",
+        return_value=plan,
+    ):
+        with pytest.raises(ValueError, match="requires an explicitly configured"):
+            stage.forward(batch, server_args)
+
+        server_args.lora_path = "/adapter.safetensors"
+        server_args.lora_merge_mode = "dynamic"
+        assert stage.forward(batch, server_args) is batch
+
+        batch.sampling_params.quality = "lossless"
+        with pytest.raises(ValueError, match='requires quality="fast"'):
+            stage.forward(batch, server_args)
+
+        batch.sampling_params.quality = "fast"
+        batch.num_inference_steps = 8
+        with pytest.raises(ValueError, match="canary is validated only"):
+            stage.forward(batch, server_args)
+
+        batch.num_inference_steps = 9
+        server_args.lora_scale = 0.5
+        with pytest.raises(ValueError, match="requires lora_scale=1.0"):
+            stage.forward(batch, server_args)
 
 
 def test_validate_server_args_requires_packed_varlen_backend():

@@ -30,6 +30,17 @@ _MINIMAX_H3_QUALITY_WORKLOAD = {
     "audio_flow_shift": 3.0,
 }
 
+_MINIMAX_H3_FAST_WORKLOAD = {
+    "task": "t2va",
+    "width": 1344,
+    "height": 768,
+    "fps": 24,
+    "frame_count": {124, 243, 362},
+    "num_inference_steps": {7, 9},
+    "flow_shift": 12.0,
+    "audio_flow_shift": 3.0,
+}
+
 
 def _string_list(value: Any, path: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
@@ -152,6 +163,17 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
             raise ValueError(
                 f"quality must be one of {list(QUALITY_LEVELS)}, got {quality!r}"
             )
+        startup_lora = getattr(server_args, "lora_path", None)
+        if not batch.is_warmup and startup_lora is not None and quality != "fast":
+            raise ValueError(
+                'MiniMax-H3 with a startup LoRA requires quality="fast"; '
+                f"quality={quality!r} cannot describe the effective model state"
+            )
+        if not batch.is_warmup and quality == "fast" and startup_lora is None:
+            raise ValueError(
+                'MiniMax-H3 quality="fast" requires an explicitly configured '
+                "startup LoRA"
+            )
         high_quality = quality == "high"
         if high_quality and not batch.is_warmup:
             server_args.pipeline_config.validate_quality_deployment(server_args)
@@ -204,6 +226,66 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                 raise ValueError(
                     'MiniMax-H3 quality="high" is validated only for '
                     f"{_MINIMAX_H3_QUALITY_WORKLOAD}; got {actual}"
+                )
+        if quality == "fast" and not batch.is_warmup:
+            try:
+                lora_scale = float(getattr(server_args, "lora_scale", None))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    'MiniMax-H3 quality="fast" requires lora_scale=1.0'
+                ) from exc
+            if lora_scale != 1.0 or getattr(
+                server_args, "lora_merge_mode", None
+            ) != "dynamic":
+                raise ValueError(
+                    'MiniMax-H3 quality="fast" requires lora_scale=1.0 and '
+                    'lora_merge_mode="dynamic"'
+                )
+            plan = minimax_h3_plan_from_batch(batch)
+            if plan is None:
+                raise ValueError(
+                    'MiniMax-H3 quality="fast" requires a resolved request plan'
+                )
+            shape = plan.shape
+            actual = {
+                "task": plan.task,
+                "width": int(shape["width"]),
+                "height": int(shape["height"]),
+                "fps": int(shape["fps"]),
+                "frame_count": int(shape["frame_count"]),
+                "num_inference_steps": int(batch.num_inference_steps),
+                "flow_shift": float(
+                    plan.flow_shift
+                    if plan.flow_shift is not None
+                    else plan.default_flow_shift
+                ),
+                "audio_flow_shift": float(
+                    plan.audio_flow_shift
+                    if plan.audio_flow_shift is not None
+                    else plan.default_audio_flow_shift
+                ),
+            }
+            exact = all(
+                actual[name] == _MINIMAX_H3_FAST_WORKLOAD[name]
+                for name in ("task", "width", "height", "fps")
+            )
+            sets_match = all(
+                actual[name] in _MINIMAX_H3_FAST_WORKLOAD[name]
+                for name in ("frame_count", "num_inference_steps")
+            )
+            shifts = math.isclose(
+                actual["flow_shift"],
+                _MINIMAX_H3_FAST_WORKLOAD["flow_shift"],
+                abs_tol=1e-9,
+            ) and math.isclose(
+                actual["audio_flow_shift"],
+                _MINIMAX_H3_FAST_WORKLOAD["audio_flow_shift"],
+                abs_tol=1e-9,
+            )
+            if not exact or not sets_match or not shifts:
+                raise ValueError(
+                    'MiniMax-H3 quality="fast" canary is validated only for '
+                    f"{_MINIMAX_H3_FAST_WORKLOAD}; got {actual}"
                 )
         return batch
 

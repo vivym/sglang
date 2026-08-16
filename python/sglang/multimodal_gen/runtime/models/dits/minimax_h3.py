@@ -1228,8 +1228,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # Attention resolution is deferred until the first forward for BCG, but
         # a component-specific selection only exists during model construction.
         self._selected_attention_backend = (
-            get_global_forced_attn_backend()
-            or get_component_forced_attn_backend()
+            get_global_forced_attn_backend() or get_component_forced_attn_backend()
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         # AdaLN 预计算调制表（存表不存参数）。build_adaln_table() 填充后 forward 走查表，
@@ -1237,6 +1236,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self._adaln_table: list[torch.Tensor] | None = None
         self._adaln_final_table: torch.Tensor | None = None
         self._adaln_timesteps: torch.Tensor | None = None
+        self._expected_adaln_adapter_identity: tuple[str, float] | None = None
+        self._loaded_adaln_adapter_identity: tuple[str, float] | None = None
         artifact_config = getattr(quant_config, _ADALN_ARTIFACT_CONFIG_KEY, None)
         if artifact_config is None:
             artifact_config = hf_config.get(_ADALN_ARTIFACT_CONFIG_KEY)
@@ -1317,6 +1318,20 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 )
         self._adaln_timesteps = timesteps.to(device=device)
 
+    def set_expected_adaln_adapter_identity(
+        self, digest: str | None, scale: float | None
+    ) -> None:
+        if (digest is None) != (scale is None):
+            raise ValueError("AdaLN adapter digest and scale must be set together")
+        identity = None if digest is None else (digest, float(scale))
+        loaded = getattr(self, "_loaded_adaln_adapter_identity", None)
+        if getattr(self, "_adaln_table", None) is not None and loaded != identity:
+            raise ValueError(
+                "MiniMax H3 AdaLN adapter changed after the offline table was loaded: "
+                f"table={loaded!r}, requested={identity!r}"
+            )
+        self._expected_adaln_adapter_identity = identity
+
     def load_adaln_table(self, path: str) -> None:
         """Load a pre-built offline AdaLN table artifact (存表不存参数).
 
@@ -1383,6 +1398,59 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     f"{actual_fingerprint!r}, checkpoint expects "
                     f"{expected_fingerprint!r}"
                 )
+            adapter_digest = metadata.get("adaln_adapter_sha256")
+            adapter_scale = metadata.get("adaln_adapter_scale")
+            if (adapter_digest is None) != (adapter_scale is None):
+                raise ValueError(
+                    "AdaLN table adapter metadata must contain both "
+                    "adaln_adapter_sha256 and adaln_adapter_scale"
+                )
+            table_adapter_identity = None
+            if adapter_digest is not None:
+                try:
+                    parsed_adapter_scale = float(adapter_scale)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"invalid AdaLN table adapter scale: {adapter_scale!r}"
+                    ) from exc
+                if not math.isfinite(parsed_adapter_scale) or parsed_adapter_scale <= 0:
+                    raise ValueError(
+                        "AdaLN table adapter scale must be positive and finite, got "
+                        f"{parsed_adapter_scale!r}"
+                    )
+                if metadata.get("adaln_adapter_application") != "table_delta":
+                    raise ValueError(
+                        "adapter-aware AdaLN table must declare table_delta application"
+                    )
+                expected_adapter_tensors = 2 * (len(self.blocks) + 1)
+                try:
+                    adapter_tensors = int(metadata.get("adaln_adapter_tensors", ""))
+                except ValueError as exc:
+                    raise ValueError(
+                        "invalid AdaLN table adapter tensor count: "
+                        f"{metadata.get('adaln_adapter_tensors')!r}"
+                    ) from exc
+                if adapter_tensors != expected_adapter_tensors:
+                    raise ValueError(
+                        "AdaLN table adapter tensor count mismatch: artifact has "
+                        f"{adapter_tensors}, expected {expected_adapter_tensors}"
+                    )
+                table_adapter_identity = (adapter_digest, parsed_adapter_scale)
+            elif metadata.get("adaln_adapter_application") is not None or metadata.get(
+                "adaln_adapter_tensors"
+            ) is not None:
+                raise ValueError(
+                    "base AdaLN table cannot declare adapter application metadata"
+                )
+            expected_adapter_identity = getattr(
+                self, "_expected_adaln_adapter_identity", None
+            )
+            if table_adapter_identity != expected_adapter_identity:
+                raise ValueError(
+                    "AdaLN table adapter mismatch: artifact has "
+                    f"{table_adapter_identity!r}, runtime expects "
+                    f"{expected_adapter_identity!r}"
+                )
 
             required_keys = {
                 "timesteps",
@@ -1435,6 +1503,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             table.to(device=device, dtype=_BF16_DTYPE) for table in block_tables
         ]
         self._adaln_final_table = final_table.to(device=device, dtype=_BF16_DTYPE)
+        self._loaded_adaln_adapter_identity = table_adapter_identity
 
     def drop_adaln_weights(self) -> int:
         """Delete the per-block and final AdaLN projections after the table is built.
