@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import torch
 
@@ -27,6 +28,87 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 _MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_rank_text_encode"
+_MINIMAX_H3_DEBUG_TEXT_HIDDEN_STATES_ENV = "MINIMAX_H3_DEBUG_TEXT_HIDDEN_STATES_PATH"
+
+
+def _debug_reuse_text_embeddings_enabled() -> bool:
+    return os.environ.get(
+        "MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _debug_text_hidden_states_path() -> Path | None:
+    value = os.environ.get(_MINIMAX_H3_DEBUG_TEXT_HIDDEN_STATES_ENV, "").strip()
+    return Path(value).expanduser().resolve() if value else None
+
+
+def _clone_text_embedding_payload(value):
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {key: _clone_text_embedding_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_text_embedding_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_text_embedding_payload(item) for item in value)
+    return value
+
+
+def _apply_debug_text_hidden_states_override(batch: Req) -> Path | None:
+    path = _debug_text_hidden_states_path()
+    if path is None:
+        return None
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{_MINIMAX_H3_DEBUG_TEXT_HIDDEN_STATES_ENV} is not a file: {path}"
+        )
+
+    artifact = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(artifact, dict):
+        raise ValueError(f"MiniMax H3 debug artifact must be a tensor mapping: {path}")
+    saved = artifact.get("text_hidden_states")
+    if not torch.is_tensor(saved):
+        raise ValueError(
+            "MiniMax H3 debug artifact must contain tensor key "
+            f"'text_hidden_states': {path}"
+        )
+
+    payload = batch.extra.get(MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY)
+    positive = payload.get("positive") if isinstance(payload, dict) else None
+    native = positive.get("hidden_states") if isinstance(positive, dict) else None
+    if not torch.is_tensor(native):
+        raise ValueError(
+            "MiniMax H3 native text payload must be encoded before applying the "
+            "debug hidden-state override"
+        )
+    if not saved.is_floating_point():
+        raise ValueError(
+            f"MiniMax H3 debug text_hidden_states must be floating point: {saved.dtype}"
+        )
+    if not bool(torch.isfinite(saved).all()):
+        raise ValueError(
+            f"MiniMax H3 debug text_hidden_states contains NaN or Inf: {path}"
+        )
+    if saved.shape != native.shape:
+        raise ValueError(
+            "MiniMax H3 debug text_hidden_states shape mismatch: "
+            f"saved={tuple(saved.shape)}, native={tuple(native.shape)}"
+        )
+    if saved.dtype != native.dtype:
+        raise ValueError(
+            "MiniMax H3 debug text_hidden_states dtype mismatch: "
+            f"saved={saved.dtype}, native={native.dtype}"
+        )
+
+    positive["hidden_states"] = saved.detach().to(device=native.device).clone()
+    logger.info(
+        "Loaded fixed MiniMax H3 text hidden states for diagnostics from %s "
+        "(shape=%s, dtype=%s)",
+        path,
+        tuple(saved.shape),
+        saved.dtype,
+    )
+    return path
 
 
 class MiniMaxH3TextEncodingStage(TextEncodingStage):
@@ -40,6 +122,8 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         )
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
+        self._debug_text_embedding_cache_key = None
+        self._debug_text_embedding_cache_payload = None
         if processor is None:
             raise ValueError(
                 "MiniMaxH3TextEncodingStage requires the pipeline processor "
@@ -56,7 +140,35 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         plan = minimax_h3_plan_from_batch(batch)
         if plan is not None:
             try:
+                debug_cache_key = None
+                if _debug_reuse_text_embeddings_enabled():
+                    debug_cache_key = (
+                        self.build_dedup_fingerprint(batch, server_args),
+                        str(_debug_text_hidden_states_path() or ""),
+                    )
+                    if (
+                        debug_cache_key == self._debug_text_embedding_cache_key
+                        and self._debug_text_embedding_cache_payload is not None
+                    ):
+                        batch.extra[MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY] = (
+                            _clone_text_embedding_payload(
+                                self._debug_text_embedding_cache_payload
+                            )
+                        )
+                        self._publish_native_text_conditioning(batch)
+                        logger.info(
+                            "Reused fixed MiniMax H3 text embeddings for diagnostics"
+                        )
+                        return batch
                 self._encode_from_plan(batch, plan)
+                _apply_debug_text_hidden_states_override(batch)
+                if debug_cache_key is not None:
+                    self._debug_text_embedding_cache_key = debug_cache_key
+                    self._debug_text_embedding_cache_payload = (
+                        _clone_text_embedding_payload(
+                            batch.extra[MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY]
+                        )
+                    )
                 self._publish_native_text_conditioning(batch)
                 self._release_encoder_for_memory_profile()
             except Exception:

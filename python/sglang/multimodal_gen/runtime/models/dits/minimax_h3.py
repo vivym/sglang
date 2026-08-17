@@ -34,12 +34,19 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTConfig,
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_block
+from sglang.multimodal_gen.runtime.cache.minimax_h3_teacache import (
+    MINIMAX_H3_TEACACHE_NUM_STEPS_EXTRA_KEY,
+    MiniMaxH3TeaCacheState,
+    decide_minimax_h3_teacache,
+    update_minimax_h3_teacache_residual,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
+    get_sp_group,
     get_ulysses_ctx,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -63,6 +70,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -1225,6 +1233,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             quant_config,
             prefix="final_layer",
         )
+        self._minimax_h3_teacache_state = MiniMaxH3TeaCacheState()
         # Attention resolution is deferred until the first forward for BCG, but
         # a component-specific selection only exists during model construction.
         self._selected_attention_backend = (
@@ -1436,9 +1445,10 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                         f"{adapter_tensors}, expected {expected_adapter_tensors}"
                     )
                 table_adapter_identity = (adapter_digest, parsed_adapter_scale)
-            elif metadata.get("adaln_adapter_application") is not None or metadata.get(
-                "adaln_adapter_tensors"
-            ) is not None:
+            elif (
+                metadata.get("adaln_adapter_application") is not None
+                or metadata.get("adaln_adapter_tensors") is not None
+            ):
                 raise ValueError(
                     "base AdaLN table cannot declare adapter application metadata"
                 )
@@ -1559,21 +1569,22 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         adaln_input: torch.Tensor,
         adaln_global_idx: torch.Tensor | None,
     ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
+        blocks = getattr(self, "_sglang_cache_dit_original_blocks", self.blocks)
         if self._adaln_table is not None:
             assert adaln_global_idx is not None
             return tuple(
                 block.adaln_proj.split_output(table.index_select(0, adaln_global_idx))
-                for block, table in zip(self.blocks, self._adaln_table, strict=True)
+                for block, table in zip(blocks, self._adaln_table, strict=True)
             )
         if not self._can_batch_block_adaln():
             return None
         local_adaln = torch.stack(
-            [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
+            [block.adaln_proj.project_local(adaln_input) for block in blocks]
         )
         gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
         return tuple(
             block.adaln_proj.split_output(output)
-            for block, output in zip(self.blocks, gathered_adaln, strict=True)
+            for block, output in zip(blocks, gathered_adaln, strict=True)
         )
 
     @staticmethod
@@ -1826,6 +1837,50 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
 
+    def _minimax_h3_teacache_config(
+        self,
+    ) -> tuple[int, int, float, int, int, list[float]] | None:
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return None
+        batch = forward_context.forward_batch
+        if batch is None or not bool(getattr(batch, "enable_teacache", False)):
+            return None
+        params = getattr(batch, "teacache_params", None)
+        if params is None:
+            raise ValueError("MiniMax H3 TeaCache parameters are missing")
+        if bool(getattr(batch, "do_classifier_free_guidance", False)):
+            raise ValueError(
+                "MiniMax H3 TeaCache requires its native single CFG branch"
+            )
+
+        extra = getattr(batch, "extra", {})
+        num_steps = int(
+            extra.get(
+                MINIMAX_H3_TEACACHE_NUM_STEPS_EXTRA_KEY,
+                getattr(batch, "num_inference_steps", 0),
+            )
+        )
+        if num_steps <= 0:
+            raise ValueError("MiniMax H3 TeaCache requires a positive step count")
+        step = int(forward_context.current_timestep)
+        start_skipping, end_skipping = params.get_skip_boundaries(num_steps, False)
+        return (
+            step,
+            num_steps,
+            float(params.teacache_thresh),
+            int(start_skipping),
+            int(end_skipping),
+            [float(value) for value in params.get_coefficients()],
+        )
+
+    def minimax_h3_teacache_summary(self) -> dict[str, object]:
+        return self._minimax_h3_teacache_state.summary()
+
+    def reset_minimax_h3_teacache(self) -> None:
+        self._minimax_h3_teacache_state.reset()
+
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
 
@@ -2009,26 +2064,103 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         block_adaln_params = self._prepare_block_adaln_params(
             adaln_input, adaln_global_idx
         )
+        cache_dit_grouped_blocks = hasattr(self, "_sglang_cache_dit_original_blocks")
+        local_valid_rows = max(
+            0,
+            min(row_stop, cu_seqlens_host[1]) - row_start,
+        )
+        if cache_dit_grouped_blocks:
+            self._context_manager._sglang_h3_valid_rows = local_valid_rows
+
+        teacache_config = self._minimax_h3_teacache_config()
+        if teacache_config is not None and cache_dit_grouped_blocks:
+            raise RuntimeError("MiniMax H3 TeaCache and Cache-DiT cannot run together")
+        teacache_should_compute = True
+        teacache_reduce_sums = get_sp_group().all_reduce if sp_ws > 1 else None
+        if teacache_config is not None:
+            (
+                teacache_step,
+                teacache_num_steps,
+                teacache_threshold,
+                teacache_start,
+                teacache_end,
+                teacache_coefficients,
+            ) = teacache_config
+            first_adaln_params = (
+                self.blocks[0].adaln_proj(adaln_input)
+                if block_adaln_params is None
+                else block_adaln_params[0]
+            )
+            shift_msa, scale_msa, *_ = first_adaln_params
+            modulated_input = _modulate_scale_shift(
+                self.blocks[0].norm1(decoder_input),
+                shift_msa,
+                scale_msa,
+                block_combined,
+                dtype=_BF16_DTYPE,
+            )
+            teacache_should_compute = decide_minimax_h3_teacache(
+                self._minimax_h3_teacache_state,
+                modulated_input[:local_valid_rows],
+                step=teacache_step,
+                num_steps=teacache_num_steps,
+                threshold=teacache_threshold,
+                start_skipping=teacache_start,
+                end_skipping=teacache_end,
+                coefficients=teacache_coefficients,
+                reduce_sums=teacache_reduce_sums,
+            )
         # With sequence parallelism, shard rows across the group for the
         # block stack. Attention trades sequence for heads internally
         # (Ulysses) and/or ring-rotates KV across ring ranks; everything
         # else, including the final layer, is row-local. Only the narrow
         # video/audio logits are gathered after the final layer.
-        for index, block in enumerate(self.blocks):
-            hidden = block(
-                hidden,
-                adaln_input=adaln_input,
-                combined_indices=block_combined,
-                rope_cache=rope_cache,
-                cu_seqlens=cu_seqlens,
-                cu_seqlens_host=cu_seqlens_host,
-                max_seqlen=max_seqlen,
-                ulysses_active=ulysses_ws > 1,
-                ring_active=ring_ws > 1,
-                adaln_params=(
-                    None if block_adaln_params is None else block_adaln_params[index]
-                ),
-            )
+        if teacache_should_compute:
+            # The fused indexed gates mutate their residual input. Preserve the
+            # real block-stack input so the cached output delta is well-defined.
+            if teacache_config is not None:
+                hidden = decoder_input.clone()
+            for index, block in enumerate(self.blocks):
+                hidden = block(
+                    hidden,
+                    adaln_input=adaln_input,
+                    combined_indices=block_combined,
+                    rope_cache=rope_cache,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqlens_host=cu_seqlens_host,
+                    max_seqlen=max_seqlen,
+                    ulysses_active=ulysses_ws > 1,
+                    ring_active=ring_ws > 1,
+                    adaln_params=(
+                        None
+                        if block_adaln_params is None
+                        else (
+                            block_adaln_params
+                            if cache_dit_grouped_blocks
+                            else block_adaln_params[index]
+                        )
+                    ),
+                )
+            if teacache_config is not None:
+                update_minimax_h3_teacache_residual(
+                    self._minimax_h3_teacache_state,
+                    hidden,
+                    decoder_input,
+                    step=teacache_step,
+                    collect_calibration=teacache_threshold == 0.0,
+                    valid_rows=local_valid_rows,
+                    reduce_sums=teacache_reduce_sums,
+                )
+        else:
+            previous_residual = self._minimax_h3_teacache_state.previous_residual
+            if (
+                previous_residual is None
+                or previous_residual.shape != decoder_input.shape
+            ):
+                raise RuntimeError(
+                    "MiniMax H3 TeaCache residual is missing or has a stale shape"
+                )
+            hidden = decoder_input + previous_residual
         final_adaln_params = None
         if self._adaln_final_table is not None:
             final_adaln_params = self.final_layer.adaln_proj.split_output(
@@ -2041,10 +2173,6 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             adaln_params=final_adaln_params,
         )
         if sp_ws > 1:
-            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-                get_sp_group,
-            )
-
             video_width = video_logits.shape[-1]
             logits = get_sp_group().all_gather(
                 torch.cat((video_logits, audio_logits), dim=-1), dim=0

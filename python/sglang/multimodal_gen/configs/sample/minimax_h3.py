@@ -8,8 +8,23 @@ from typing import Any
 import msgspec
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
 _MINIMAX_H3_MAX_SIGNED_SEED = (1 << 63) - 1
+
+
+def _minimax_h3_teacache_params_from_env() -> TeaCacheParams:
+    coefficients = [
+        float(value)
+        for value in os.environ.get("SGLANG_H3_TEACACHE_COEFFICIENTS", "1,0").split(",")
+        if value.strip()
+    ]
+    return TeaCacheParams(
+        teacache_thresh=float(os.environ.get("SGLANG_H3_TEACACHE_THRESHOLD", "0")),
+        start_skipping=int(os.environ.get("SGLANG_H3_TEACACHE_START", "2")),
+        end_skipping=int(os.environ.get("SGLANG_H3_TEACACHE_END", "-2")),
+        coefficients=coefficients,
+    )
 
 
 def _optional_unit_float(value: Any, field_name: str) -> float | None:
@@ -64,6 +79,9 @@ class MiniMaxH3SamplingParams(SamplingParams):
     output_mode: str | None = field(
         default=None,
         metadata={"batch_sig_exclude": True},
+    )
+    teacache_params: TeaCacheParams = field(
+        default_factory=_minimax_h3_teacache_params_from_env
     )
 
     @classmethod
@@ -218,10 +236,22 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "delivery contract is the resolved target canvas"
             )
         if self.enable_teacache:
-            raise ValueError(
-                "MiniMax H3 does not support enable_teacache: its packed "
-                "video/audio denoise loop has no lossless TeaCache contract"
-            )
+            params = self.teacache_params
+            if not isinstance(params, TeaCacheParams):
+                raise ValueError("MiniMax H3 teacache_params must be TeaCacheParams")
+            if (
+                not math.isfinite(params.teacache_thresh)
+                or params.teacache_thresh < 0.0
+            ):
+                raise ValueError(
+                    "MiniMax H3 TeaCache threshold must be finite and non-negative"
+                )
+            if not params.coefficients or not all(
+                math.isfinite(float(value)) for value in params.coefficients
+            ):
+                raise ValueError(
+                    "MiniMax H3 TeaCache coefficients must be non-empty and finite"
+                )
         if self.rollout:
             raise ValueError(
                 "MiniMax H3 does not support rollout: its coupled video/audio "

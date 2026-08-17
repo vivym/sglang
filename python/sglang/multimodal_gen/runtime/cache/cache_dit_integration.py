@@ -6,6 +6,8 @@ This module provides helper functions to enable cache-dit acceleration
 on transformer modules in SGLang's modular pipeline architecture.
 """
 
+import json
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -18,8 +20,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 import cache_dit
 from cache_dit import (
@@ -35,7 +35,47 @@ from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
+logger = init_logger(__name__)
+
 _original_similarity = None
+
+
+def _cache_dit_h3_finite_diagnostics_enabled() -> bool:
+    return os.getenv("SGLANG_CACHE_DIT_H3_FINITE_DIAGNOSTICS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _finite_tensor_summary(value: torch.Tensor) -> dict[str, float | int | str]:
+    finite = torch.isfinite(value)
+    finite_values = value[finite].float()
+    return {
+        "dtype": str(value.dtype),
+        "elements": value.numel(),
+        "nan_elements": int(torch.isnan(value).sum().item()),
+        "inf_elements": int(torch.isinf(value).sum().item()),
+        "finite_abs_max": (
+            float(finite_values.abs().max().item()) if finite_values.numel() else float("nan")
+        ),
+        "finite_abs_mean": (
+            float(finite_values.abs().mean().item()) if finite_values.numel() else float("nan")
+        ),
+    }
+
+
+def _h3_similarity_tensors(
+    context_manager,
+    t1: torch.Tensor,
+    t2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    valid_rows = getattr(context_manager, "_sglang_h3_valid_rows", None)
+    if valid_rows is None:
+        return t1, t2
+    valid_rows = max(0, min(int(valid_rows), t1.shape[0], t2.shape[0]))
+    return t1[:valid_rows], t2[:valid_rows]
 
 
 def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Module:
@@ -46,6 +86,13 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
     cache_dit.disable_cache(target)
     if target is not transformer:
         del transformer._sglang_cache_dit_adapter
+    if hasattr(transformer, "_sglang_cache_dit_original_blocks"):
+        del transformer._sglang_cache_dit_original_blocks
+    context_manager = getattr(transformer, "_context_manager", None)
+    if context_manager is not None and hasattr(
+        context_manager, "_sglang_h3_valid_rows"
+    ):
+        del context_manager._sglang_h3_valid_rows
     for name in ("_is_parallelized", "_parallelism_config"):
         if hasattr(transformer, name):
             delattr(transformer, name)
@@ -62,7 +109,9 @@ def _patch_cache_dit_similarity():
     _original_similarity = cache_manager.CachedContextManager.similarity
 
     def patched_similarity(self, t1, t2, *, threshold, parallelized=False, prefix="Fn"):
-        if not parallelized:
+        diagnostics_enabled = _cache_dit_h3_finite_diagnostics_enabled()
+        h3_valid_rows = getattr(self, "_sglang_h3_valid_rows", None)
+        if not parallelized and not diagnostics_enabled and h3_valid_rows is None:
             return _original_similarity(
                 self,
                 t1,
@@ -71,24 +120,49 @@ def _patch_cache_dit_similarity():
                 parallelized=parallelized,
                 prefix=prefix,
             )
+
+        if threshold <= 0.0 or threshold >= 1.0 or t1.shape != t2.shape:
+            return _original_similarity(
+                self,
+                t1,
+                t2,
+                threshold=threshold,
+                parallelized=parallelized,
+                prefix=prefix,
+            )
+
+        t1, t2 = _h3_similarity_tensors(self, t1, t2)
 
         sp_group = getattr(self, "_sglang_sp_group", None)
         tp_group = getattr(self, "_sglang_tp_group", None)
         tp_sp_group = getattr(self, "_sglang_tp_sp_group", None)
         target_group = tp_sp_group or sp_group or tp_group
 
-        if target_group is None:
-            return _original_similarity(
-                self,
-                t1,
-                t2,
-                threshold=threshold,
-                parallelized=parallelized,
-                prefix=prefix,
-            )
-
         # Adapted from https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_contexts/cache_manager.py#L495-L523
         condition_thresh = self.get_important_condition_threshold()
+        diagnostics = None
+        if diagnostics_enabled:
+            raw_diff_bf16 = (t1 - t2).abs()
+            raw_diff_fp32 = (t1.float() - t2.float()).abs()
+            mean_diff_bf16 = raw_diff_bf16.mean()
+            mean_t1_bf16 = t1.abs().mean()
+            mean_diff_fp32 = raw_diff_fp32.mean()
+            mean_t1_fp32 = t1.float().abs().mean()
+            diagnostics = {
+                "prefix": prefix,
+                "threshold": threshold,
+                "condition_threshold": condition_thresh,
+                "t1": _finite_tensor_summary(t1),
+                "t2": _finite_tensor_summary(t2),
+                "raw_diff_bf16": _finite_tensor_summary(raw_diff_bf16),
+                "raw_diff_fp32": _finite_tensor_summary(raw_diff_fp32),
+                "mean_diff_bf16": float(mean_diff_bf16.float().item()),
+                "mean_t1_bf16": float(mean_t1_bf16.float().item()),
+                "ratio_bf16": float((mean_diff_bf16 / mean_t1_bf16).float().item()),
+                "mean_diff_fp32": float(mean_diff_fp32.item()),
+                "mean_t1_fp32": float(mean_t1_fp32.item()),
+                "ratio_fp32": float((mean_diff_fp32 / mean_t1_fp32).item()),
+            }
         if condition_thresh > 0.0:
             raw_diff = (t1 - t2).abs()
             token_m_df = raw_diff.mean(dim=-1)
@@ -106,10 +180,20 @@ def _patch_cache_dit_similarity():
             mean_diff = (t1 - t2).abs().mean()
             mean_t1 = t1.abs().mean()
 
-        dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
-        dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
+        if parallelized:
+            dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
+            dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
 
         diff = (mean_diff / mean_t1).item()
+        if diagnostics is not None:
+            diagnostics["selected_mean_diff"] = float(mean_diff.float().item())
+            diagnostics["selected_mean_t1"] = float(mean_t1.float().item())
+            diagnostics["selected_ratio"] = diff
+            print(
+                "SGLANG_H3_CACHE_DIT_SIMILARITY "
+                + json.dumps(diagnostics, sort_keys=True),
+                flush=True,
+            )
         self.add_residual_diff(diff)
         return diff < threshold
 
@@ -286,9 +370,143 @@ _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern]] = {
 }
 
 
+class _MiniMaxH3CacheDitBlock(torch.nn.Module):
+    """Select this H3 block's AdaLN parameters from the grouped cache call."""
+
+    def __init__(
+        self,
+        block: torch.nn.Module,
+        *,
+        block_index: int,
+        block_count: int,
+        clone_input_before_forward: bool = False,
+    ) -> None:
+        super().__init__()
+        self.block = block
+        self.block_index = block_index
+        self.block_count = block_count
+        self.clone_input_before_forward = clone_input_before_forward
+        self._finite_diagnostic_step = 0
+
+    def _record_finite_diagnostics(
+        self,
+        name: str,
+        value: torch.Tensor,
+        *,
+        combined_indices: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
+    ) -> None:
+        if self.block_index != 0 or not _cache_dit_h3_finite_diagnostics_enabled():
+            return
+
+        row_finite = torch.isfinite(value).all(dim=-1)
+        total_rows = int(value.shape[0])
+        used_rows = (
+            int(cu_seqlens[1].item())
+            if cu_seqlens is not None and cu_seqlens.numel() >= 2
+            else total_rows
+        )
+        payload = {
+            "step": self._finite_diagnostic_step,
+            "point": name,
+            "shape": list(value.shape),
+            "nan_elements": int(torch.isnan(value).sum().item()),
+            "inf_elements": int(torch.isinf(value).sum().item()),
+            "nonfinite_rows": int((~row_finite).sum().item()),
+            "used_nonfinite_rows": int((~row_finite[:used_rows]).sum().item()),
+            "padding_nonfinite_rows": int((~row_finite[used_rows:]).sum().item()),
+            "all": _finite_tensor_summary(value),
+            "used": _finite_tensor_summary(value[:used_rows]),
+            "padding": _finite_tensor_summary(value[used_rows:]),
+        }
+        if combined_indices is not None:
+            tags = combined_indices[:used_rows].remainder(3)
+            payload["used_nonfinite_rows_by_modality"] = {
+                str(tag): int(((~row_finite[:used_rows]) & (tags == tag)).sum().item())
+                for tag in range(3)
+            }
+        print(
+            "SGLANG_H3_CACHE_DIT_FINITE " + json.dumps(payload, sort_keys=True),
+            flush=True,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *args,
+        adaln_params=None,
+        **kwargs,
+    ):
+        combined_indices = kwargs.get("combined_indices")
+        cu_seqlens = kwargs.get("cu_seqlens")
+        self._record_finite_diagnostics(
+            "block_0_input",
+            hidden_states,
+            combined_indices=combined_indices,
+            cu_seqlens=cu_seqlens,
+        )
+        selected_adaln_params = adaln_params
+        if adaln_params is not None:
+            if not isinstance(adaln_params, tuple) or len(adaln_params) != self.block_count:
+                raise ValueError(
+                    "Cache-DiT H3 grouped AdaLN parameters must contain exactly "
+                    f"{self.block_count} block entries"
+                )
+            selected_adaln_params = adaln_params[self.block_index]
+        # H3's fused gated residual updates its first argument in place. Cache-DiT
+        # needs the input at each residual-cache segment boundary to remain unchanged.
+        block_input = (
+            hidden_states.clone() if self.clone_input_before_forward else hidden_states
+        )
+        output = self.block(
+            block_input,
+            *args,
+            adaln_params=selected_adaln_params,
+            **kwargs,
+        )
+        self._record_finite_diagnostics(
+            "block_0_output",
+            output,
+            combined_indices=combined_indices,
+            cu_seqlens=cu_seqlens,
+        )
+        if self.block_index == 0 and _cache_dit_h3_finite_diagnostics_enabled():
+            used_rows = (
+                int(cu_seqlens[1].item())
+                if cu_seqlens is not None and cu_seqlens.numel() >= 2
+                else int(hidden_states.shape[0])
+            )
+            residual_bf16 = output - hidden_states
+            residual_fp32 = output.float() - hidden_states.float()
+            print(
+                "SGLANG_H3_CACHE_DIT_FN_RESIDUAL "
+                + json.dumps(
+                    {
+                        "step": self._finite_diagnostic_step,
+                        "bf16_all": _finite_tensor_summary(residual_bf16),
+                        "bf16_used": _finite_tensor_summary(residual_bf16[:used_rows]),
+                        "bf16_padding": _finite_tensor_summary(
+                            residual_bf16[used_rows:]
+                        ),
+                        "fp32_all": _finite_tensor_summary(residual_fp32),
+                        "fp32_used": _finite_tensor_summary(residual_fp32[:used_rows]),
+                        "fp32_padding": _finite_tensor_summary(
+                            residual_fp32[used_rows:]
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        if self.block_index == 0:
+            self._finite_diagnostic_step += 1
+        return output
+
+
 def _build_custom_block_adapter(
     transformer: torch.nn.Module,
     has_separate_cfg: bool = False,
+    h3_fn_compute_blocks: int | None = None,
 ) -> Optional[BlockAdapter]:
     """Build a manual BlockAdapter for a model absent from cache-dit's registry,
     or None if the class is unknown."""
@@ -302,9 +520,30 @@ def _build_custom_block_adapter(
             f"Transformer {transformer.__class__.__name__} has no attribute "
             f"{blocks_attr!r} for cache-dit blocks."
         )
+    if transformer.__class__.__name__ == "MiniMaxH3DiTModel" and isinstance(
+        blocks, torch.nn.ModuleList
+    ):
+        block_count = len(blocks)
+        segment_starts = (
+            {0, h3_fn_compute_blocks}
+            if h3_fn_compute_blocks is not None
+            else set()
+        )
+        blocks = torch.nn.ModuleList(
+            _MiniMaxH3CacheDitBlock(
+                block,
+                block_index=index,
+                block_count=block_count,
+                clone_input_before_forward=index in segment_starts,
+            )
+            for index, block in enumerate(blocks)
+        )
+        blocks_attr = "blocks"
+
     return BlockAdapter(
         transformer=transformer,
         blocks=blocks,
+        blocks_name=blocks_attr,
         forward_pattern=forward_pattern,
         has_separate_cfg=has_separate_cfg,
     )
@@ -347,7 +586,9 @@ def enable_cache_on_transformer(
     custom_adapter = None
     if not BlockAdapterRegister.is_supported(transformer):
         custom_adapter = _build_custom_block_adapter(
-            transformer, has_separate_cfg=has_separate_cfg
+            transformer,
+            has_separate_cfg=has_separate_cfg,
+            h3_fn_compute_blocks=config.Fn_compute_blocks,
         )
         if custom_adapter is None:
             transformer_cls_name = transformer.__class__.__name__
@@ -406,7 +647,11 @@ def enable_cache_on_transformer(
         )
 
     parallelism_config = _build_parallelism_config(sp_group, tp_group)
-    if parallelism_config is not None:
+    if (
+        parallelism_config is not None
+        or transformer.__class__.__name__ == "MiniMaxH3DiTModel"
+        or _cache_dit_h3_finite_diagnostics_enabled()
+    ):
         _patch_cache_dit_similarity()
 
     _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
@@ -414,8 +659,18 @@ def enable_cache_on_transformer(
     # Custom path: pass a pre-built BlockAdapter, bypassing the registry.
     # Standard path: let enable_cache discover the registered adapter.
     target = transformer
+    h3_original_blocks = None
     if custom_adapter is not None:
         target = custom_adapter
+        if (
+            transformer.__class__.__name__ == "MiniMaxH3DiTModel"
+            and isinstance(custom_adapter.blocks, torch.nn.ModuleList)
+            and all(
+                isinstance(block, _MiniMaxH3CacheDitBlock)
+                for block in custom_adapter.blocks
+            )
+        ):
+            h3_original_blocks = tuple(block.block for block in custom_adapter.blocks)
         logger.info(
             "Enabling cache-dit on %s via custom BlockAdapter (%s).",
             model_name,
@@ -429,6 +684,8 @@ def enable_cache_on_transformer(
     )
     if custom_adapter is not None:
         transformer._sglang_cache_dit_adapter = custom_adapter
+        if h3_original_blocks is not None:
+            transformer._sglang_cache_dit_original_blocks = h3_original_blocks
 
     if parallelism_config is not None:
         context_manager = getattr(transformer, "_context_manager", None)

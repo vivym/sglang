@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
+from sglang.multimodal_gen.runtime.cache.minimax_h3_teacache import (
+    MINIMAX_H3_TEACACHE_NUM_STEPS_EXTRA_KEY,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     is_fsdp_managed_module,
 )
@@ -518,6 +521,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
+        if bool(getattr(batch.sampling_params, "enable_teacache", False)):
+            if self._cache_dit_enabled:
+                self.transformer = disable_cache_on_transformer(self.transformer)
+                self._cache_dit_enabled = False
+                self._cached_num_steps = None
+                self._minimax_h3_cache_mode = None
+            return
         quality = getattr(batch.sampling_params, "quality", "lossless")
         explicit_fields = getattr(batch.sampling_params, "_explicit_fields", ())
         generic_requested = (
@@ -635,6 +645,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA")
         device = torch.device("cuda")
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
+        batch.extra[MINIMAX_H3_TEACACHE_NUM_STEPS_EXTRA_KEY] = len(sigmas_video) - 1
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
             batch,
@@ -661,6 +672,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         placement_managed = self._component_residency_manager is not None
         nsys_capture = os.environ.get("MINIMAX_H3_NSYS_CAPTURE_DIT", "0") == "1"
         nsys_capture_started = False
+        model = None
         if nsys_capture:
             torch.cuda.synchronize()
             torch.cuda.profiler.start()
@@ -730,19 +742,63 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         batch=batch,
                     ),
                 )
+                self._record_cache_dit_metrics(model, batch)
+                self._record_minimax_h3_teacache_metrics(model, batch)
         finally:
             try:
-                self._finish_active_component_use()
+                if model is not None and hasattr(model, "reset_minimax_h3_teacache"):
+                    model.reset_minimax_h3_teacache()
             finally:
-                if nsys_capture_started:
-                    torch.cuda.synchronize()
-                    torch.cuda.profiler.stop()
+                try:
+                    self._finish_active_component_use()
+                finally:
+                    if nsys_capture_started:
+                        torch.cuda.synchronize()
+                        torch.cuda.profiler.stop()
         _publish_full_loop_outputs(
             ctx,
             batch=batch,
             positive=positive,
             video_rows=video_rows,
             audio_rows=audio_rows,
+        )
+
+    def _record_cache_dit_metrics(self, model: Any, batch: Req) -> None:
+        if not self._cache_dit_enabled or batch.metrics is None:
+            return
+
+        import cache_dit
+
+        target = getattr(model, "_sglang_cache_dit_adapter", model)
+        summaries = cache_dit.summary(target, logging=False)
+        candidates = [summary for summary in summaries if summary.residual_diffs]
+        if not candidates:
+            return
+        stats = max(candidates, key=lambda summary: len(summary.residual_diffs))
+        batch.metrics.record_metadata(
+            "cache_dit",
+            {
+                "cached_steps": list(stats.cached_steps),
+                "residual_diffs": dict(stats.residual_diffs),
+                "accumulated_cached_steps": int(stats.accumulated_cached_steps),
+                "accumulated_executed_steps": int(stats.accumulated_executed_steps),
+                "accumulated_transformer_executed_steps": int(
+                    stats.accumulated_transformer_executed_steps
+                ),
+            },
+        )
+
+    @staticmethod
+    def _record_minimax_h3_teacache_metrics(model: Any, batch: Req) -> None:
+        if (
+            batch.metrics is None
+            or not bool(getattr(batch.sampling_params, "enable_teacache", False))
+            or not hasattr(model, "minimax_h3_teacache_summary")
+        ):
+            return
+        batch.metrics.record_metadata(
+            "minimax_h3_teacache",
+            model.minimax_h3_teacache_summary(),
         )
 
     @contextmanager
@@ -1101,16 +1157,23 @@ def _publish_full_loop_outputs(
             dump_path_template,
             seed=plan_seed if plan_seed is not None else getattr(batch, "seed", None),
             request_id=getattr(batch, "request_id", None),
+            output_file_name=getattr(batch.sampling_params, "output_file_name", None),
         )
         dump_parent = os.path.dirname(os.path.abspath(dump_path))
         os.makedirs(dump_parent, exist_ok=True)
-        torch.save(
-            {
-                "latents": batch.latents.detach().cpu(),
-                "audio_latents": batch.audio_latents.detach().cpu(),
-            },
-            dump_path,
-        )
+        dump_payload = {
+            "latents": batch.latents.detach().cpu(),
+            "audio_latents": batch.audio_latents.detach().cpu(),
+            "initial_video_rows": ctx.state["initial_video_rows"].detach().cpu(),
+            "initial_audio_rows": ctx.state["initial_audio_rows"].detach().cpu(),
+            "text_hidden_states": ctx.embeddings["positive"]["hidden_states"]
+            .detach()
+            .cpu(),
+        }
+        refined_prompt_embeds = positive.static_kwargs.get("prompt_embeds")
+        if torch.is_tensor(refined_prompt_embeds):
+            dump_payload["refined_prompt_embeds"] = refined_prompt_embeds.detach().cpu()
+        torch.save(dump_payload, dump_path)
         print(f"[latents] saved replay artifact to {dump_path}", flush=True)
 
 
@@ -1119,12 +1182,19 @@ def _resolve_debug_latent_dump_path(
     *,
     seed: int | None,
     request_id: str | None,
+    output_file_name: str | None = None,
 ) -> str:
     """Resolve per-request fields in the opt-in latent replay artifact path."""
 
+    output_stem = (
+        os.path.splitext(os.path.basename(output_file_name))[0]
+        if output_file_name
+        else "unknown"
+    )
     return template.format(
         seed="unknown" if seed is None else seed,
         request_id="unknown" if request_id is None else request_id,
+        output_stem=output_stem,
     )
 
 

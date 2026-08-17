@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical contract for request-static H3 denoise metadata."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -22,6 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_packed_sequence_ref2va_blocks,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    MiniMaxH3DenoisingStage,
     _resolve_debug_latent_dump_path,
 )
 
@@ -201,11 +203,56 @@ def test_rank_local_token_tags_match_reference_slice():
 def test_debug_latent_dump_path_can_distinguish_grouped_requests():
     assert (
         _resolve_debug_latent_dump_path(
-            "/tmp/h3-{seed}-{request_id}.pt", seed=43, request_id="request-1"
+            "/tmp/h3-{seed}-{request_id}-{output_stem}.pt",
+            seed=43,
+            request_id="request-1",
+            output_file_name="/tmp/cache-candidate.mp4",
         )
-        == "/tmp/h3-43-request-1.pt"
+        == "/tmp/h3-43-request-1-cache-candidate.pt"
     )
     assert (
         _resolve_debug_latent_dump_path("/tmp/h3-{seed}.pt", seed=None, request_id=None)
         == "/tmp/h3-unknown.pt"
     )
+
+
+def test_teacache_request_unmounts_active_cache_dit_hook():
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.transformer = object()
+    stage._cache_dit_enabled = True
+    stage._cached_num_steps = 19
+    stage._minimax_h3_cache_mode = "generic"
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(enable_teacache=True),
+    )
+    restored = object()
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.minimax_h3.stages.denoising."
+        "disable_cache_on_transformer",
+        return_value=restored,
+    ) as disable:
+        stage._maybe_enable_cache_dit(19, batch)
+
+    disable.assert_called_once()
+    assert stage.transformer is restored
+    assert not stage._cache_dit_enabled
+    assert stage._cached_num_steps is None
+    assert stage._minimax_h3_cache_mode is None
+
+
+def test_teacache_summary_is_copied_into_request_metrics():
+    recorded = {}
+    summary = {"computed_steps": [0, 2], "cached_steps": [1]}
+    model = SimpleNamespace(minimax_h3_teacache_summary=lambda: summary)
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(enable_teacache=True),
+        metrics=SimpleNamespace(
+            record_metadata=lambda name, value: recorded.update({name: value})
+        ),
+    )
+
+    MiniMaxH3DenoisingStage._record_minimax_h3_teacache_metrics(model, batch)
+
+    assert recorded == {"minimax_h3_teacache": summary}

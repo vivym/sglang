@@ -53,6 +53,7 @@ class RequestMetrics:
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
         self.suppress_stage_breakdown: bool = False
+        self.metadata: Dict[str, Any] = {}
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
 
@@ -77,6 +78,11 @@ class RequestMetrics:
             return
         self.memory_snapshots[checkpoint_name] = snapshot
 
+    def record_metadata(self, name: str, value: Any):
+        if self.suppress_stage_breakdown:
+            return
+        self.metadata[name] = value
+
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the metrics data to a dictionary."""
         return {
@@ -84,6 +90,7 @@ class RequestMetrics:
             "stages": self.stages,
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
+            "metadata": self.metadata,
             "memory_snapshots": {
                 name: snapshot.to_dict()
                 for name, snapshot in self.memory_snapshots.items()

@@ -7,6 +7,9 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+    _h3_similarity_tensors,
+)
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
     _adaln_table_covers_timesteps,
@@ -156,6 +159,50 @@ def test_offline_adaln_table_is_not_all_gathered_again():
             model, torch.empty(0), torch.tensor([1])
         )
     assert torch.equal(params[0][0], model._adaln_table[0][1:2])
+
+
+def test_offline_adaln_table_uses_original_blocks_while_cache_dit_groups_them():
+    class Projection:
+        def __init__(self, block_index):
+            self.block_index = block_index
+
+        def split_output(self, value):
+            return (self.block_index, value)
+
+    originals = tuple(
+        SimpleNamespace(adaln_proj=Projection(index)) for index in range(2)
+    )
+    model = SimpleNamespace(
+        _adaln_table=[
+            torch.arange(12).reshape(2, 6),
+            torch.arange(12, 24).reshape(2, 6),
+        ],
+        blocks=[SimpleNamespace()],
+        _sglang_cache_dit_original_blocks=originals,
+    )
+
+    params = MiniMaxH3DiTModel._prepare_block_adaln_params(
+        model, torch.empty(0), torch.tensor([1])
+    )
+
+    assert [item[0] for item in params] == [0, 1]
+    assert torch.equal(params[0][1], model._adaln_table[0][1:2])
+    assert torch.equal(params[1][1], model._adaln_table[1][1:2])
+
+
+def test_cache_dit_h3_similarity_excludes_packed_padding_rows():
+    manager = SimpleNamespace(_sglang_h3_valid_rows=3)
+    previous = torch.tensor([[1.0], [2.0], [3.0], [1e30]])
+    current = torch.tensor([[1.1], [2.1], [3.1], [-1e30]])
+
+    sliced_previous, sliced_current = _h3_similarity_tensors(
+        manager,
+        previous,
+        current,
+    )
+
+    assert torch.equal(sliced_previous, previous[:3])
+    assert torch.equal(sliced_current, current[:3])
 
 
 def test_adaln_lookup_requires_exact_timestep_match():

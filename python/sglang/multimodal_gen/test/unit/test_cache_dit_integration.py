@@ -126,6 +126,10 @@ def _install_torch_stub():
     torch_dist = types.ModuleType("torch.distributed")
 
     class _FakeModule:
+        def __call__(self, *args, **kwargs):
+            return self.forward(*args, **kwargs)
+
+    class _FakeModuleList(list):
         pass
 
     class _FakeProcessGroup:
@@ -135,6 +139,8 @@ def _install_torch_stub():
         AVG = "AVG"
 
     torch_nn.Module = _FakeModule
+    torch_nn.ModuleList = _FakeModuleList
+    torch.Tensor = object
     torch_dist.ProcessGroup = _FakeProcessGroup
     torch_dist.ReduceOp = _FakeReduceOp
     torch.distributed = torch_dist
@@ -306,6 +312,57 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         self.assertEqual(adapter.forward_pattern, "Pattern_3")
         self.assertFalse(adapter.has_separate_cfg)
 
+    def test_minimax_h3_wrapper_dispatches_per_block_adaln_params(self):
+        module = _import_module_with_stub()
+
+        class Block(module.torch.nn.Module):
+            def forward(self, hidden_states, *, adaln_params=None):
+                return hidden_states, adaln_params
+
+        original_blocks = module.torch.nn.ModuleList([Block(), Block()])
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = original_blocks
+
+        adapter = module._build_custom_block_adapter(transformer)
+        grouped_params = (("block_0",), ("block_1",))
+
+        self.assertEqual(adapter.blocks_name, "blocks")
+        self.assertEqual(len(adapter.blocks), 2)
+        self.assertEqual(
+            adapter.blocks[1]("hidden", adaln_params=grouped_params),
+            ("hidden", ("block_1",)),
+        )
+        with self.assertRaisesRegex(ValueError, "exactly 2 block entries"):
+            adapter.blocks[0]("hidden", adaln_params=(("only_one",),))
+
+    def test_minimax_h3_clones_inputs_at_cache_segment_boundaries(self):
+        module = _import_module_with_stub()
+
+        class Hidden:
+            def clone(self):
+                return Hidden()
+
+        class Block(module.torch.nn.Module):
+            def forward(self, hidden_states, *, adaln_params=None):
+                return hidden_states
+
+        original_blocks = module.torch.nn.ModuleList([Block(), Block(), Block()])
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = original_blocks
+
+        adapter = module._build_custom_block_adapter(
+            transformer,
+            h3_fn_compute_blocks=1,
+        )
+
+        self.assertTrue(adapter.blocks[0].clone_input_before_forward)
+        self.assertTrue(adapter.blocks[1].clone_input_before_forward)
+        self.assertFalse(adapter.blocks[2].clone_input_before_forward)
+        hidden = Hidden()
+        self.assertIsNot(adapter.blocks[0](hidden), hidden)
+        self.assertIsNot(adapter.blocks[1](hidden), hidden)
+        self.assertIs(adapter.blocks[2](hidden), hidden)
+
     def test_custom_adapter_is_retained_until_disable(self):
         module = _import_module_with_stub()
         module.BlockAdapterRegister.supported = False
@@ -322,6 +379,34 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         self.assertIs(module.disable_cache_on_transformer(transformer), transformer)
         self.assertEqual(module.cache_dit.disable_calls, [adapter])
         self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
+
+    def test_minimax_h3_original_blocks_are_retained_until_disable(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+
+        def enable_and_normalize(target, **kwargs):
+            module.cache_dit.enable_calls.append({"target": target, **kwargs})
+            target.blocks = [[target.blocks]]
+
+        module.cache_dit.enable_cache = enable_and_normalize
+
+        class Block(module.torch.nn.Module):
+            def forward(self, hidden_states, *, adaln_params=None):
+                return hidden_states
+
+        original_blocks = module.torch.nn.ModuleList([Block(), Block()])
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = original_blocks
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=19)
+
+        module.enable_cache_on_transformer(transformer, config)
+
+        self.assertEqual(
+            transformer._sglang_cache_dit_original_blocks,
+            tuple(original_blocks),
+        )
+        module.disable_cache_on_transformer(transformer)
+        self.assertFalse(hasattr(transformer, "_sglang_cache_dit_original_blocks"))
 
 
 if __name__ == "__main__":
