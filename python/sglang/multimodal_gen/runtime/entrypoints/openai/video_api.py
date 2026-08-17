@@ -408,6 +408,8 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "diffusers_kwargs": request.diffusers_kwargs,
         **cosmos3_kwargs,
     }
+    if request.teacache_params is not None:
+        kwargs["teacache_params"] = request.teacache_params
 
     sampling_params_cls = _video_sampling_params_cls(server_args)
     kwargs = sampling_params_cls.lower_video_request_kwargs(request, kwargs)

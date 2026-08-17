@@ -134,6 +134,7 @@ class VideoGenerationsRequest(BaseModel):
     max_sequence_length: Optional[int] = None
     flow_shift: Optional[float] = None
     enable_teacache: Optional[bool] = False
+    teacache_params: Optional[Dict[str, Any]] = None
     # Frame interpolation
     enable_frame_interpolation: Optional[bool] = False
     frame_interpolation_exp: Optional[int] = 1  # 1=2×, 2=4×
