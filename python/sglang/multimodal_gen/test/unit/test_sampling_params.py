@@ -52,12 +52,13 @@ class TestSamplingParamsValidate(unittest.TestCase):
     def test_quality_defaults_to_lossless(self):
         self.assertEqual(SamplingParams().quality, "lossless")
 
-    def test_quality_accepts_the_two_validated_levels(self):
+    def test_quality_accepts_the_validated_levels(self):
         self.assertEqual(SamplingParams(quality="lossless").quality, "lossless")
         self.assertEqual(SamplingParams(quality="high").quality, "high")
+        self.assertEqual(SamplingParams(quality="fast").quality, "fast")
 
     def test_quality_rejects_invalid_values(self):
-        for bad in ("ultra", "draft", "fast", "", True, 1):
+        for bad in ("ultra", "draft", "", True, 1):
             with self.assertRaisesRegex(ValueError, r"quality must be one of"):
                 SamplingParams(quality=bad)  # type: ignore[arg-type]
 

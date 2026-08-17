@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
@@ -44,6 +45,36 @@ TARGET = {
     "aspect_ratio": "16:9",
     "duration_seconds": 5.0,
 }
+
+
+def test_teacache_api_params_are_typed_and_request_scoped(monkeypatch):
+    for name in (
+        "SGLANG_H3_TEACACHE_THRESHOLD",
+        "SGLANG_H3_TEACACHE_START",
+        "SGLANG_H3_TEACACHE_END",
+        "SGLANG_H3_TEACACHE_COEFFICIENTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    dense_before = MiniMaxH3SamplingParams()
+    canary = MiniMaxH3SamplingParams(
+        enable_teacache=True,
+        teacache_params={
+            "teacache_thresh": 0.08,
+            "start_skipping": 15,
+            "end_skipping": 16,
+            "coefficients": [1.0, 0.0],
+        },
+    )
+    dense_after = MiniMaxH3SamplingParams()
+
+    assert dense_before.enable_teacache is False
+    assert dense_after.enable_teacache is False
+    assert dense_before.teacache_params.teacache_thresh == 0.0
+    assert dense_after.teacache_params.teacache_thresh == 0.0
+    assert isinstance(canary.teacache_params, TeaCacheParams)
+    assert canary.teacache_params.teacache_thresh == pytest.approx(0.08)
+    assert canary.teacache_params.get_skip_boundaries(19, False) == (15, 16)
 
 
 @pytest.mark.parametrize(

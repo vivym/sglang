@@ -120,9 +120,7 @@ class SamplingParams:
     prompt: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
-    negative_prompt: str = (
-        "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
-    )
+    negative_prompt: str = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     prompt_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     output_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     output_file_name: str | None = field(
@@ -237,12 +235,8 @@ class SamplingParams:
     )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
-    rollout_return_denoising_env: bool = (
-        False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
-    )
-    rollout_return_dit_trajectory: bool = (
-        False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
-    )
+    rollout_return_denoising_env: bool = False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
+    rollout_return_dit_trajectory: bool = False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
     # 0-indexed denoising-loop step filters; None = all steps.
     rollout_sde_step_indices: list[int] | None = None
     rollout_return_step_indices: list[int] | None = None
@@ -316,6 +310,14 @@ class SamplingParams:
 
     def __post_init__(self) -> None:
         assert self.num_frames >= 1
+
+        if isinstance(self.teacache_params, dict):
+            from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+
+            try:
+                self.teacache_params = TeaCacheParams(**self.teacache_params)
+            except TypeError as exc:
+                raise ValueError(f"Invalid teacache_params: {exc}") from exc
 
         if self.width is None and self._default_width is not None:
             self.width = self._default_width
@@ -442,8 +444,7 @@ class SamplingParams:
 
         if self.quality not in QUALITY_LEVELS:
             raise ValueError(
-                f"quality must be one of {list(QUALITY_LEVELS)}, "
-                f"got {self.quality!r}"
+                f"quality must be one of {list(QUALITY_LEVELS)}, got {self.quality!r}"
             )
 
         # These are always required to be sane regardless of pipeline.
