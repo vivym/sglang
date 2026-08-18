@@ -216,6 +216,24 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self.video_vae = video_vae
         self.audio_vae = audio_vae
         self._compiled_audio_vae_decode = ActiveTargetCompiledCallable()
+        self._warmed_audio_vae_target_id: int | None = None
+
+    def _warmup_audio_vae_decode(
+        self,
+        audio_vae,
+        audio_decode,
+        audio_decode_latent: torch.Tensor,
+    ) -> None:
+        target_id = id(audio_vae)
+        if self._warmed_audio_vae_target_id == target_id:
+            return
+        warmup_length = min(8, int(audio_decode_latent.shape[-1]))
+        if warmup_length <= 0:
+            raise ValueError("MiniMax H3 audio latent length must be positive")
+        # BigVGAN's CUDA path can produce a different first-ever output. Prime
+        # its lazy kernels with a bounded input before decoding user latents.
+        audio_decode(torch.zeros_like(audio_decode_latent[..., :warmup_length]))
+        self._warmed_audio_vae_target_id = target_id
 
     @property
     def role_affinity(self) -> RoleType:
@@ -299,6 +317,11 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     server_args,
                     decode_fn=audio_vae.decode,
                     compiled_callable=self._compiled_audio_vae_decode,
+                )
+                self._warmup_audio_vae_decode(
+                    audio_vae,
+                    audio_decode,
+                    audio_decode_latent,
                 )
                 waveform = _required_tensor(
                     audio_decode(audio_decode_latent), "audio_vae.decode"

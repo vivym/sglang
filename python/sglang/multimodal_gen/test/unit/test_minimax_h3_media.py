@@ -15,6 +15,31 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     material_io,
     reference_encoding,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
+    MiniMaxH3DecodingStage,
+)
+
+
+def test_audio_vae_decode_warms_once_per_module():
+    stage = MiniMaxH3DecodingStage(video_vae=None, audio_vae=None)
+    first_audio_vae = object()
+    second_audio_vae = object()
+    latent = torch.ones(2, 32, 12)
+    calls = []
+
+    def decode(value):
+        calls.append(value.clone())
+        return value
+
+    stage._warmup_audio_vae_decode(first_audio_vae, decode, latent)
+    stage._warmup_audio_vae_decode(first_audio_vae, decode, latent)
+    stage._warmup_audio_vae_decode(second_audio_vae, decode, latent)
+
+    assert len(calls) == 2
+    assert calls[0].shape == (2, 32, 8)
+    assert calls[1].shape == (2, 32, 8)
+    assert torch.count_nonzero(calls[0]) == 0
+    assert torch.count_nonzero(calls[1]) == 0
 
 
 def test_ffprobe_falls_back_when_stream_side_data_is_unknown(monkeypatch):
