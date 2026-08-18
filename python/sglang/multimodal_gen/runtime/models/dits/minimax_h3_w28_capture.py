@@ -33,6 +33,7 @@ SAGEATTENTION_ROOT_ENV = "MINIMAX_H3_W28_SAGEATTENTION_ROOT"
 QKV_SNAPSHOT_PATH_ENV = "MINIMAX_H3_W28_QKV_SNAPSHOT_PATH"
 QKV_SNAPSHOT_DIR_ENV = "MINIMAX_H3_W28_QKV_SNAPSHOT_DIR"
 QKV_SNAPSHOT_MAX_BYTES_ENV = "MINIMAX_H3_W28_QKV_SNAPSHOT_MAX_BYTES"
+FULL_QKV_SNAPSHOT_PATH_ENV = "MINIMAX_H3_W29_FULL_QKV_SNAPSHOT_PATH"
 
 BLOCK_Q = 128
 WARP_Q = 32
@@ -57,6 +58,7 @@ class CaptureConfig:
     sageattention_root: Path
     qkv_snapshot_path: Path | None
     qkv_snapshot_dir: Path | None
+    full_qkv_snapshot_path: Path | None
     qkv_snapshot_max_bytes: int
     analyze_samples: bool
 
@@ -66,6 +68,7 @@ class _CaptureState:
     config: CaptureConfig
     sampled: set[tuple[int, int, int, int]]
     snapshot_bytes: int = 0
+    full_snapshot_written: bool = False
 
 
 _CAPTURE_STATE: _CaptureState | None = None
@@ -152,6 +155,7 @@ def parse_capture_config(
         raise ValueError(f"{MAX_SAMPLES_ENV} must be between 1 and 4096")
     qkv_snapshot_path = _qkv_snapshot_path(env, max_samples=max_samples)
     qkv_snapshot_dir = _qkv_snapshot_dir(env)
+    full_qkv_snapshot_path = _full_qkv_snapshot_path(env)
     if qkv_snapshot_path is not None and qkv_snapshot_dir is not None:
         raise ValueError(
             f"{QKV_SNAPSHOT_PATH_ENV} and {QKV_SNAPSHOT_DIR_ENV} are mutually exclusive"
@@ -177,6 +181,7 @@ def parse_capture_config(
         sageattention_root=_persistent_sageattention_root(env),
         qkv_snapshot_path=qkv_snapshot_path,
         qkv_snapshot_dir=qkv_snapshot_dir,
+        full_qkv_snapshot_path=full_qkv_snapshot_path,
         qkv_snapshot_max_bytes=qkv_snapshot_max_bytes,
         analyze_samples=_analysis_enabled(env),
     )
@@ -228,6 +233,23 @@ def _qkv_snapshot_dir(environment: Mapping[str, str]) -> Path | None:
         raise ValueError(f"{QKV_SNAPSHOT_DIR_ENV} must use persistent storage, not /tmp")
     if path.exists() and not path.is_dir():
         raise ValueError(f"{QKV_SNAPSHOT_DIR_ENV} must be a directory")
+    return path
+
+
+def _full_qkv_snapshot_path(environment: Mapping[str, str]) -> Path | None:
+    raw_path = environment.get(FULL_QKV_SNAPSHOT_PATH_ENV, "").strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{FULL_QKV_SNAPSHOT_PATH_ENV} must be an absolute path")
+    path = path.resolve()
+    if path == Path("/tmp") or Path("/tmp") in path.parents:
+        raise ValueError(
+            f"{FULL_QKV_SNAPSHOT_PATH_ENV} must use persistent storage, not /tmp"
+        )
+    if path.suffix != ".safetensors":
+        raise ValueError(f"{FULL_QKV_SNAPSHOT_PATH_ENV} must end in .safetensors")
     return path
 
 
@@ -730,6 +752,79 @@ def _write_qkv_bundle(
     }
 
 
+def _write_full_qkv_snapshot(
+    path: Path,
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    metadata: Mapping[str, Any],
+    softmax_scale: float,
+    remaining_bytes: int,
+) -> dict[str, Any]:
+    """Atomically persist one complete live 56-head attention input."""
+    from safetensors.torch import save_file
+
+    if query.ndim != 4 or query.shape != key.shape or query.shape != value.shape:
+        raise ValueError("full Q/K/V snapshot requires matching four-dimensional tensors")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = path.with_name(path.name + ".partial")
+    if path.exists() or partial_path.exists():
+        raise FileExistsError(f"refusing to overwrite full H3 Q/K/V snapshot: {path}")
+    tensor_bytes = sum(
+        tensor.numel() * tensor.element_size() for tensor in (query, key, value)
+    )
+    if tensor_bytes + 1024**2 > remaining_bytes:
+        raise RuntimeError(
+            "full Q/K/V snapshot byte budget exceeded: "
+            f"need {tensor_bytes}, remaining {remaining_bytes}"
+        )
+    free_bytes = shutil.disk_usage(path.parent).free
+    if free_bytes - tensor_bytes < 2 * 1024**3:
+        raise RuntimeError(
+            "full Q/K/V snapshot would leave less than 2 GiB free: "
+            f"need {tensor_bytes}, free {free_bytes}"
+        )
+    tensors = {
+        "query": query.detach().to(device="cpu").contiguous(),
+        "key": key.detach().to(device="cpu").contiguous(),
+        "value": value.detach().to(device="cpu").contiguous(),
+    }
+    snapshot_metadata = {
+        "schema_version": "3.0.0",
+        "softmax_scale": repr(float(softmax_scale)),
+        **{name: str(value) for name, value in metadata.items()},
+    }
+    try:
+        save_file(tensors, str(partial_path), metadata=snapshot_metadata)
+        with partial_path.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(partial_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        partial_path.unlink(missing_ok=True)
+        raise
+    return {
+        "path": str(path),
+        "bytes": path.stat().st_size,
+        "tensor_bytes": tensor_bytes,
+        "sha256": _sha256(path),
+        "format": "safetensors",
+        "schema_version": "3.0.0",
+        "git_eligible": False,
+        "tensor_shapes": {
+            name: list(tensor.shape) for name, tensor in tensors.items()
+        },
+        "tensor_dtypes": {
+            name: str(tensor.dtype) for name, tensor in tensors.items()
+        },
+    }
+
+
 def _state() -> _CaptureState:
     global _CAPTURE_STATE
     with _STATE_LOCK:
@@ -764,6 +859,11 @@ def _state() -> _CaptureState:
                     "qkv_snapshot_dir": (
                         str(config.qkv_snapshot_dir)
                         if config.qkv_snapshot_dir is not None
+                        else None
+                    ),
+                    "full_qkv_snapshot_path": (
+                        str(config.full_qkv_snapshot_path)
+                        if config.full_qkv_snapshot_path is not None
                         else None
                     ),
                     "qkv_snapshot_max_bytes": config.qkv_snapshot_max_bytes,
@@ -801,6 +901,40 @@ def maybe_capture_w28_activation(
         return
     if real_sequence <= 0 or real_sequence > query.shape[0]:
         raise ValueError("real_sequence must identify a non-empty Q/K/V prefix")
+
+    if config.full_qkv_snapshot_path is not None and not state.full_snapshot_written:
+        full_snapshot = _write_full_qkv_snapshot(
+            config.full_qkv_snapshot_path,
+            query=query[:real_sequence].unsqueeze(0).contiguous(),
+            key=key[:real_sequence].unsqueeze(0).contiguous(),
+            value=value[:real_sequence].unsqueeze(0).contiguous(),
+            metadata={
+                "run_id": config.run_id,
+                "layer": layer,
+                "step": step,
+                "real_sequence": real_sequence,
+                "physical_sequence": query.shape[0],
+                "attention_prefix": attention_prefix,
+            },
+            softmax_scale=softmax_scale,
+            remaining_bytes=config.qkv_snapshot_max_bytes - state.snapshot_bytes,
+        )
+        state.snapshot_bytes += full_snapshot["bytes"]
+        state.full_snapshot_written = True
+        _append_jsonl(
+            config.output_path,
+            {
+                "schema_version": "1.0.0",
+                "record_type": "full_qkv_snapshot",
+                "run_id": config.run_id,
+                "layer": layer,
+                "step": step,
+                "real_sequence": real_sequence,
+                "physical_sequence": query.shape[0],
+                "attention_prefix": attention_prefix,
+                "snapshot": full_snapshot,
+            },
+        )
 
     starts = q_block_starts(real_sequence, config.q_blocks)
     for head in sorted(config.heads):
