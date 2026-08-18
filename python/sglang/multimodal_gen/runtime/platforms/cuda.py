@@ -47,7 +47,9 @@ torch.backends.cuda.enable_cudnn_sdp(False)
 
 def device_id_to_physical_device_id(device_id: int) -> int:
     if "CUDA_VISIBLE_DEVICES" in os.environ:
-        device_ids = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+        device_ids = [
+            visible.strip() for visible in os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+        ]
         if device_ids == [""]:
             msg = (
                 "CUDA_VISIBLE_DEVICES is set to empty string, which means"
@@ -58,8 +60,22 @@ def device_id_to_physical_device_id(device_id: int) -> int:
                 " more information."
             )
             raise RuntimeError(msg)
-        physical_device_id = device_ids[device_id]
-        return int(physical_device_id)
+        try:
+            visible_device = device_ids[device_id]
+        except IndexError as exc:
+            raise ValueError(
+                f"logical CUDA device {device_id} is outside CUDA_VISIBLE_DEVICES="
+                f"{os.environ['CUDA_VISIBLE_DEVICES']!r}"
+            ) from exc
+        try:
+            return int(visible_device)
+        except ValueError:
+            if visible_device.startswith(("GPU-", "MIG-")):
+                handle = pynvml.nvmlDeviceGetHandleByUUID(visible_device)
+                return int(pynvml.nvmlDeviceGetIndex(handle))
+            raise ValueError(
+                f"unsupported CUDA_VISIBLE_DEVICES entry {visible_device!r}"
+            ) from None
     else:
         return device_id
 

@@ -478,6 +478,30 @@ def _minimax_h3_attention_core_impl(
 
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
+    if os.environ.get("MINIMAX_H3_W28_CAPTURE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        from sglang.multimodal_gen.runtime.models.dits.minimax_h3_w28_capture import (
+            is_main_dit_attention_prefix,
+            maybe_capture_w28_activation,
+        )
+
+        # The prompt token refiner reuses this core before denoise context exists.
+        if is_main_dit_attention_prefix(attention.prefix):
+            forward_context = get_forward_context()
+            maybe_capture_w28_activation(
+                attention_prefix=attention.prefix,
+                step=int(forward_context.current_timestep),
+                query=q,
+                key=k,
+                value=v,
+                real_sequence=max_seqlen,
+                softmax_scale=attention.softmax_scale,
+            )
+
     if attention._attention_impl is None:
         attention._set_attention_backend(
             get_attn_backend(
