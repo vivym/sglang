@@ -223,6 +223,52 @@ async def server_info_endpoint(request: Request):
         "tp_size": server_args.tp_size,
         "dp_size": server_args.dp_size,
         "version": __version__,
+        "runtime_config": _runtime_config_for_server_info(server_args),
+    }
+
+
+def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
+    """Return effective settings needed to audit a generation worker."""
+    backend = getattr(server_args.backend, "value", server_args.backend)
+    scheduler_ports = server_args.scheduler_ports
+    if scheduler_ports is None:
+        scheduler_ports = [server_args.scheduler_port]
+    return {
+        "backend": backend,
+        "model_variant": server_args.model_variant,
+        "transformer_weights_path": server_args.transformer_weights_path,
+        "component_paths": dict(server_args.component_paths or {}),
+        "attention_backend": server_args.attention_backend,
+        "component_attention_backends": dict(
+            server_args.component_attention_backends or {}
+        ),
+        "performance_mode": server_args.performance_mode,
+        "dit_cpu_offload": server_args.dit_cpu_offload,
+        "text_encoder_cpu_offload": server_args.text_encoder_cpu_offload,
+        "vae_cpu_offload": server_args.vae_cpu_offload,
+        "layerwise_offload_components": list(
+            server_args.layerwise_offload_components or []
+        ),
+        "layerwise_offload_prefetch_size": server_args.layerwise_offload_prefetch_size,
+        "cache_dit_config": server_args.cache_dit_config,
+        "lora_path": server_args.lora_path,
+        "strict_ports": server_args.strict_ports,
+        "minimax_h3": {
+            "adaln_precompute": os.environ.get("MINIMAX_H3_ADALN_PRECOMPUTE", "1"),
+            "adaln_table_path": os.environ.get(
+                "MINIMAX_H3_ADALN_TABLE_PATH",
+                "/srv/models/MiniMax-H3-adaln-table-hardened/steps20.safetensors",
+            ),
+            "load_adaln_weights": os.environ.get("MINIMAX_H3_LOAD_ADALN_WEIGHTS", "0"),
+            "force_vae_resident": os.environ.get("MINIMAX_H3_FORCE_VAE_RESIDENT", "1"),
+            "convrot_assertion": os.environ.get("MINIMAX_H3_CONVROT"),
+        },
+        "ports": {
+            "http": server_args.port,
+            "broker": server_args.broker_port,
+            "master": server_args.master_port,
+            "schedulers": list(scheduler_ports),
+        },
     }
 
 

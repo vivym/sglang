@@ -434,6 +434,9 @@ def add_common_data_to_response(
     if result.metrics and result.metrics.total_duration_s > 0:
         response["inference_time_s"] = result.metrics.total_duration_s
 
+    if result.metrics and result.metrics.metadata:
+        response["metrics_metadata"] = dict(result.metrics.metadata)
+
     if result.usage is not None:
         usage = dict(result.usage)
         cached_tokens = usage.pop("cached_tokens", None)

@@ -3,10 +3,15 @@ from unittest.mock import patch
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
+    VideoResponse,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    add_common_data_to_response,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _build_video_sampling_params,
 )
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 
 
 def test_video_api_forwards_profiling_options():
@@ -95,3 +100,31 @@ def test_video_api_forwards_request_scoped_teacache_params():
 
     assert kwargs["enable_teacache"] is True
     assert kwargs["teacache_params"] == teacache_params
+
+
+def test_video_response_exposes_request_metrics_metadata():
+    metrics = RequestMetrics("preview-request")
+    metrics.record_metadata(
+        "minimax_h3_teacache",
+        {"computed_steps": [0, 1], "cached_steps": [15]},
+    )
+    result = SimpleNamespace(
+        peak_memory_mb=0.0,
+        metrics=metrics,
+        usage=None,
+        action_pred=None,
+    )
+
+    payload = add_common_data_to_response(
+        {"status": "completed"},
+        request_id="preview-request",
+        result=result,
+    )
+    response = VideoResponse(**payload)
+
+    assert response.metrics_metadata == {
+        "minimax_h3_teacache": {
+            "computed_steps": [0, 1],
+            "cached_steps": [15],
+        }
+    }

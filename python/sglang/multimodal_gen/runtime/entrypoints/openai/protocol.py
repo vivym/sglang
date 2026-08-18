@@ -101,6 +101,7 @@ class VideoResponse(BaseModel):
     num_outputs: Optional[int] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    metrics_metadata: Optional[Dict[str, Any]] = None
     action: Optional[Dict[str, Any]] = None
 
 
