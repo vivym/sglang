@@ -34,8 +34,15 @@ def test_sm80_research_mode_requires_persistent_root() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "cuda_per_warp_fp32_precombined_skip_noop",
+        "cuda_fp16_row_pipeline_precombined_scale",
+    ),
+)
 def test_sm80_research_mode_binds_root_variant_and_extension_hash(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, variant
 ) -> None:
     root = tmp_path / "persistent-sageattention"
     package_dir = root / "sageattention"
@@ -61,16 +68,14 @@ def test_sm80_research_mode_binds_root_variant_and_extension_hash(
 
     config = sage_attn.resolve_sage_sm80_research_config(
         {
-            sage_attn.SAGE_SM80_VARIANT_ENV: (
-                "cuda_per_warp_fp32_precombined_skip_noop"
-            ),
+            sage_attn.SAGE_SM80_VARIANT_ENV: variant,
             sage_attn.SAGE_SM80_ROOT_ENV: str(root),
             sage_attn.SAGE_SM80_QATTN_SHA256_ENV: expected_sha256,
         }
     )
 
     assert config is not None
-    assert config.variant == "cuda_per_warp_fp32_precombined_skip_noop"
+    assert config.variant == variant
     assert config.root == root
     assert config.qattn_extension == extension_path
     assert config.qattn_sha256 == expected_sha256

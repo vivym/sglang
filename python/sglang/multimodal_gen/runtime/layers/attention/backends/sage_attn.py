@@ -35,6 +35,7 @@ SAGE_SM80_RESEARCH_VARIANTS = frozenset(
         "cuda_per_warp_fp32",
         "cuda_per_warp_fp32_precombined_skip_noop",
         "cuda_fp16",
+        "cuda_fp16_row_pipeline_precombined_scale",
     }
 )
 
