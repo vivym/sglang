@@ -71,7 +71,7 @@ def test_relative_l1_by_modality_matches_global_and_tagged_rows():
         chunk_rows=2,
     )
 
-    assert global_value == pytest.approx(_relative_l1(current, previous))
+    assert global_value == _relative_l1(current, previous)
     assert modalities == pytest.approx(
         {"video": 10.0 / 18.0, "text": 1.0, "audio": 0.25}
     )

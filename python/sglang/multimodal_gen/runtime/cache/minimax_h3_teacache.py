@@ -147,18 +147,18 @@ def _relative_l1_by_modality(
     )
     for start in range(0, current_rows.shape[0], chunk_rows):
         stop = min(start + chunk_rows, current_rows.shape[0])
+        delta_abs = (current_rows[start:stop] - previous_rows[start:stop]).abs()
+        sums[0, 0].add_(delta_abs.sum(dtype=torch.float32))
+        delta_row_sums = delta_abs.sum(dim=-1, dtype=torch.float32)
+        del delta_abs
+        previous_abs = previous_rows[start:stop].abs()
+        sums[0, 1].add_(previous_abs.sum(dtype=torch.float32))
+        previous_row_sums = previous_abs.sum(dim=-1, dtype=torch.float32)
+        del previous_abs
         row_sums = torch.stack(
-            (
-                (current_rows[start:stop] - previous_rows[start:stop])
-                .abs()
-                .sum(dim=-1, dtype=torch.float32),
-                previous_rows[start:stop]
-                .abs()
-                .sum(dim=-1, dtype=torch.float32),
-            ),
+            (delta_row_sums, previous_row_sums),
             dim=-1,
         )
-        sums[0].add_(row_sums.sum(dim=0))
         sums.index_add_(0, tags[start:stop].to(torch.long) + 1, row_sums)
     if reduce_sums is not None:
         sums = reduce_sums(sums)
