@@ -10,6 +10,11 @@ from dataclasses import dataclass, field
 import torch
 
 MINIMAX_H3_TEACACHE_NUM_STEPS_EXTRA_KEY = "minimax_h3_teacache_num_steps"
+_MINIMAX_H3_MODALITY_TAGS = {0: "video", 1: "text", 2: "audio"}
+
+
+def _empty_modality_metrics() -> dict[str, dict[int, float]]:
+    return {name: {} for name in _MINIMAX_H3_MODALITY_TAGS.values()}
 
 
 @dataclass
@@ -23,6 +28,12 @@ class MiniMaxH3TeaCacheState:
     proxy_rel_l1: dict[int, float] = field(default_factory=dict)
     rescaled_rel_l1: dict[int, float] = field(default_factory=dict)
     output_rel_l1: dict[int, float] = field(default_factory=dict)
+    proxy_rel_l1_by_modality: dict[str, dict[int, float]] = field(
+        default_factory=_empty_modality_metrics
+    )
+    output_rel_l1_by_modality: dict[str, dict[int, float]] = field(
+        default_factory=_empty_modality_metrics
+    )
 
     def reset(self) -> None:
         self.previous_modulated_input = None
@@ -34,6 +45,10 @@ class MiniMaxH3TeaCacheState:
         self.proxy_rel_l1.clear()
         self.rescaled_rel_l1.clear()
         self.output_rel_l1.clear()
+        for values in self.proxy_rel_l1_by_modality.values():
+            values.clear()
+        for values in self.output_rel_l1_by_modality.values():
+            values.clear()
 
     def summary(self) -> dict[str, object]:
         return {
@@ -42,6 +57,14 @@ class MiniMaxH3TeaCacheState:
             "proxy_rel_l1": dict(self.proxy_rel_l1),
             "rescaled_rel_l1": dict(self.rescaled_rel_l1),
             "output_rel_l1": dict(self.output_rel_l1),
+            "proxy_rel_l1_by_modality": {
+                name: dict(values)
+                for name, values in self.proxy_rel_l1_by_modality.items()
+            },
+            "output_rel_l1_by_modality": {
+                name: dict(values)
+                for name, values in self.output_rel_l1_by_modality.items()
+            },
             "accumulated_distance": self.accumulated_distance,
         }
 
@@ -84,6 +107,70 @@ def _relative_l1(
     return value
 
 
+def _relative_l1_by_modality(
+    current: torch.Tensor,
+    previous: torch.Tensor,
+    token_tags: torch.Tensor,
+    *,
+    chunk_rows: int = 4096,
+    reduce_sums: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> tuple[float, dict[str, float]]:
+    """Compute global and per-modality relative L1 in one tensor scan."""
+
+    if current.shape != previous.shape:
+        raise ValueError(
+            "MiniMax H3 TeaCache comparison shape mismatch: "
+            f"current={tuple(current.shape)}, previous={tuple(previous.shape)}"
+        )
+    if chunk_rows <= 0:
+        raise ValueError("MiniMax H3 TeaCache chunk_rows must be positive")
+
+    current_rows = current.reshape(-1, current.shape[-1])
+    previous_rows = previous.reshape_as(current_rows)
+    tags = token_tags.reshape(-1)
+    if tags.shape[0] != current_rows.shape[0]:
+        raise ValueError(
+            "MiniMax H3 TeaCache token tag count mismatch: "
+            f"tags={tags.shape[0]}, rows={current_rows.shape[0]}"
+        )
+    if tags.numel() and (
+        int(tags.min().item()) < 0
+        or int(tags.max().item()) >= len(_MINIMAX_H3_MODALITY_TAGS)
+    ):
+        raise ValueError("MiniMax H3 TeaCache token tags must be in [0, 3)")
+
+    # Row zero is the global aggregate. Rows 1..3 correspond to tags 0..2.
+    sums = torch.zeros(
+        (len(_MINIMAX_H3_MODALITY_TAGS) + 1, 2),
+        dtype=torch.float32,
+        device=current.device,
+    )
+    for start in range(0, current_rows.shape[0], chunk_rows):
+        stop = min(start + chunk_rows, current_rows.shape[0])
+        row_sums = torch.stack(
+            (
+                (current_rows[start:stop] - previous_rows[start:stop])
+                .abs()
+                .sum(dim=-1, dtype=torch.float32),
+                previous_rows[start:stop]
+                .abs()
+                .sum(dim=-1, dtype=torch.float32),
+            ),
+            dim=-1,
+        )
+        sums[0].add_(row_sums.sum(dim=0))
+        sums.index_add_(0, tags[start:stop].to(torch.long) + 1, row_sums)
+    if reduce_sums is not None:
+        sums = reduce_sums(sums)
+    values = sums[:, 0] / sums[:, 1].clamp_min(1e-8)
+    if not bool(torch.isfinite(values).all().item()):
+        raise ValueError("MiniMax H3 TeaCache relative L1 is non-finite")
+    return float(values[0].item()), {
+        name: float(values[tag + 1].item())
+        for tag, name in _MINIMAX_H3_MODALITY_TAGS.items()
+    }
+
+
 def _rescale_distance(value: float, coefficients: list[float]) -> float:
     if not coefficients:
         raise ValueError("MiniMax H3 TeaCache coefficients must not be empty")
@@ -109,6 +196,7 @@ def decide_minimax_h3_teacache(
     end_skipping: int,
     coefficients: list[float],
     reduce_sums: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    token_tags: torch.Tensor | None = None,
 ) -> bool:
     """Return True to execute the H3 block stack, False to reuse its residual."""
 
@@ -125,11 +213,21 @@ def decide_minimax_h3_teacache(
     raw_distance = None
     scaled_distance = None
     if previous is not None:
-        raw_distance = _relative_l1(
-            modulated_input,
-            previous,
-            reduce_sums=reduce_sums,
-        )
+        if token_tags is None:
+            raw_distance = _relative_l1(
+                modulated_input,
+                previous,
+                reduce_sums=reduce_sums,
+            )
+        else:
+            raw_distance, modality_distances = _relative_l1_by_modality(
+                modulated_input,
+                previous,
+                token_tags,
+                reduce_sums=reduce_sums,
+            )
+            for name, value in modality_distances.items():
+                state.proxy_rel_l1_by_modality[name][step] = value
         scaled_distance = _rescale_distance(raw_distance, coefficients)
         state.proxy_rel_l1[step] = raw_distance
         state.rescaled_rel_l1[step] = scaled_distance
@@ -164,6 +262,7 @@ def update_minimax_h3_teacache_residual(
     collect_calibration: bool = False,
     valid_rows: int | None = None,
     reduce_sums: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    token_tags: torch.Tensor | None = None,
 ) -> None:
     if block_output.shape != block_input.shape:
         raise ValueError(
@@ -183,6 +282,11 @@ def update_minimax_h3_teacache_residual(
             "MiniMax H3 TeaCache valid_rows outside block output shape: "
             f"{valid_rows} not in [0, {block_output.shape[0]}]"
         )
+    if token_tags is not None and token_tags.numel() != block_output.shape[0]:
+        raise ValueError(
+            "MiniMax H3 TeaCache token tag count mismatch: "
+            f"tags={token_tags.numel()}, rows={block_output.shape[0]}"
+        )
 
     previous_output = state.previous_calibration_output
     if collect_calibration and previous_output is not None:
@@ -191,11 +295,25 @@ def update_minimax_h3_teacache_residual(
         if valid_rows is not None:
             metric_output = block_output[:valid_rows]
             metric_previous = previous_output[:valid_rows]
-        state.output_rel_l1[step] = _relative_l1(
-            metric_output,
-            metric_previous,
-            reduce_sums=reduce_sums,
-        )
+        if token_tags is None:
+            state.output_rel_l1[step] = _relative_l1(
+                metric_output,
+                metric_previous,
+                reduce_sums=reduce_sums,
+            )
+        else:
+            metric_tags = token_tags
+            if valid_rows is not None:
+                metric_tags = token_tags[:valid_rows]
+            output_distance, modality_distances = _relative_l1_by_modality(
+                metric_output,
+                metric_previous,
+                metric_tags,
+                reduce_sums=reduce_sums,
+            )
+            state.output_rel_l1[step] = output_distance
+            for name, value in modality_distances.items():
+                state.output_rel_l1_by_modality[name][step] = value
     state.previous_calibration_output = (
         block_output.detach() if collect_calibration else None
     )

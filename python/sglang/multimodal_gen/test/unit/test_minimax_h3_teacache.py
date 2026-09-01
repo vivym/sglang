@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.cache.minimax_h3_teacache import (
     MINIMAX_H3_TEACACHE_NUM_STEPS_EXTRA_KEY,
     MiniMaxH3TeaCacheState,
     _relative_l1,
+    _relative_l1_by_modality,
     decide_minimax_h3_teacache,
     update_minimax_h3_teacache_residual,
 )
@@ -53,6 +54,47 @@ def test_relative_l1_reduces_numerator_and_denominator_together():
 
     assert actual == pytest.approx(1.0)
     torch.testing.assert_close(reduced[0], torch.tensor([3.0, 3.0]))
+
+
+def test_relative_l1_by_modality_matches_global_and_tagged_rows():
+    previous = torch.tensor(
+        [[1.0, 1.0], [2.0, 2.0], [4.0, 4.0], [8.0, 8.0]]
+    )
+    current = previous + torch.tensor(
+        [[1.0, 1.0], [2.0, 2.0], [1.0, 1.0], [4.0, 4.0]]
+    )
+
+    global_value, modalities = _relative_l1_by_modality(
+        current,
+        previous,
+        torch.tensor([0, 1, 2, 0]),
+        chunk_rows=2,
+    )
+
+    assert global_value == pytest.approx(_relative_l1(current, previous))
+    assert modalities == pytest.approx(
+        {"video": 10.0 / 18.0, "text": 1.0, "audio": 0.25}
+    )
+
+
+def test_relative_l1_by_modality_reduces_all_sums_once():
+    reduced = []
+
+    def reduce_sums(value):
+        reduced.append(value.clone())
+        return value * 2
+
+    global_value, modalities = _relative_l1_by_modality(
+        torch.tensor([[2.0, 4.0]]),
+        torch.tensor([[1.0, 2.0]]),
+        torch.tensor([2]),
+        reduce_sums=reduce_sums,
+    )
+
+    assert len(reduced) == 1
+    assert reduced[0].shape == (4, 2)
+    assert global_value == pytest.approx(1.0)
+    assert modalities == {"video": 0.0, "text": 0.0, "audio": 1.0}
 
 
 def test_empty_sequence_parallel_rank_still_joins_reduction():
@@ -119,6 +161,47 @@ def test_zero_threshold_forces_dense_calibration_and_records_output_delta():
     assert set(state.proxy_rel_l1) == {1, 2}
     assert set(state.output_rel_l1) == {1, 2}
     assert state.output_rel_l1[1] == pytest.approx(0.1, rel=0.05)
+
+
+def test_teacache_records_modality_proxy_and_output_calibration():
+    state = MiniMaxH3TeaCacheState()
+    tags = torch.tensor([0, 1, 2])
+
+    for step, values in enumerate(
+        (
+            torch.tensor([[1.0], [2.0], [4.0]]),
+            torch.tensor([[2.0], [2.5], [5.0]]),
+        )
+    ):
+        assert decide_minimax_h3_teacache(
+            state,
+            values,
+            step=step,
+            num_steps=2,
+            threshold=0.0,
+            start_skipping=0,
+            end_skipping=2,
+            coefficients=[1.0, 0.0],
+            token_tags=tags,
+        )
+        update_minimax_h3_teacache_residual(
+            state,
+            values * 2,
+            values,
+            step=step,
+            collect_calibration=True,
+            token_tags=tags,
+        )
+
+    assert state.proxy_rel_l1_by_modality["video"][1] == pytest.approx(1.0)
+    assert state.proxy_rel_l1_by_modality["text"][1] == pytest.approx(0.25)
+    assert state.proxy_rel_l1_by_modality["audio"][1] == pytest.approx(0.25)
+    assert state.output_rel_l1_by_modality["video"][1] == pytest.approx(1.0)
+    assert state.output_rel_l1_by_modality["text"][1] == pytest.approx(0.25)
+    assert state.output_rel_l1_by_modality["audio"][1] == pytest.approx(0.25)
+
+    summary = state.summary()
+    assert summary["proxy_rel_l1_by_modality"]["audio"] == {1: 0.25}
 
 
 def test_output_metric_excludes_packed_padding_rows_and_caches_true_residual():

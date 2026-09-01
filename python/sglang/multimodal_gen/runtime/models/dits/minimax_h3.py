@@ -2101,6 +2101,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             raise RuntimeError("MiniMax H3 TeaCache and Cache-DiT cannot run together")
         teacache_should_compute = True
         teacache_reduce_sums = get_sp_group().all_reduce if sp_ws > 1 else None
+        teacache_modality_metrics = os.environ.get(
+            "MINIMAX_H3_TEACACHE_MODALITY_METRICS", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         if teacache_config is not None:
             (
                 teacache_step,
@@ -2133,6 +2136,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 end_skipping=teacache_end,
                 coefficients=teacache_coefficients,
                 reduce_sums=teacache_reduce_sums,
+                token_tags=(
+                    block_token_tags[:local_valid_rows]
+                    if teacache_modality_metrics
+                    else None
+                ),
             )
         # With sequence parallelism, shard rows across the group for the
         # block stack. Attention trades sequence for heads internally
@@ -2174,6 +2182,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     collect_calibration=teacache_threshold == 0.0,
                     valid_rows=local_valid_rows,
                     reduce_sums=teacache_reduce_sums,
+                    token_tags=(
+                        block_token_tags if teacache_modality_metrics else None
+                    ),
                 )
         else:
             previous_residual = self._minimax_h3_teacache_state.previous_residual
