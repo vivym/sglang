@@ -50,6 +50,20 @@ def _resolve_checkpoint_load_device(
     return runtime_device
 
 
+def _supports_direct_gpu_weight_loading(
+    quant_spec: TransformerQuantLoadSpec,
+) -> bool:
+    if quant_spec.runtime_quant_config is None:
+        return True
+    quant_config = quant_spec.quant_config
+    quant_name_getter = getattr(type(quant_config), "get_name", None)
+    quant_name = quant_name_getter() if callable(quant_name_getter) else None
+    return bool(
+        quant_name == "int8"
+        and getattr(quant_config, "is_checkpoint_int8_serialized", False)
+    )
+
+
 def _default_quantized_attention_backend(
     quant_spec: TransformerQuantLoadSpec, server_args: ServerArgs
 ) -> AttentionBackendEnum | None:
@@ -222,9 +236,12 @@ class TransformerLoader(ComponentLoader):
         direct_gpu_weight_loading = bool(
             component_server_args.direct_gpu_weight_loading
         )
-        if direct_gpu_weight_loading and quant_spec.runtime_quant_config is not None:
+        if direct_gpu_weight_loading and not _supports_direct_gpu_weight_loading(
+            quant_spec
+        ):
             raise ValueError(
-                "--direct-gpu-weight-loading supports only unquantized DiT checkpoints"
+                "--direct-gpu-weight-loading supports only unquantized or "
+                "serialized INT8 DiT checkpoints"
             )
         weight_load_plan = WeightLoadPlan.for_component(
             checkpoint_load_device=checkpoint_load_device,

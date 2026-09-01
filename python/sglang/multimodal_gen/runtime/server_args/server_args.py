@@ -1872,10 +1872,11 @@ class ServerArgs(DisaggServerArgsMixin):
             "--direct-gpu-weight-loading",
             action=StoreBoolean,
             default=ServerArgs.direct_gpu_weight_loading,
-            help="Load the full unquantized DiT checkpoint state dict directly "
-            "onto GPU before assigning model parameters. This may reduce startup "
-            "time depending on the model, but temporarily requires checkpoint "
-            "weights and model weights to coexist on GPU. Disabled by default.",
+            help="Load a supported DiT checkpoint state dict directly onto GPU "
+            "before assigning model parameters. Unquantized and serialized INT8 "
+            "checkpoints are supported. This may reduce startup host memory and "
+            "time, but temporarily requires checkpoint weights and model weights "
+            "to coexist on GPU. Disabled by default.",
         )
         parser.add_argument(
             "--cpu-offload-components",

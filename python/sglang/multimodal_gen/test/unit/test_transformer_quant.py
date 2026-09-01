@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_l
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     _default_quantized_attention_backend,
     _resolve_checkpoint_load_device,
+    _supports_direct_gpu_weight_loading,
     _warn_if_expected_param_dtype_missing,
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
@@ -266,6 +267,32 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
 
         self.assertTrue(plan.load_full_state_dict_on_device)
+
+    def test_direct_gpu_loading_accepts_only_serialized_int8_quantization(self):
+        unquantized = TransformerQuantLoadSpec([], None, None, None)
+        serialized_int8 = TransformerQuantLoadSpec(
+            [],
+            _make_quant_config("int8", is_checkpoint_int8_serialized=True),
+            None,
+            None,
+        )
+        online_int8 = TransformerQuantLoadSpec(
+            [],
+            _make_quant_config("int8", is_checkpoint_int8_serialized=False),
+            None,
+            None,
+        )
+        serialized_fp8 = TransformerQuantLoadSpec(
+            [],
+            _make_quant_config("fp8", is_checkpoint_fp8_serialized=True),
+            None,
+            None,
+        )
+
+        self.assertTrue(_supports_direct_gpu_weight_loading(unquantized))
+        self.assertTrue(_supports_direct_gpu_weight_loading(serialized_int8))
+        self.assertFalse(_supports_direct_gpu_weight_loading(online_int8))
+        self.assertFalse(_supports_direct_gpu_weight_loading(serialized_fp8))
 
     def test_unquantized_cpu_offload_loads_checkpoint_on_cpu(self):
         device = _resolve_checkpoint_load_device(
