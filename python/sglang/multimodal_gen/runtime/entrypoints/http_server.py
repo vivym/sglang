@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 logger = init_logger(__name__)
+SERVER_INSTANCE_ID = str(uuid.uuid4())
 
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 SERVER_WARMUP_BYPASS_PATHS = (
@@ -223,6 +224,7 @@ async def server_info_endpoint(request: Request):
         "tp_size": server_args.tp_size,
         "dp_size": server_args.dp_size,
         "version": __version__,
+        "server_instance_id": SERVER_INSTANCE_ID,
         "runtime_config": _runtime_config_for_server_info(server_args),
     }
 
@@ -262,6 +264,10 @@ def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
             "load_adaln_weights": os.environ.get("MINIMAX_H3_LOAD_ADALN_WEIGHTS", "0"),
             "force_vae_resident": os.environ.get("MINIMAX_H3_FORCE_VAE_RESIDENT", "1"),
             "convrot_assertion": os.environ.get("MINIMAX_H3_CONVROT"),
+            "latent_dump_path_template": os.environ.get("MINIMAX_H3_DUMP_LATENTS_PATH"),
+            "reuse_text_embeddings": os.environ.get(
+                "MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS", "0"
+            ),
         },
         "ports": {
             "http": server_args.port,

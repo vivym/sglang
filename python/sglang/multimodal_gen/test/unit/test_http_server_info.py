@@ -1,16 +1,20 @@
 from types import SimpleNamespace
 
 from sglang.multimodal_gen.runtime.entrypoints.http_server import (
+    SERVER_INSTANCE_ID,
     _runtime_config_for_server_info,
 )
 
 
 def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
+    assert SERVER_INSTANCE_ID
     monkeypatch.setenv("MINIMAX_H3_ADALN_PRECOMPUTE", "1")
     monkeypatch.setenv("MINIMAX_H3_ADALN_TABLE_PATH", "/models/steps20.safetensors")
     monkeypatch.setenv("MINIMAX_H3_LOAD_ADALN_WEIGHTS", "0")
     monkeypatch.setenv("MINIMAX_H3_FORCE_VAE_RESIDENT", "1")
     monkeypatch.setenv("MINIMAX_H3_CONVROT", "1")
+    monkeypatch.setenv("MINIMAX_H3_DUMP_LATENTS_PATH", "/runs/latents/{request_id}.pt")
+    monkeypatch.setenv("MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS", "0")
     server_args = SimpleNamespace(
         backend=SimpleNamespace(value="sglang"),
         model_variant="fl2va",
@@ -56,6 +60,8 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
             "load_adaln_weights": "0",
             "force_vae_resident": "1",
             "convrot_assertion": "1",
+            "latent_dump_path_template": "/runs/latents/{request_id}.pt",
+            "reuse_text_embeddings": "0",
         },
         "ports": {
             "http": 30500,
@@ -73,6 +79,8 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
         "MINIMAX_H3_LOAD_ADALN_WEIGHTS",
         "MINIMAX_H3_FORCE_VAE_RESIDENT",
         "MINIMAX_H3_CONVROT",
+        "MINIMAX_H3_DUMP_LATENTS_PATH",
+        "MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS",
     ):
         monkeypatch.delenv(name, raising=False)
     server_args = SimpleNamespace(
@@ -111,5 +119,7 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
         "load_adaln_weights": "0",
         "force_vae_resident": "1",
         "convrot_assertion": None,
+        "latent_dump_path_template": None,
+        "reuse_text_embeddings": "0",
     }
     assert config["ports"]["schedulers"] == [5555]
