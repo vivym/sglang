@@ -13,6 +13,7 @@ import torch
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.action import api as action_api
 from sglang.multimodal_gen.runtime.entrypoints.action import openpi
@@ -253,6 +254,20 @@ def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
         ),
         "layerwise_offload_prefetch_size": server_args.layerwise_offload_prefetch_size,
         "cache_dit_config": server_args.cache_dit_config,
+        "cache_dit_env": {
+            "enabled": envs.SGLANG_CACHE_DIT_ENABLED,
+            "fn_compute_blocks": envs.SGLANG_CACHE_DIT_FN,
+            "bn_compute_blocks": envs.SGLANG_CACHE_DIT_BN,
+            "warmup_steps": envs.SGLANG_CACHE_DIT_WARMUP,
+            "residual_diff_threshold": envs.SGLANG_CACHE_DIT_RDT,
+            "max_continuous_cached_steps": envs.SGLANG_CACHE_DIT_MC,
+            "taylorseer_enabled": envs.SGLANG_CACHE_DIT_TAYLORSEER,
+            "taylorseer_order": envs.SGLANG_CACHE_DIT_TS_ORDER,
+            "scm_preset": envs.SGLANG_CACHE_DIT_SCM_PRESET,
+            "scm_compute_bins": envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS,
+            "scm_cache_bins": envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS,
+            "scm_policy": envs.SGLANG_CACHE_DIT_SCM_POLICY,
+        },
         "lora_path": server_args.lora_path,
         "strict_ports": server_args.strict_ports,
         "minimax_h3": {

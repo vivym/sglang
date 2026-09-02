@@ -15,6 +15,18 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
     monkeypatch.setenv("MINIMAX_H3_CONVROT", "1")
     monkeypatch.setenv("MINIMAX_H3_DUMP_LATENTS_PATH", "/runs/latents/{request_id}.pt")
     monkeypatch.setenv("MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS", "0")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "1")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_FN", "1")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_BN", "0")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_WARMUP", "4")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_RDT", "0.066")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_MC", "1")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_TAYLORSEER", "false")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_TS_ORDER", "1")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_SCM_PRESET", "none")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_SCM_COMPUTE_BINS", "8,3,3,2,2")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_SCM_CACHE_BINS", "1,2,2,2,3")
+    monkeypatch.setenv("SGLANG_CACHE_DIT_SCM_POLICY", "dynamic")
     server_args = SimpleNamespace(
         backend=SimpleNamespace(value="sglang"),
         model_variant="fl2va",
@@ -52,6 +64,20 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
         "layerwise_offload_components": ["text_encoder"],
         "layerwise_offload_prefetch_size": 1.0,
         "cache_dit_config": None,
+        "cache_dit_env": {
+            "enabled": True,
+            "fn_compute_blocks": 1,
+            "bn_compute_blocks": 0,
+            "warmup_steps": 4,
+            "residual_diff_threshold": 0.066,
+            "max_continuous_cached_steps": 1,
+            "taylorseer_enabled": False,
+            "taylorseer_order": 1,
+            "scm_preset": "none",
+            "scm_compute_bins": "8,3,3,2,2",
+            "scm_cache_bins": "1,2,2,2,3",
+            "scm_policy": "dynamic",
+        },
         "lora_path": None,
         "strict_ports": True,
         "minimax_h3": {
@@ -81,6 +107,18 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
         "MINIMAX_H3_CONVROT",
         "MINIMAX_H3_DUMP_LATENTS_PATH",
         "MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS",
+        "SGLANG_CACHE_DIT_ENABLED",
+        "SGLANG_CACHE_DIT_FN",
+        "SGLANG_CACHE_DIT_BN",
+        "SGLANG_CACHE_DIT_WARMUP",
+        "SGLANG_CACHE_DIT_RDT",
+        "SGLANG_CACHE_DIT_MC",
+        "SGLANG_CACHE_DIT_TAYLORSEER",
+        "SGLANG_CACHE_DIT_TS_ORDER",
+        "SGLANG_CACHE_DIT_SCM_PRESET",
+        "SGLANG_CACHE_DIT_SCM_COMPUTE_BINS",
+        "SGLANG_CACHE_DIT_SCM_CACHE_BINS",
+        "SGLANG_CACHE_DIT_SCM_POLICY",
     ):
         monkeypatch.delenv(name, raising=False)
     server_args = SimpleNamespace(
@@ -111,6 +149,20 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
     assert config["component_paths"] == {}
     assert config["component_attention_backends"] == {}
     assert config["layerwise_offload_components"] == []
+    assert config["cache_dit_env"] == {
+        "enabled": False,
+        "fn_compute_blocks": 1,
+        "bn_compute_blocks": 0,
+        "warmup_steps": 4,
+        "residual_diff_threshold": 0.24,
+        "max_continuous_cached_steps": 3,
+        "taylorseer_enabled": False,
+        "taylorseer_order": 1,
+        "scm_preset": "none",
+        "scm_compute_bins": None,
+        "scm_cache_bins": None,
+        "scm_policy": "dynamic",
+    }
     assert config["minimax_h3"] == {
         "adaln_precompute": "1",
         "adaln_table_path": (
