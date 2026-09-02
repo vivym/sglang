@@ -11,6 +11,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
 _MINIMAX_H3_MAX_SIGNED_SEED = (1 << 63) - 1
+MINIMAX_H3_SAMPLER_MODES = ("euler", "res_multistep")
 
 
 def _minimax_h3_teacache_params_from_env() -> TeaCacheParams:
@@ -76,6 +77,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
         metadata={"batch_sig_exclude": True},
     )
     audio_flow_shift: float | None = None
+    sampler_mode: str = "euler"
     output_mode: str | None = field(
         default=None,
         metadata={"batch_sig_exclude": True},
@@ -92,6 +94,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "conditions",
                 "target",
                 "audio_flow_shift",
+                "sampler_mode",
                 "audio_guidance_scale",
                 "quality",
                 "output_mode",
@@ -225,6 +228,26 @@ class MiniMaxH3SamplingParams(SamplingParams):
         super()._validate()
         _optional_positive_finite_float(self.flow_shift, "flow_shift")
         _optional_positive_finite_float(self.audio_flow_shift, "audio_flow_shift")
+        if self.sampler_mode not in MINIMAX_H3_SAMPLER_MODES:
+            raise ValueError(
+                "MiniMax H3 sampler_mode must be one of "
+                f"{list(MINIMAX_H3_SAMPLER_MODES)}, got {self.sampler_mode!r}"
+            )
+        if self.sampler_mode == "res_multistep":
+            enabled = os.environ.get(
+                "SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP", "0"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if not enabled:
+                raise ValueError(
+                    "MiniMax H3 res_multistep is an experimental canary; set "
+                    "SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP=1 on the server to enable it"
+                )
+            if self.quality != "fast":
+                raise ValueError('MiniMax H3 res_multistep requires quality="fast"')
+            if self.enable_teacache or self.enable_spectrum:
+                raise ValueError(
+                    "MiniMax H3 res_multistep cannot be combined with TeaCache or Spectrum"
+                )
         if self.enable_frame_interpolation:
             raise ValueError(
                 "MiniMax H3 does not support enable_frame_interpolation: the "
@@ -342,4 +365,4 @@ class MiniMaxH3SamplingParams(SamplingParams):
             req.extra.update(self.build_request_extra())
 
 
-__all__ = ["MiniMaxH3SamplingParams"]
+__all__ = ["MINIMAX_H3_SAMPLER_MODES", "MiniMaxH3SamplingParams"]

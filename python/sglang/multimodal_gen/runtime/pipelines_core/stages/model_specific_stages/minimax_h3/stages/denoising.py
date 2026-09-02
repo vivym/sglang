@@ -521,6 +521,27 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
+        quality = getattr(batch.sampling_params, "quality", "lossless")
+        self._minimax_h3_quality = quality
+        sampler_mode = getattr(batch.sampling_params, "sampler_mode", "euler")
+        if sampler_mode == "res_multistep":
+            if bool(getattr(batch.sampling_params, "enable_teacache", False)):
+                raise ValueError(
+                    "MiniMax H3 res_multistep cannot be combined with TeaCache"
+                )
+            if self._cache_dit_enabled:
+                self.transformer = disable_cache_on_transformer(self.transformer)
+                self._cache_dit_enabled = False
+                self._cached_num_steps = None
+                self._minimax_h3_cache_mode = None
+            if (
+                getattr(batch.sampling_params, "quality", "lossless") == "high"
+                or super()._cache_dit_requested()
+            ):
+                raise ValueError(
+                    "MiniMax H3 res_multistep cannot be combined with Cache-DiT"
+                )
+            return
         if bool(getattr(batch.sampling_params, "enable_teacache", False)):
             if self._cache_dit_enabled:
                 self.transformer = disable_cache_on_transformer(self.transformer)
@@ -528,7 +549,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 self._cached_num_steps = None
                 self._minimax_h3_cache_mode = None
             return
-        quality = getattr(batch.sampling_params, "quality", "lossless")
         explicit_fields = getattr(batch.sampling_params, "_explicit_fields", ())
         generic_requested = (
             super()._cache_dit_requested() and "quality" not in explicit_fields
@@ -537,8 +557,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             "high" if quality == "high" else ("generic" if generic_requested else None)
         )
         current_mode = getattr(self, "_minimax_h3_cache_mode", None)
-        self._minimax_h3_quality = quality
-
         # H3 is monolithic-only, and the scheduler executes one worker batch at
         # a time. Combined with `quality` in the dynamic-batch signature, this
         # makes the process-wide hook transition safe at this batch boundary.
@@ -645,6 +663,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA")
         device = torch.device("cuda")
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
+        sampler_mode = getattr(batch.sampling_params, "sampler_mode", "euler")
         batch.extra[MINIMAX_H3_TEACACHE_NUM_STEPS_EXTRA_KEY] = len(sigmas_video) - 1
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
@@ -736,6 +755,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     device=device,
                     imgvid_cond_noise_aug_for_inference=float(imgvid_noise_aug),
                     audio_cond_noise_aug_for_inference=float(audio_noise_aug),
+                    sampler_mode=sampler_mode,
                     on_step=on_step,
                     step_profiler=partial(
                         self._profile_denoising_step,
@@ -744,6 +764,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 )
                 self._record_cache_dit_metrics(model, batch)
                 self._record_minimax_h3_teacache_metrics(model, batch)
+                self._record_minimax_h3_solver_metrics(
+                    batch,
+                    sampler_mode=sampler_mode,
+                    sigma_points=len(sigmas_video),
+                )
         finally:
             try:
                 if model is not None and hasattr(model, "reset_minimax_h3_teacache"):
@@ -799,6 +824,28 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         batch.metrics.record_metadata(
             "minimax_h3_teacache",
             model.minimax_h3_teacache_summary(),
+        )
+
+    @staticmethod
+    def _record_minimax_h3_solver_metrics(
+        batch: Req,
+        *,
+        sampler_mode: str,
+        sigma_points: int,
+    ) -> None:
+        if batch.metrics is None:
+            return
+        batch.metrics.record_metadata(
+            "minimax_h3_solver",
+            {
+                "sampler_mode": sampler_mode,
+                "sigma_points": int(sigma_points),
+                "dit_calls": int(sigma_points) - 1,
+                "order": 2 if sampler_mode == "res_multistep" else 1,
+                "modality_histories": (
+                    "independent" if sampler_mode == "res_multistep" else "none"
+                ),
+            },
         )
 
     @contextmanager

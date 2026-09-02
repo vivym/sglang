@@ -292,6 +292,7 @@ def test_video_adapter_lowers_only_native_fields_and_rejects_cfg():
         "target": TARGET,
         "flow_shift": 8.0,
         "audio_flow_shift": 2.0,
+        "sampler_mode": "euler",
         "quality": "high",
         "imgvid_cond_noise_aug_for_inference": 0.75,
         "audio_cond_noise_aug_for_inference": 0.5,
@@ -460,6 +461,84 @@ def test_fast_quality_binds_startup_lora_and_canary_workload():
         batch.num_inference_steps = 9
         server_args.lora_scale = 0.5
         with pytest.raises(ValueError, match="requires lora_scale=1.0"):
+            stage.forward(batch, server_args)
+
+
+def test_res_multistep_is_explicit_request_scoped_fast_canary(monkeypatch):
+    with pytest.raises(ValueError, match="experimental canary"):
+        MiniMaxH3SamplingParams(
+            sampler_mode="res_multistep",
+            quality="fast",
+        )
+
+    monkeypatch.setenv("SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP", "1")
+    params = MiniMaxH3SamplingParams(
+        sampler_mode="res_multistep",
+        quality="fast",
+    )
+    assert params.sampler_mode == "res_multistep"
+
+    with pytest.raises(ValueError, match='requires quality="fast"'):
+        MiniMaxH3SamplingParams(sampler_mode="res_multistep")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        MiniMaxH3SamplingParams(
+            sampler_mode="res_multistep",
+            quality="fast",
+            enable_teacache=True,
+        )
+
+
+def test_res_multistep_admission_binds_candidate_grid_and_excludes_lora(monkeypatch):
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va", "fl2va"],
+                "task_aliases": {},
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            }
+        }
+    )
+    canonical = minimax_h3_validate_canonical_request(
+        task="t2va",
+        prompt="solver canary",
+        conditions=[],
+        target={**TARGET, "duration_seconds": 15.0},
+        seed=0,
+    )
+    plan = minimax_h3_resolve_plan(canonical)
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            task="t2va",
+            quality="fast",
+            sampler_mode="res_multistep",
+        ),
+        num_inference_steps=13,
+        is_warmup=False,
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(metadata)
+    server_args = _quality_server_args()
+    server_args.pipeline_config = MiniMaxH3PipelineConfig()
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+        "minimax_h3.release_metadata.minimax_h3_plan_from_batch",
+        return_value=plan,
+    ):
+        with pytest.raises(ValueError, match="canary is disabled"):
+            stage.forward(batch, server_args)
+
+        monkeypatch.setenv("SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP", "1")
+        assert stage.forward(batch, server_args) is batch
+
+        batch.num_inference_steps = 14
+        with pytest.raises(ValueError, match="admitted only"):
+            stage.forward(batch, server_args)
+
+        batch.num_inference_steps = 15
+        server_args.lora_path = "/adapter.safetensors"
+        with pytest.raises(ValueError, match="cannot be combined"):
             stage.forward(batch, server_args)
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -41,6 +42,18 @@ _MINIMAX_H3_FAST_WORKLOAD = {
     "audio_flow_shift": 3.0,
 }
 
+_MINIMAX_H3_RES_MULTISTEP_CANARY_WORKLOAD = {
+    "task": "t2va",
+    "width": 1344,
+    "height": 768,
+    "fps": 24,
+    "frame_count": {124, 243, 362},
+    # 13/15/17/21 sigma points execute 12/14/16/20 DiT calls.
+    "num_inference_steps": {13, 15, 17, 21},
+    "flow_shift": 12.0,
+    "audio_flow_shift": 3.0,
+}
+
 
 def _string_list(value: Any, path: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
@@ -74,7 +87,7 @@ class MiniMaxH3ReleaseMetadata:
         partition = raw.get("partition")
         if partition not in {"fl2va", "ref2va"}:
             raise ValueError(
-                "model_index.json._minimax_h3.partition must be one of " "fl2va, ref2va"
+                "model_index.json._minimax_h3.partition must be one of fl2va, ref2va"
             )
         tasks = _string_list(raw.get("tasks"), "model_index.json._minimax_h3.tasks")
         aliases = raw.get("task_aliases", {})
@@ -159,21 +172,35 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
             raise ValueError("MiniMax H3 request task must be a non-empty string")
         self.metadata.canonical_task(task)
         quality = getattr(batch.sampling_params, "quality", "lossless")
+        sampler_mode = getattr(batch.sampling_params, "sampler_mode", "euler")
         if quality not in QUALITY_LEVELS:
             raise ValueError(
                 f"quality must be one of {list(QUALITY_LEVELS)}, got {quality!r}"
             )
+        if sampler_mode not in {"euler", "res_multistep"}:
+            raise ValueError(f"unsupported MiniMax-H3 sampler_mode {sampler_mode!r}")
         startup_lora = getattr(server_args, "lora_path", None)
-        if not batch.is_warmup and startup_lora is not None and quality != "fast":
-            raise ValueError(
-                'MiniMax-H3 with a startup LoRA requires quality="fast"; '
-                f"quality={quality!r} cannot describe the effective model state"
-            )
-        if not batch.is_warmup and quality == "fast" and startup_lora is None:
-            raise ValueError(
-                'MiniMax-H3 quality="fast" requires an explicitly configured '
-                "startup LoRA"
-            )
+        uses_res_multistep = sampler_mode == "res_multistep"
+        if not batch.is_warmup:
+            if startup_lora is not None and uses_res_multistep:
+                raise ValueError(
+                    "MiniMax-H3 res_multistep cannot be combined with a startup LoRA"
+                )
+            if startup_lora is not None and quality != "fast":
+                raise ValueError(
+                    'MiniMax-H3 with a startup LoRA requires quality="fast"; '
+                    f"quality={quality!r} cannot describe the effective model state"
+                )
+            if uses_res_multistep and quality != "fast":
+                raise ValueError(
+                    'MiniMax-H3 res_multistep requires quality="fast"; '
+                    f"quality={quality!r} cannot describe the solver trajectory"
+                )
+            if quality == "fast" and startup_lora is None and not uses_res_multistep:
+                raise ValueError(
+                    'MiniMax-H3 quality="fast" requires an explicitly configured '
+                    "startup LoRA or sampler_mode='res_multistep'"
+                )
         high_quality = quality == "high"
         if high_quality and not batch.is_warmup:
             server_args.pipeline_config.validate_quality_deployment(server_args)
@@ -228,15 +255,72 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                     f"{_MINIMAX_H3_QUALITY_WORKLOAD}; got {actual}"
                 )
         if quality == "fast" and not batch.is_warmup:
+            if uses_res_multistep:
+                enabled = os.environ.get(
+                    "SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP", "0"
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                if not enabled:
+                    raise ValueError(
+                        "MiniMax-H3 res_multistep canary is disabled; set "
+                        "SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP=1"
+                    )
+                plan = minimax_h3_plan_from_batch(batch)
+                if plan is None:
+                    raise ValueError(
+                        'MiniMax-H3 quality="fast" requires a resolved request plan'
+                    )
+                shape = plan.shape
+                actual = {
+                    "task": plan.task,
+                    "width": int(shape["width"]),
+                    "height": int(shape["height"]),
+                    "fps": int(shape["fps"]),
+                    "frame_count": int(shape["frame_count"]),
+                    "num_inference_steps": int(batch.num_inference_steps),
+                    "flow_shift": float(
+                        plan.flow_shift
+                        if plan.flow_shift is not None
+                        else plan.default_flow_shift
+                    ),
+                    "audio_flow_shift": float(
+                        plan.audio_flow_shift
+                        if plan.audio_flow_shift is not None
+                        else plan.default_audio_flow_shift
+                    ),
+                }
+                exact = all(
+                    actual[name] == _MINIMAX_H3_RES_MULTISTEP_CANARY_WORKLOAD[name]
+                    for name in ("task", "width", "height", "fps")
+                )
+                sets_match = all(
+                    actual[name] in _MINIMAX_H3_RES_MULTISTEP_CANARY_WORKLOAD[name]
+                    for name in ("frame_count", "num_inference_steps")
+                )
+                shifts = math.isclose(
+                    actual["flow_shift"],
+                    _MINIMAX_H3_RES_MULTISTEP_CANARY_WORKLOAD["flow_shift"],
+                    abs_tol=1e-9,
+                ) and math.isclose(
+                    actual["audio_flow_shift"],
+                    _MINIMAX_H3_RES_MULTISTEP_CANARY_WORKLOAD["audio_flow_shift"],
+                    abs_tol=1e-9,
+                )
+                if not exact or not sets_match or not shifts:
+                    raise ValueError(
+                        "MiniMax-H3 res_multistep canary is admitted only for "
+                        f"{_MINIMAX_H3_RES_MULTISTEP_CANARY_WORKLOAD}; got {actual}"
+                    )
+                return batch
             try:
                 lora_scale = float(getattr(server_args, "lora_scale", None))
             except (TypeError, ValueError) as exc:
                 raise ValueError(
                     'MiniMax-H3 quality="fast" requires lora_scale=1.0'
                 ) from exc
-            if lora_scale != 1.0 or getattr(
-                server_args, "lora_merge_mode", None
-            ) != "dynamic":
+            if (
+                lora_scale != 1.0
+                or getattr(server_args, "lora_merge_mode", None) != "dynamic"
+            ):
                 raise ValueError(
                     'MiniMax-H3 quality="fast" requires lora_scale=1.0 and '
                     'lora_merge_mode="dynamic"'

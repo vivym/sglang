@@ -283,6 +283,9 @@ def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
             "reuse_text_embeddings": os.environ.get(
                 "MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS", "0"
             ),
+            "experimental_res_multistep": os.environ.get(
+                "SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP", "0"
+            ),
         },
         "ports": {
             "http": server_args.port,

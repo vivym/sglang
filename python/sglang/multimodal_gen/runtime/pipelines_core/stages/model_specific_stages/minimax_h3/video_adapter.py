@@ -58,6 +58,7 @@ class MiniMaxH3VideoModelAdapter:
             "conditions",
             "target",
             "audio_flow_shift",
+            "sampler_mode",
             "audio_guidance_scale",
             "quality",
             "output_mode",
@@ -70,8 +71,7 @@ class MiniMaxH3VideoModelAdapter:
     def validate_task_gate(self, task: Any, *, provided: bool) -> None:
         if not provided or task is None:
             raise ValueError(
-                "task is required for MiniMax H3; supported tasks: "
-                "fl2va, ref2va, t2va"
+                "task is required for MiniMax H3; supported tasks: fl2va, ref2va, t2va"
             )
         if not isinstance(task, str):
             raise ValueError("task must be a non-empty string for MiniMax H3")
@@ -167,11 +167,15 @@ class MiniMaxH3VideoModelAdapter:
         kwargs.pop("fps", None)
         self._reject_retired_cfg_fields(kwargs)
         quality = self._quality_extra(request, "quality")
+        sampler_mode = _parse_extra_value(_extra_value(request, "sampler_mode"))
+        if sampler_mode is None:
+            sampler_mode = "euler"
         kwargs.update(
             {
                 "audio_flow_shift": self._positive_finite_extra(
                     request, "audio_flow_shift"
                 ),
+                "sampler_mode": sampler_mode,
                 "task": canonical_minimax_h3_task(
                     _parse_extra_value(_extra_value(request, "task"))
                 ),

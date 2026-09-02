@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler_ancestral import (
+    minimax_h3_res_multistep_coeffs,
+)
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -46,6 +49,28 @@ def _minimax_h3_update_target_rows_(
     if sigma_curr == 0.0:
         return
     torch.mul(one_minus_sigma_ratio, denoised_scratch, out=velocity)
+    torch.mul(sigma_ratio, state, out=state)
+    torch.add(state, velocity, out=state)
+
+
+@torch.inference_mode()
+def _minimax_h3_res_multistep_update_target_rows_(
+    state: torch.Tensor,
+    velocity: torch.Tensor,
+    previous_denoised: torch.Tensor,
+    *,
+    sigma_t: torch.Tensor,
+    sigma_ratio: torch.Tensor,
+    hb1: float,
+    hb2: float,
+    denoised_scratch: torch.Tensor,
+) -> None:
+    """Apply one second-order update while retaining the current x0 history."""
+
+    torch.mul(sigma_t, velocity, out=denoised_scratch)
+    torch.add(state, denoised_scratch, out=denoised_scratch)
+    torch.mul(denoised_scratch, hb1, out=velocity)
+    torch.add(velocity, previous_denoised, alpha=hb2, out=velocity)
     torch.mul(sigma_ratio, state, out=state)
     torch.add(state, velocity, out=state)
 
@@ -369,6 +394,7 @@ def minimax_h3_denoise_loop(
     device: torch.device,
     imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
+    sampler_mode: str = "euler",
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -386,6 +412,11 @@ def minimax_h3_denoise_loop(
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
         raise ValueError("sigma schedules need at least 2 entries")
+    if sampler_mode not in {"euler", "res_multistep"}:
+        raise ValueError(
+            "MiniMax H3 sampler_mode must be one of ['euler', 'res_multistep'], "
+            f"got {sampler_mode!r}"
+        )
     n_cond = positive.video_target_start
     if keyframe_cond_rows is None:
         if n_cond != 0:
@@ -461,6 +492,14 @@ def minimax_h3_denoise_loop(
     audio_one_minus_sigma_ratios = 1.0 - audio_sigma_ratios
     video_denoised_scratch = torch.empty_like(video_rows[video_target_slice])
     audio_denoised_scratch = torch.empty_like(audio_rows[audio_target_slice])
+    if sampler_mode == "res_multistep":
+        video_res_coeffs = minimax_h3_res_multistep_coeffs(sigmas_video)
+        audio_res_coeffs = minimax_h3_res_multistep_coeffs(sigmas_audio)
+        previous_video_denoised = torch.empty_like(video_denoised_scratch)
+        previous_audio_denoised = torch.empty_like(audio_denoised_scratch)
+    else:
+        video_res_coeffs = audio_res_coeffs = None
+        previous_video_denoised = previous_audio_denoised = None
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
@@ -484,26 +523,62 @@ def minimax_h3_denoise_loop(
                 mv_audio_t = v_audio[audio_target_slice].float()
 
                 video_target = video_rows[video_target_slice]
-                _minimax_h3_update_target_rows_(
-                    video_target,
-                    mv_video_t,
-                    sigma_t=video_sigma_t[step],
-                    sigma_curr=s_v,
-                    sigma_ratio=video_sigma_ratios[step],
-                    one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
-                    denoised_scratch=video_denoised_scratch,
+                video_coeff = (
+                    None if video_res_coeffs is None else video_res_coeffs[step]
                 )
+                if video_coeff is None:
+                    _minimax_h3_update_target_rows_(
+                        video_target,
+                        mv_video_t,
+                        sigma_t=video_sigma_t[step],
+                        sigma_curr=s_v,
+                        sigma_ratio=video_sigma_ratios[step],
+                        one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
+                        denoised_scratch=video_denoised_scratch,
+                    )
+                else:
+                    assert previous_video_denoised is not None
+                    _minimax_h3_res_multistep_update_target_rows_(
+                        video_target,
+                        mv_video_t,
+                        previous_video_denoised,
+                        sigma_t=video_sigma_t[step],
+                        sigma_ratio=video_sigma_ratios[step],
+                        hb1=video_coeff[0],
+                        hb2=video_coeff[1],
+                        denoised_scratch=video_denoised_scratch,
+                    )
+                if previous_video_denoised is not None:
+                    previous_video_denoised.copy_(video_denoised_scratch)
 
                 audio_target = audio_rows[audio_target_slice]
-                _minimax_h3_update_target_rows_(
-                    audio_target,
-                    mv_audio_t,
-                    sigma_t=audio_sigma_t[step],
-                    sigma_curr=s_a,
-                    sigma_ratio=audio_sigma_ratios[step],
-                    one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
-                    denoised_scratch=audio_denoised_scratch,
+                audio_coeff = (
+                    None if audio_res_coeffs is None else audio_res_coeffs[step]
                 )
+                if audio_coeff is None:
+                    _minimax_h3_update_target_rows_(
+                        audio_target,
+                        mv_audio_t,
+                        sigma_t=audio_sigma_t[step],
+                        sigma_curr=s_a,
+                        sigma_ratio=audio_sigma_ratios[step],
+                        one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
+                        denoised_scratch=audio_denoised_scratch,
+                    )
+                else:
+                    assert previous_audio_denoised is not None
+                    _minimax_h3_res_multistep_update_target_rows_(
+                        audio_target,
+                        mv_audio_t,
+                        previous_audio_denoised,
+                        sigma_t=audio_sigma_t[step],
+                        sigma_ratio=audio_sigma_ratios[step],
+                        hb1=audio_coeff[0],
+                        hb2=audio_coeff[1],
+                        denoised_scratch=audio_denoised_scratch,
+                    )
+                if previous_audio_denoised is not None:
+                    previous_audio_denoised.copy_(audio_denoised_scratch)
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
 
@@ -516,5 +591,6 @@ __all__ = [
     "MINIMAX_H3_IMGVID_COND_TIMESTEP",
     "MINIMAX_H3_VIDEO_ROW_WIDTH",
     "MiniMaxH3DenoiseBranch",
+    "_minimax_h3_res_multistep_update_target_rows_",
     "minimax_h3_denoise_loop",
 ]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -134,12 +135,102 @@ def _minimax_h3_euler_eta0_step(
     return out.to(dtype=state.dtype)
 
 
+def minimax_h3_res_multistep_coeffs(
+    sigmas: Sequence[float],
+) -> list[tuple[float, float] | None]:
+    """Build second-order exponential-integrator coefficients.
+
+    The first step has no history and the terminal step reaches sigma zero, so
+    both deliberately fall back to Euler. Intermediate entries contain the
+    current and previous x0 weights, respectively.
+    """
+
+    values = [
+        _validate_sigma(value, f"sigmas[{index}]") for index, value in enumerate(sigmas)
+    ]
+    if len(values) < 2:
+        raise ValueError("sigma schedule needs at least 2 entries")
+    for index, (sigma_curr, sigma_next) in enumerate(zip(values, values[1:])):
+        if sigma_curr <= sigma_next:
+            raise ValueError(
+                "sigma schedule must be strictly decreasing, got "
+                f"sigmas[{index}]={sigma_curr} and sigmas[{index + 1}]={sigma_next}"
+            )
+
+    coeffs: list[tuple[float, float] | None] = []
+    for index, (sigma_curr, sigma_next) in enumerate(zip(values, values[1:])):
+        if index == 0 or sigma_next == 0.0:
+            coeffs.append(None)
+            continue
+
+        sigma_prev = values[index - 1]
+        h = math.log(sigma_curr / sigma_next)
+        c2 = math.log(sigma_curr / sigma_prev) / h
+        if h <= 0.0 or c2 == 0.0 or not math.isfinite(c2):
+            raise ValueError(
+                f"unsupported res_multistep sigma geometry at step {index}"
+            )
+        phi1 = math.expm1(-h) / (-h)
+        phi2 = (phi1 - 1.0) / (-h)
+        hb1 = h * (phi1 - phi2 / c2)
+        hb2 = h * (phi2 / c2)
+        if not math.isfinite(hb1) or not math.isfinite(hb2):
+            raise ValueError(f"non-finite res_multistep coefficients at step {index}")
+        coeffs.append((hb1, hb2))
+    return coeffs
+
+
+def minimax_h3_res_multistep_eta0_step(
+    state: torch.Tensor,
+    denoised: torch.Tensor,
+    previous_denoised: torch.Tensor,
+    *,
+    sigma_curr: float,
+    sigma_next: float,
+    hb1: float,
+    hb2: float,
+) -> torch.Tensor:
+    """Advance one modality with its own second-order sigma history."""
+
+    if state.shape != denoised.shape or state.shape != previous_denoised.shape:
+        raise ValueError(
+            "state, denoised, and previous_denoised shapes must match, got "
+            f"{state.shape}, {denoised.shape}, and {previous_denoised.shape}"
+        )
+    for tensor, name in (
+        (state, "state"),
+        (denoised, "denoised"),
+        (previous_denoised, "previous_denoised"),
+    ):
+        if not torch.is_floating_point(tensor):
+            raise ValueError(f"{name} must be a floating point tensor")
+        _require_finite_tensor(tensor, name)
+    sigma_curr = _validate_sigma(sigma_curr, "sigma_curr")
+    sigma_next = _validate_sigma(sigma_next, "sigma_next")
+    if sigma_curr <= 0.0 or sigma_next <= 0.0 or sigma_next >= sigma_curr:
+        raise ValueError("res_multistep requires 0 < sigma_next < sigma_curr")
+    if not math.isfinite(hb1) or not math.isfinite(hb2):
+        raise ValueError("res_multistep coefficients must be finite")
+
+    compute_dtype = torch.float32
+    if state.dtype not in (torch.float16, torch.bfloat16):
+        compute_dtype = state.dtype
+    ratio = state.new_tensor(sigma_next / sigma_curr, dtype=compute_dtype)
+    out = (
+        ratio * state.to(dtype=compute_dtype)
+        + hb1 * denoised.to(dtype=compute_dtype)
+        + hb2 * previous_denoised.to(dtype=compute_dtype)
+    )
+    out = out.to(dtype=state.dtype)
+    _require_finite_tensor(out, "res_multistep output")
+    return out
+
+
 class MiniMaxH3EulerAncestralEta0SchedulerAdapter:
     def __init__(self, **config: Any) -> None:
         if config:
             raise ValueError(
-                f"{type(self).__name__} does not accept config fields: "
-                f"{sorted(config)}"
+                f"{type(self).__name__} does not accept config fields: {sorted(config)}"
             )
 
     def set_shift(self, _flow_shift: float) -> None:
@@ -210,5 +301,7 @@ EntryClass = MiniMaxH3EulerAncestralEta0SchedulerAdapter
 __all__ = [
     "MiniMaxH3EulerAncestralEta0SchedulerAdapter",
     "minimax_h3_euler_eta0_step",
+    "minimax_h3_res_multistep_coeffs",
+    "minimax_h3_res_multistep_eta0_step",
     "minimax_h3_rf_v_to_x0",
 ]

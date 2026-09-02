@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
@@ -12,11 +13,15 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler_ancestral import (
     _minimax_h3_euler_eta0_step,
     _minimax_h3_rf_v_to_x0,
+    minimax_h3_res_multistep_coeffs,
+    minimax_h3_res_multistep_eta0_step,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
     _build_local_embedding_layout,
+    _minimax_h3_res_multistep_update_target_rows_,
     _minimax_h3_update_target_rows_,
+    minimax_h3_denoise_loop,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
@@ -149,6 +154,182 @@ def test_inplace_target_update_matches_scheduler_math():
             denoised_scratch=torch.empty_like(actual),
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_res_multistep_coefficients_preserve_constant_x0_euler_weight():
+    sigmas = [1.0, 0.8, 0.5, 0.2, 0.0]
+    coeffs = minimax_h3_res_multistep_coeffs(sigmas)
+
+    assert coeffs[0] is None
+    assert coeffs[-1] is None
+    for step in (1, 2):
+        hb1, hb2 = coeffs[step]
+        assert hb1 + hb2 == pytest.approx(
+            1.0 - sigmas[step + 1] / sigmas[step], abs=1e-15
+        )
+
+
+def test_inplace_res_multistep_update_matches_reference_math():
+    generator = torch.Generator().manual_seed(17)
+    state = torch.randn(11, 32, generator=generator)
+    velocity = torch.randn(11, 32, generator=generator)
+    previous_denoised = torch.randn(11, 32, generator=generator)
+    sigmas = [1.0, 0.75, 0.3, 0.0]
+    hb1, hb2 = minimax_h3_res_multistep_coeffs(sigmas)[1]
+    denoised = _minimax_h3_rf_v_to_x0(
+        state,
+        velocity,
+        torch.tensor(1.0 - sigmas[1]),
+    )
+    expected = minimax_h3_res_multistep_eta0_step(
+        state,
+        denoised,
+        previous_denoised,
+        sigma_curr=sigmas[1],
+        sigma_next=sigmas[2],
+        hb1=hb1,
+        hb2=hb2,
+    )
+
+    actual = state.clone()
+    denoised_scratch = torch.empty_like(actual)
+    _minimax_h3_res_multistep_update_target_rows_(
+        actual,
+        velocity.clone(),
+        previous_denoised,
+        sigma_t=torch.tensor(sigmas[1]),
+        sigma_ratio=torch.tensor(sigmas[2] / sigmas[1]),
+        hb1=hb1,
+        hb2=hb2,
+        denoised_scratch=denoised_scratch,
+    )
+
+    torch.testing.assert_close(denoised_scratch, denoised, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def _run_tiny_loop(*, sampler_mode: str | None, video_sigmas, audio_sigmas):
+    branch = _branch("t2va")
+    video = torch.linspace(-1.0, 1.0, branch.img_pos.numel() * 96).reshape(-1, 96)
+    audio = torch.linspace(-0.5, 0.5, branch.audio_pos.numel() * 32).reshape(-1, 32)
+
+    def model(**kwargs):
+        video_state = kwargs["x"][0].index_select(0, branch.img_target_seq_idx)
+        audio_state = kwargs["audio_x"][0].index_select(0, branch.audio_pos_dev)
+        return video_state.square().mul(0.025).add(0.01), audio_state.mul(-0.15)
+
+    kwargs = dict(
+        model=model,
+        positive=branch,
+        initial_video_rows=video,
+        initial_audio_rows=audio,
+        keyframe_cond_rows=None,
+        sigmas_video=video_sigmas,
+        sigmas_audio=audio_sigmas,
+        device=torch.device("cpu"),
+    )
+    if sampler_mode is not None:
+        kwargs["sampler_mode"] = sampler_mode
+    return minimax_h3_denoise_loop(**kwargs)
+
+
+def test_default_sampler_is_bitwise_euler_and_res_history_is_request_local():
+    video_sigmas = [1.0, 0.8, 0.5, 0.2, 0.0]
+    audio_sigmas = [1.0, 0.65, 0.35, 0.1, 0.0]
+
+    default = _run_tiny_loop(
+        sampler_mode=None,
+        video_sigmas=video_sigmas,
+        audio_sigmas=audio_sigmas,
+    )
+    explicit = _run_tiny_loop(
+        sampler_mode="euler",
+        video_sigmas=video_sigmas,
+        audio_sigmas=audio_sigmas,
+    )
+    first_res = _run_tiny_loop(
+        sampler_mode="res_multistep",
+        video_sigmas=video_sigmas,
+        audio_sigmas=audio_sigmas,
+    )
+    second_res = _run_tiny_loop(
+        sampler_mode="res_multistep",
+        video_sigmas=video_sigmas,
+        audio_sigmas=audio_sigmas,
+    )
+
+    for left, right in zip(default, explicit, strict=True):
+        assert torch.equal(left, right)
+    for left, right in zip(first_res, second_res, strict=True):
+        assert torch.equal(left, right)
+    assert not torch.equal(first_res[0], default[0])
+    assert not torch.equal(first_res[1], default[1])
+
+
+def test_res_multistep_full_loop_matches_independent_modality_recurrences():
+    video_sigmas = [1.0, 0.82, 0.51, 0.23, 0.0]
+    audio_sigmas = [1.0, 0.61, 0.29, 0.08, 0.0]
+    branch = _branch("t2va")
+    initial_video = torch.linspace(
+        -1.0, 1.0, branch.img_pos.numel() * 96
+    ).reshape(-1, 96)
+    initial_audio = torch.linspace(
+        -0.5, 0.5, branch.audio_pos.numel() * 32
+    ).reshape(-1, 32)
+
+    def velocity(state: torch.Tensor, modality: str) -> torch.Tensor:
+        if modality == "video":
+            return state.square().mul(0.025).add(0.01)
+        return state.mul(-0.15)
+
+    def reference(initial, sigmas, modality):
+        state = initial.clone()
+        previous_denoised = None
+        coeffs = minimax_h3_res_multistep_coeffs(sigmas)
+        for step, (sigma_curr, sigma_next) in enumerate(
+            zip(sigmas[:-1], sigmas[1:], strict=True)
+        ):
+            current_velocity = velocity(state, modality)
+            denoised = _minimax_h3_rf_v_to_x0(
+                state,
+                current_velocity,
+                torch.tensor(1.0 - sigma_curr),
+            )
+            if coeffs[step] is None:
+                state = _minimax_h3_euler_eta0_step(
+                    state,
+                    denoised,
+                    sigma_curr=sigma_curr,
+                    sigma_next=sigma_next,
+                    sigma_ratio=torch.tensor(
+                        0.0 if sigma_curr == 0.0 else sigma_next / sigma_curr
+                    ),
+                )
+            else:
+                assert previous_denoised is not None
+                hb1, hb2 = coeffs[step]
+                state = minimax_h3_res_multistep_eta0_step(
+                    state,
+                    denoised,
+                    previous_denoised,
+                    sigma_curr=sigma_curr,
+                    sigma_next=sigma_next,
+                    hb1=hb1,
+                    hb2=hb2,
+                )
+            previous_denoised = denoised
+        return state
+
+    expected_video = reference(initial_video, video_sigmas, "video")
+    expected_audio = reference(initial_audio, audio_sigmas, "audio")
+    actual_video, actual_audio = _run_tiny_loop(
+        sampler_mode="res_multistep",
+        video_sigmas=video_sigmas,
+        audio_sigmas=audio_sigmas,
+    )
+
+    torch.testing.assert_close(actual_video, expected_video, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual_audio, expected_audio, rtol=1e-6, atol=1e-6)
 
 
 def test_local_text_layout_is_a_contiguous_prefix_per_ulysses_rank():
