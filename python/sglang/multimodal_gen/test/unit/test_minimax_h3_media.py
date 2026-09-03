@@ -28,6 +28,10 @@ def test_video_vae_decode_weights_are_prepared_before_first_denoise(monkeypatch)
         def __init__(self):
             self.dtypes = []
 
+        @staticmethod
+        def parameters():
+            return iter((SimpleNamespace(is_cuda=True),))
+
         def prepare_decoder_autocast_weights(self, dtype):
             self.dtypes.append(dtype)
             return 144
@@ -38,6 +42,11 @@ def test_video_vae_decode_weights_are_prepared_before_first_denoise(monkeypatch)
         pipeline_config=SimpleNamespace(vae_decode_precision="fp16"),
     )
     monkeypatch.setattr(decoding, "autocast_enabled", lambda *_args: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    reserved = iter((12 * 1024**3, 7 * 1024**3))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: next(reserved))
+    empty_cache_calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: empty_cache_calls.append(1))
 
     stage = MiniMaxH3DecodingStage(
         video_vae=video_vae,
@@ -47,6 +56,7 @@ def test_video_vae_decode_weights_are_prepared_before_first_denoise(monkeypatch)
 
     assert video_vae.dtypes == [torch.float16]
     assert stage._startup_converted_video_vae_linears == 144
+    assert empty_cache_calls == [1]
 
 
 @pytest.mark.parametrize(
