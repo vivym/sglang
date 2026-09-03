@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical contract for request-static H3 denoise metadata."""
 
+import hashlib
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -30,6 +32,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
     MiniMaxH3DenoisingStage,
     _resolve_debug_latent_dump_path,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+    minimax_h3_time_shift_sigmas,
 )
 
 
@@ -169,6 +174,32 @@ def test_res_multistep_coefficients_preserve_constant_x0_euler_weight():
         )
 
 
+def test_res_multistep_schedule_matches_pinned_runninghub_golden():
+    """Guard the full schedule port from RunningHub commit d6c5f7b."""
+
+    payload = {}
+    for points in (13, 15, 17, 21, 50):
+        for shift in (3.0, 12.0):
+            sigmas = minimax_h3_time_shift_sigmas(
+                num_steps=points,
+                shift_scale=shift,
+            )
+            payload[f"{points}:{shift:g}"] = {
+                "sigmas": sigmas,
+                "coeffs": minimax_h3_res_multistep_coeffs(sigmas),
+            }
+    canonical = json.dumps(
+        payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+    assert hashlib.sha256(canonical).hexdigest() == (
+        "756da5593fde7a7142060ff3e931dc1721512a37dc497b31ee694d2c15749562"
+    )
+
+
 def test_inplace_res_multistep_update_matches_reference_math():
     generator = torch.Generator().manual_seed(17)
     state = torch.randn(11, 32, generator=generator)
@@ -181,14 +212,11 @@ def test_inplace_res_multistep_update_matches_reference_math():
         velocity,
         torch.tensor(1.0 - sigmas[1]),
     )
-    expected = minimax_h3_res_multistep_eta0_step(
-        state,
-        denoised,
-        previous_denoised,
-        sigma_curr=sigmas[1],
-        sigma_next=sigmas[2],
-        hb1=hb1,
-        hb2=hb2,
+    sigma_ratio = torch.tensor(sigmas[2] / sigmas[1])
+    # This is deliberately left-associative to match the pinned upstream
+    # res_multistep expression, including its fp32 rounding points.
+    expected = (
+        sigma_ratio * state + hb1 * denoised + hb2 * previous_denoised
     )
 
     actual = state.clone()
@@ -198,14 +226,14 @@ def test_inplace_res_multistep_update_matches_reference_math():
         velocity.clone(),
         previous_denoised,
         sigma_t=torch.tensor(sigmas[1]),
-        sigma_ratio=torch.tensor(sigmas[2] / sigmas[1]),
+        sigma_ratio=sigma_ratio,
         hb1=hb1,
         hb2=hb2,
         denoised_scratch=denoised_scratch,
     )
 
     torch.testing.assert_close(denoised_scratch, denoised, rtol=0, atol=0)
-    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _run_tiny_loop(*, sampler_mode: str | None, video_sigmas, audio_sigmas):

@@ -69,9 +69,12 @@ def _minimax_h3_res_multistep_update_target_rows_(
 
     torch.mul(sigma_t, velocity, out=denoised_scratch)
     torch.add(state, denoised_scratch, out=denoised_scratch)
-    torch.mul(denoised_scratch, hb1, out=velocity)
-    torch.add(velocity, previous_denoised, alpha=hb2, out=velocity)
+    # Preserve the upstream left-associative arithmetic order exactly while
+    # continuing to reuse the disposable velocity storage.
     torch.mul(sigma_ratio, state, out=state)
+    torch.mul(denoised_scratch, hb1, out=velocity)
+    torch.add(state, velocity, out=state)
+    torch.mul(previous_denoised, hb2, out=velocity)
     torch.add(state, velocity, out=state)
 
 
