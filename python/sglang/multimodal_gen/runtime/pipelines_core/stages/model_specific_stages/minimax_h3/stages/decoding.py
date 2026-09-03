@@ -226,43 +226,21 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self._startup_converted_video_vae_linears = 0
         if video_vae is not None and server_args is not None:
             self._startup_converted_video_vae_linears = (
-                self._prepare_video_vae_decode_weights(
-                    video_vae,
-                    server_args,
-                    release_inactive_cuda_cache=True,
-                )
+                self._prepare_video_vae_decode_weights(video_vae, server_args)
             )
 
     @staticmethod
-    def _prepare_video_vae_decode_weights(
-        video_vae,
-        server_args: ServerArgs,
-        *,
-        release_inactive_cuda_cache: bool = False,
-    ) -> int:
+    def _prepare_video_vae_decode_weights(video_vae, server_args: ServerArgs) -> int:
         decode_dtype = resolve_decode_precision(server_args, "video_vae")
         if not autocast_enabled(decode_dtype, server_args.disable_autocast):
             return 0
         converted = int(video_vae.prepare_decoder_autocast_weights(decode_dtype))
         if converted:
-            released_bytes = 0
-            parameters = getattr(video_vae, "parameters", None)
-            cuda_resident = (
-                torch.cuda.is_available()
-                and callable(parameters)
-                and any(parameter.is_cuda for parameter in parameters())
-            )
-            if release_inactive_cuda_cache and cuda_resident:
-                reserved_before = torch.cuda.memory_reserved()
-                torch.cuda.empty_cache()
-                released_bytes = max(0, reserved_before - torch.cuda.memory_reserved())
             logger.info(
                 "Prepared %d MiniMax H3 video VAE decoder linears as %s before "
-                "the first denoise; returned %.2f GiB of inactive CUDA allocator "
-                "memory",
+                "the first denoise",
                 converted,
                 decode_dtype,
-                released_bytes / (1024**3),
             )
         return converted
 
