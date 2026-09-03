@@ -145,6 +145,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             MiniMaxH3DecodingStage(
                 video_vae=self.get_module("video_vae"),
                 audio_vae=self.get_module("audio_vae"),
+                server_args=server_args,
             )
         )
 

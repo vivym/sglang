@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from collections.abc import Mapping
 
 import torch
@@ -34,6 +35,9 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _required_tensor(value, path: str) -> torch.Tensor:
@@ -211,12 +215,34 @@ def _minimax_h3_decoder_task(batch: Req) -> str | None:
 
 
 class MiniMaxH3DecodingStage(DecodingStage):
-    def __init__(self, video_vae, audio_vae) -> None:
+    def __init__(
+        self, video_vae, audio_vae, server_args: ServerArgs | None = None
+    ) -> None:
         super().__init__(vae=video_vae, component_name="video_vae")
         self.video_vae = video_vae
         self.audio_vae = audio_vae
         self._compiled_audio_vae_decode = ActiveTargetCompiledCallable()
         self._warmed_audio_vae_target_id: int | None = None
+        self._startup_converted_video_vae_linears = 0
+        if video_vae is not None and server_args is not None:
+            self._startup_converted_video_vae_linears = (
+                self._prepare_video_vae_decode_weights(video_vae, server_args)
+            )
+
+    @staticmethod
+    def _prepare_video_vae_decode_weights(video_vae, server_args: ServerArgs) -> int:
+        decode_dtype = resolve_decode_precision(server_args, "video_vae")
+        if not autocast_enabled(decode_dtype, server_args.disable_autocast):
+            return 0
+        converted = int(video_vae.prepare_decoder_autocast_weights(decode_dtype))
+        if converted:
+            logger.info(
+                "Prepared %d MiniMax H3 video VAE decoder linears as %s before "
+                "the first denoise",
+                converted,
+                decode_dtype,
+            )
+        return converted
 
     def _warmup_audio_vae_decode(
         self,
@@ -367,7 +393,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 and autocast_enabled(video_vae_dtype, server_args.disable_autocast)
             )
             if visual_autocast_enabled:
-                selected_video_vae.prepare_decoder_autocast_weights(video_vae_dtype)
+                self._prepare_video_vae_decode_weights(selected_video_vae, server_args)
             with torch.autocast(
                 device_type=visual_latent.device.type,
                 dtype=video_vae_dtype,

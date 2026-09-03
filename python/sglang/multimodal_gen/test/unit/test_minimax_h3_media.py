@@ -18,6 +18,71 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
     MiniMaxH3DecodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
+    decoding,
+)
+
+
+def test_video_vae_decode_weights_are_prepared_before_first_denoise(monkeypatch):
+    class FakeVideoVAE:
+        def __init__(self):
+            self.dtypes = []
+
+        def prepare_decoder_autocast_weights(self, dtype):
+            self.dtypes.append(dtype)
+            return 144
+
+    video_vae = FakeVideoVAE()
+    server_args = SimpleNamespace(
+        disable_autocast=False,
+        pipeline_config=SimpleNamespace(vae_decode_precision="fp16"),
+    )
+    monkeypatch.setattr(decoding, "autocast_enabled", lambda *_args: True)
+
+    stage = MiniMaxH3DecodingStage(
+        video_vae=video_vae,
+        audio_vae=None,
+        server_args=server_args,
+    )
+
+    assert video_vae.dtypes == [torch.float16]
+    assert stage._startup_converted_video_vae_linears == 144
+
+
+@pytest.mark.parametrize(
+    ("decode_precision", "disable_autocast"),
+    (("fp32", False), ("fp16", True)),
+)
+def test_video_vae_decode_weight_preparation_respects_autocast(
+    monkeypatch, decode_precision, disable_autocast
+):
+    class FakeVideoVAE:
+        def __init__(self):
+            self.dtypes = []
+
+        def prepare_decoder_autocast_weights(self, dtype):
+            self.dtypes.append(dtype)
+            return 144
+
+    video_vae = FakeVideoVAE()
+    server_args = SimpleNamespace(
+        disable_autocast=disable_autocast,
+        pipeline_config=SimpleNamespace(vae_decode_precision=decode_precision),
+    )
+    monkeypatch.setattr(
+        decoding,
+        "autocast_enabled",
+        lambda dtype, disabled: dtype != torch.float32 and not disabled,
+    )
+
+    stage = MiniMaxH3DecodingStage(
+        video_vae=video_vae,
+        audio_vae=None,
+        server_args=server_args,
+    )
+
+    assert video_vae.dtypes == []
+    assert stage._startup_converted_video_vae_linears == 0
 
 
 def test_audio_vae_decode_warms_once_per_module():
