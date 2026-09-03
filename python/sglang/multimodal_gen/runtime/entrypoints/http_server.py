@@ -253,6 +253,11 @@ def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
             server_args.layerwise_offload_components or []
         ),
         "layerwise_offload_prefetch_size": server_args.layerwise_offload_prefetch_size,
+        "batching_mode": server_args.batching_mode,
+        "batching_max_size": server_args.batching_max_size,
+        "batching_delay_ms": server_args.batching_delay_ms,
+        "batching_config": server_args.batching_config,
+        "enable_batching_metrics": server_args.enable_batching_metrics,
         "cache_dit_config": server_args.cache_dit_config,
         "cache_dit_env": {
             "enabled": envs.SGLANG_CACHE_DIT_ENABLED,

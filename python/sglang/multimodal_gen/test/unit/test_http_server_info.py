@@ -41,6 +41,11 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
         vae_cpu_offload=False,
         layerwise_offload_components=["text_encoder"],
         layerwise_offload_prefetch_size=1.0,
+        batching_mode="dynamic",
+        batching_max_size=2,
+        batching_delay_ms=500.0,
+        batching_config="/configs/h3-batching-production.json",
+        enable_batching_metrics=True,
         cache_dit_config=None,
         lora_path=None,
         strict_ports=True,
@@ -64,6 +69,11 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
         "vae_cpu_offload": False,
         "layerwise_offload_components": ["text_encoder"],
         "layerwise_offload_prefetch_size": 1.0,
+        "batching_mode": "dynamic",
+        "batching_max_size": 2,
+        "batching_delay_ms": 500.0,
+        "batching_config": "/configs/h3-batching-production.json",
+        "enable_batching_metrics": True,
         "cache_dit_config": None,
         "cache_dit_env": {
             "enabled": True,
@@ -137,6 +147,11 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
         vae_cpu_offload=False,
         layerwise_offload_components=None,
         layerwise_offload_prefetch_size=0.0,
+        batching_mode="dynamic",
+        batching_max_size=1,
+        batching_delay_ms=0.0,
+        batching_config=None,
+        enable_batching_metrics=False,
         cache_dit_config=None,
         lora_path=None,
         strict_ports=False,
@@ -152,6 +167,11 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
     assert config["component_paths"] == {}
     assert config["component_attention_backends"] == {}
     assert config["layerwise_offload_components"] == []
+    assert config["batching_mode"] == "dynamic"
+    assert config["batching_max_size"] == 1
+    assert config["batching_delay_ms"] == 0.0
+    assert config["batching_config"] is None
+    assert config["enable_batching_metrics"] is False
     assert config["cache_dit_env"] == {
         "enabled": False,
         "fn_compute_blocks": 1,
