@@ -406,13 +406,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self, reqs: List[Req]
     ) -> Iterator[OutputBatch]:
         yield from self.worker.execute_forward_sequentially(reqs)
-        logger.info(
-            "Processed native grouped batch sequentially: %d/%d request(s) "
-            "with max_delay=%.2fms",
-            len(reqs),
-            self._batching_max_size,
-            self._batching_delay_s * 1000.0,
-        )
 
     def _execute_generation_sequential(self, reqs: List[Req]) -> List[OutputBatch]:
         return [self.worker.execute_forward([req]) for req in reqs]
@@ -775,6 +768,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 assert output_batch is not None
                 self._return_item_result(item, output_batch)
                 del output_batch
+            logger.info(
+                "Processed native grouped batch sequentially: %d/%d request(s) "
+                "with max_delay=%.2fms",
+                len(items),
+                self._batching_max_size,
+                self._batching_delay_s * 1000.0,
+            )
         finally:
             close = getattr(output_iter, "close", None)
             if close is not None:
