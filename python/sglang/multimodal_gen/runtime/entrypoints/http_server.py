@@ -291,6 +291,7 @@ def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
             "experimental_res_multistep": os.environ.get(
                 "SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP", "0"
             ),
+            "memory_profile": os.environ.get("SGLANG_H3_MEMORY_PROFILE", "0"),
         },
         "ports": {
             "http": server_args.port,
