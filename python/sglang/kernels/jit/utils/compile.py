@@ -164,6 +164,34 @@ def _jit_build_dir_name(module_name: str) -> str:
     return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
 
 
+def _load_cached_module(module_name: str, prebuilt: pathlib.Path) -> Module | None:
+    """Load a completed cache entry, removing an unreadable output for rebuild."""
+    if not prebuilt.is_file():
+        return None
+
+    from filelock import FileLock
+    from tvm_ffi import load_module
+
+    # TVM-FFI uses the same lock while linking. Taking it here prevents a
+    # second process from opening a partially written shared library.
+    with FileLock(str(prebuilt.parent / "lock")):
+        if not prebuilt.is_file():
+            return None
+        try:
+            module = load_module(str(prebuilt))
+            logger.debug("Reused cached JIT module %s", module_name)
+            return module
+        except Exception:
+            logger.warning(
+                "Cached JIT module %s failed to load; removing it for rebuild.",
+                module_name,
+                exc_info=True,
+            )
+            # Ninja will relink the target once the corrupt output is absent.
+            prebuilt.unlink()
+            return None
+
+
 def _make_wrapper(tup: Tuple[str, str]) -> str:
     export_name, kernel_name = tup
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
@@ -283,17 +311,9 @@ def load_jit(
             pathlib.Path(cache_dir).expanduser() / _jit_build_dir_name(module_name)
         )
     prebuilt = pathlib.Path(build_directory) / f"{module_name}.so"
-    if prebuilt.is_file():
-        from tvm_ffi import load_module
-
-        try:
-            module = load_module(str(prebuilt))
-            logger.debug("Reused cached JIT module %s", module_name)
-            return module
-        except Exception:
-            logger.warning(
-                "Cached JIT module %s failed to load; rebuilding.", module_name
-            )
+    module = _load_cached_module(module_name, prebuilt)
+    if module is not None:
+        return module
 
     if header_only:
         cpp_sources = _make_sources(cpp_files, cpp_wrappers or [])
