@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import time
+
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
@@ -25,6 +27,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3ReleaseMetadata,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
@@ -96,6 +101,19 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             raise ValueError(
                 "MiniMaxH3Pipeline only supports monolithic deployment; "
                 f"disaggregation role {role.value!r} is not supported"
+            )
+
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        transformer = self.get_module("transformer")
+        prewarm = getattr(transformer, "prewarm_fused_mlp_activation", None)
+        if prewarm is None:
+            return
+
+        started = time.perf_counter()
+        if prewarm():
+            logger.info(
+                "Prewarmed MiniMax H3 rounded MLP activation before readiness in %.3f seconds",
+                time.perf_counter() - started,
             )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:

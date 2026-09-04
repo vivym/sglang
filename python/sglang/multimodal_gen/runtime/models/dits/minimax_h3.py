@@ -1117,6 +1117,38 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
+    @torch.inference_mode()
+    def prewarm_fused_mlp_activation(self) -> bool:
+        """Load and launch the configured rounded MLP activation before readiness."""
+        if getattr(self, "_fused_mlp_activation_prewarmed", False):
+            return False
+
+        mlp = next(
+            (
+                block.mlp
+                for block in self.blocks
+                if getattr(block.mlp, "use_fused_activation", False)
+            ),
+            None,
+        )
+        if mlp is None:
+            return False
+
+        parameter = next(self.parameters(), None)
+        if parameter is None or parameter.device.type != "cuda":
+            return False
+
+        # The CUDA kernel is shape-generic. One vector exercises the same
+        # rounded entry point as production without allocating an H3 activation.
+        scratch = torch.zeros((1, 16), dtype=_BF16_DTYPE, device=parameter.device)
+        if mlp.reuse_fc1_activation:
+            silu_and_mul_with_activation_rounding_(scratch)
+        else:
+            silu_and_mul_with_activation_rounding(scratch)
+        torch.cuda.synchronize(parameter.device)
+        self._fused_mlp_activation_prewarmed = True
+        return True
+
     def _can_batch_block_adaln(self) -> bool:
         return (
             get_tp_world_size() > 1

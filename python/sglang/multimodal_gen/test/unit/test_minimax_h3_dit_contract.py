@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _copy_grouped_qkv_tp_shard,
     _reorder_grouped_qkv_to_qkv,
 )
+from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
+    MiniMaxH3Pipeline,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
@@ -255,6 +258,103 @@ def test_mlp_fused_activation_has_explicit_fallback(monkeypatch):
     with torch.device("meta"):
         fallback_mlp = MiniMaxH3MLP(arch, None, prefix="blocks.0.mlp")
     assert fallback_mlp.use_fused_activation is False
+
+
+@pytest.mark.parametrize(
+    ("reuse_input", "expected_function"),
+    [
+        (False, "silu_and_mul_with_activation_rounding"),
+        (True, "silu_and_mul_with_activation_rounding_"),
+    ],
+)
+def test_fused_mlp_activation_prewarm_uses_configured_entrypoint(
+    reuse_input, expected_function
+):
+    device = torch.device("cuda:0")
+    scratch = object()
+    model = SimpleNamespace(
+        blocks=[
+            SimpleNamespace(
+                mlp=SimpleNamespace(
+                    use_fused_activation=True,
+                    reuse_fc1_activation=reuse_input,
+                )
+            )
+        ],
+        parameters=lambda: iter([SimpleNamespace(device=device)]),
+    )
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3.torch.zeros",
+            return_value=scratch,
+        ) as zeros,
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "silu_and_mul_with_activation_rounding"
+        ) as out_of_place,
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "silu_and_mul_with_activation_rounding_"
+        ) as in_place,
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3.torch.cuda.synchronize"
+        ) as synchronize,
+    ):
+        assert MiniMaxH3DiTModel.prewarm_fused_mlp_activation(model) is True
+        assert MiniMaxH3DiTModel.prewarm_fused_mlp_activation(model) is False
+
+    zeros.assert_called_once_with((1, 16), dtype=torch.bfloat16, device=device)
+    synchronize.assert_called_once_with(device)
+    calls = {
+        "silu_and_mul_with_activation_rounding": out_of_place.call_count,
+        "silu_and_mul_with_activation_rounding_": in_place.call_count,
+    }
+    assert calls[expected_function] == 1
+    assert sum(calls.values()) == 1
+
+
+def test_fused_mlp_activation_prewarm_skips_disabled_or_non_cuda_model():
+    disabled = SimpleNamespace(
+        blocks=[
+            SimpleNamespace(
+                mlp=SimpleNamespace(
+                    use_fused_activation=False,
+                    reuse_fc1_activation=False,
+                )
+            )
+        ],
+        parameters=lambda: iter([SimpleNamespace(device=torch.device("cuda:0"))]),
+    )
+    cpu = SimpleNamespace(
+        blocks=[
+            SimpleNamespace(
+                mlp=SimpleNamespace(
+                    use_fused_activation=True,
+                    reuse_fc1_activation=False,
+                )
+            )
+        ],
+        parameters=lambda: iter([SimpleNamespace(device=torch.device("cpu"))]),
+    )
+
+    assert MiniMaxH3DiTModel.prewarm_fused_mlp_activation(disabled) is False
+    assert MiniMaxH3DiTModel.prewarm_fused_mlp_activation(cpu) is False
+
+
+def test_minimax_h3_pipeline_prewarms_transformer_during_initialization():
+    transformer = SimpleNamespace(prewarm_fused_mlp_activation=lambda: True)
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline.modules = {"transformer": transformer}
+
+    with patch.object(
+        transformer,
+        "prewarm_fused_mlp_activation",
+        wraps=transformer.prewarm_fused_mlp_activation,
+    ) as prewarm:
+        pipeline.initialize_pipeline(SimpleNamespace())
+
+    prewarm.assert_called_once_with()
 
 
 def test_deferred_attention_preserves_component_backend_selection():
