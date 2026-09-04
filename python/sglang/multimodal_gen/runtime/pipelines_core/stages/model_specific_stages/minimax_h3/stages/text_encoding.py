@@ -207,8 +207,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             torch.cuda.empty_cache()
         after = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
         logger.info(
-            "SGLANG_H3_MEMORY_PROFILE released text_encoder after encode: "
-            "allocated %.2f -> %.2f MiB",
+            "SGLANG_H3_MEMORY_PROFILE_RELEASE_ENCODER allocated %.2f -> %.2f MiB",
             before / (1024**2),
             after / (1024**2),
         )

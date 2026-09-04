@@ -17,6 +17,8 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
     monkeypatch.setenv("MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS", "0")
     monkeypatch.setenv("SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP", "1")
     monkeypatch.setenv("SGLANG_H3_MEMORY_PROFILE", "1")
+    monkeypatch.setenv("SGLANG_H3_MEMORY_PROFILE_RELEASE_ENCODER", "1")
+    monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "1")
     monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "1")
     monkeypatch.setenv("SGLANG_CACHE_DIT_FN", "1")
     monkeypatch.setenv("SGLANG_CACHE_DIT_BN", "0")
@@ -102,6 +104,8 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
             "reuse_text_embeddings": "0",
             "experimental_res_multistep": "1",
             "memory_profile": "1",
+            "memory_profile_release_encoder": "1",
+            "cuda_launch_blocking": "1",
         },
         "ports": {
             "http": 30500,
@@ -123,6 +127,8 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
         "MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS",
         "SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP",
         "SGLANG_H3_MEMORY_PROFILE",
+        "SGLANG_H3_MEMORY_PROFILE_RELEASE_ENCODER",
+        "CUDA_LAUNCH_BLOCKING",
         "SGLANG_CACHE_DIT_ENABLED",
         "SGLANG_CACHE_DIT_FN",
         "SGLANG_CACHE_DIT_BN",
@@ -201,5 +207,7 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
         "reuse_text_embeddings": "0",
         "experimental_res_multistep": "0",
         "memory_profile": "0",
+        "memory_profile_release_encoder": "0",
+        "cuda_launch_blocking": "0",
     }
     assert config["ports"]["schedulers"] == [5555]
