@@ -83,3 +83,21 @@ def test_fp16_gated_ffn_scales_for_w2_output_bound(monkeypatch):
     assert actual.dtype == torch.float32
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_fp16_gated_ffn_fused_scale_cast_is_bit_exact(monkeypatch):
+    torch.cuda.manual_seed(2)
+    monkeypatch.setenv("MINIMAX_H3_VAE_FFN_FP32_ACT", "1")
+    monkeypatch.setenv("MINIMAX_H3_VAE_FFN_FP32_PRODUCT_SCALE", "1")
+    module = FeedForward(64, mult=4, use_gated=True, bias=True).cuda().half()
+    inputs = torch.randn((2, 17, 64), device="cuda", dtype=torch.float16)
+
+    monkeypatch.setenv("MINIMAX_H3_VAE_FFN_FUSED_SCALE_CAST", "0")
+    expected = module(inputs)
+    monkeypatch.setenv("MINIMAX_H3_VAE_FFN_FUSED_SCALE_CAST", "1")
+    actual = module(inputs)
+
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)

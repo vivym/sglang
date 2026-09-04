@@ -12,6 +12,11 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
+from sglang.kernels.ops.diffusion.triton.minimax_h3_vae import (
+    try_mul_reduce_max_f32_exact,
+    try_restore_scale_add_bias_f32_exact,
+    try_scale_cast_f16_exact,
+)
 from sglang.kernels.ops.diffusion.triton.scale_shift import (
     try_fused_scaled_residual_add_exact,
 )
@@ -206,15 +211,31 @@ class FeedForward(nn.Module):
                     activation_dtype = hidden_states.dtype
                     gate_fp32 = self.act_fn(gate.float())
                     if _env_flag("MINIMAX_H3_VAE_FFN_FP32_PRODUCT_SCALE", "1"):
-                        hidden_states = gate_fp32.mul(hidden_states.float())
+                        fused_product = None
+                        if (
+                            activation_dtype == torch.float16
+                            and not probe_enabled
+                            and _env_flag(
+                                "MINIMAX_H3_VAE_FFN_FUSED_SCALE_CAST", "1"
+                            )
+                        ):
+                            fused_product = try_mul_reduce_max_f32_exact(
+                                gate_fp32, hidden_states
+                            )
+                        if fused_product is None:
+                            hidden_states = gate_fp32.mul(hidden_states.float())
+                            max_abs = None
+                        else:
+                            hidden_states, max_abs = fused_product
                         if probe_enabled:
                             product_unscaled_stats = _deferred_probe_stats(
                                 hidden_states
                             )
                         if activation_dtype == torch.float16:
-                            max_abs = hidden_states.detach().abs().amax(
-                                dim=-1, keepdim=True
-                            )
+                            if max_abs is None:
+                                max_abs = hidden_states.detach().abs().amax(
+                                    dim=-1, keepdim=True
+                                )
                             if _env_flag(
                                 "MINIMAX_H3_VAE_FFN_OUTPUT_BOUND_SCALE", "0"
                             ):
@@ -233,8 +254,18 @@ class FeedForward(nn.Module):
                             fp16_restore_scale = torch.exp2(
                                 torch.ceil(torch.log2(ratio))
                             )
-                            hidden_states.div_(fp16_restore_scale)
-                        hidden_states = hidden_states.to(activation_dtype)
+                            scaled = None
+                            if fused_product is not None:
+                                scaled = try_scale_cast_f16_exact(
+                                    hidden_states, fp16_restore_scale
+                                )
+                            if scaled is None:
+                                hidden_states.div_(fp16_restore_scale)
+                                hidden_states = hidden_states.to(activation_dtype)
+                            else:
+                                hidden_states = scaled
+                        else:
+                            hidden_states = hidden_states.to(activation_dtype)
                     else:
                         # Diagnostic control that reproduces the previous partial
                         # fix: SiLU was fp32, but the product was still fp16.
@@ -275,10 +306,22 @@ class FeedForward(nn.Module):
             if probe_enabled:
                 w2_linear_stats = _deferred_probe_stats(w2_linear)
                 restore_scale_stats = _deferred_probe_stats(fp16_restore_scale)
-            hidden_states = w2_linear.float()
-            hidden_states.mul_(fp16_restore_scale)
-            if self.w2.bias is not None:
-                hidden_states.add_(self.w2.bias.float())
+            restored = None
+            if (
+                self.w2.bias is not None
+                and not probe_enabled
+                and _env_flag("MINIMAX_H3_VAE_FFN_FUSED_SCALE_CAST", "1")
+            ):
+                restored = try_restore_scale_add_bias_f32_exact(
+                    w2_linear, fp16_restore_scale, self.w2.bias
+                )
+            if restored is None:
+                hidden_states = w2_linear.float()
+                hidden_states.mul_(fp16_restore_scale)
+                if self.w2.bias is not None:
+                    hidden_states.add_(self.w2.bias.float())
+            else:
+                hidden_states = restored
         if probe_enabled:
             assert input_stats is not None
             assert w1_stats is not None
