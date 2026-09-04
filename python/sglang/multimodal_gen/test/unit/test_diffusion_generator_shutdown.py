@@ -31,6 +31,30 @@ class _FakeProcess:
 
 
 class TestDiffGeneratorShutdown(unittest.TestCase):
+    def test_from_server_args_sets_global_before_local_server_start(self):
+        server_args = SimpleNamespace()
+        events = []
+
+        with (
+            patch.object(dg, "globally_suppress_loggers"),
+            patch.object(dg, "init_diffusion_tracing"),
+            patch.object(dg, "set_global_server_args") as set_global,
+            patch.object(dg.PortArgs, "from_server_args", return_value=object()),
+            patch.object(
+                DiffGenerator,
+                "_start_local_server_if_needed",
+                side_effect=lambda: events.append("start") or [],
+            ),
+            patch.object(DiffGenerator, "_run_client_warmup_if_needed"),
+        ):
+            set_global.side_effect = lambda args: events.append(("global", args))
+            generator = DiffGenerator.from_server_args(server_args)
+
+        self.assertIs(generator.server_args, server_args)
+        self.assertEqual(events, [("global", server_args), "start"])
+        self.assertTrue(generator.owns_scheduler_client)
+        generator.owns_scheduler_client = False
+
     def test_shutdown_uses_bounded_scheduler_timeout_and_forces_worker(self):
         generator = object.__new__(DiffGenerator)
         process = _FakeProcess()

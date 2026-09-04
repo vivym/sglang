@@ -35,7 +35,11 @@ from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
-from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    PortArgs,
+    ServerArgs,
+    set_global_server_args,
+)
 from sglang.multimodal_gen.runtime.server_warmup import (
     run_sync_client_warmup,
     should_run_explicit_client_warmup,
@@ -127,6 +131,10 @@ class DiffGenerator:
             The created DiffGenerator
         """
         globally_suppress_loggers()
+        # Request preparation runs in this client process before work is sent
+        # to the scheduler. Keep its runtime-dependent adapters on the same
+        # ServerArgs contract as HTTP request preparation.
+        set_global_server_args(server_args)
         instance = cls(
             server_args=server_args,
         )
