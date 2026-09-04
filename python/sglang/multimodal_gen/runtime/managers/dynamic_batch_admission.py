@@ -35,6 +35,7 @@ _BATCHING_RULE_KEYS = frozenset(
         "offload",
         "max_batch_size",
         "max_cost",
+        "max_encoder_batch_tokens",
         # Free-form provenance/benchmark metadata. It is intentionally ignored
         # by admission, but accepted so production configs can explain caps.
         "calibration",
@@ -48,18 +49,46 @@ class AdmissionLimit:
 
     max_batch_size: int
     max_cost: float | None = None
+    max_encoder_batch_tokens: int | None = None
     cap_reason: str | None = None
 
-    def reject_reason(self, *, batch_size: int, batch_cost: float) -> str | None:
+    def reject_reason(
+        self,
+        *,
+        batch_size: int,
+        batch_cost: float,
+        encoder_batch_tokens: int | None = None,
+    ) -> str | None:
         if batch_size > self.max_batch_size:
             return self.cap_reason or f"config_cap:{self.max_batch_size}"
         if self.max_cost is not None and batch_cost > self.max_cost:
             return f"cost_budget:{batch_cost:.0f}>{self.max_cost:.0f}"
+        if self.max_encoder_batch_tokens is not None:
+            if encoder_batch_tokens is None:
+                return "encoder_token_budget:unavailable"
+            if encoder_batch_tokens > self.max_encoder_batch_tokens:
+                return (
+                    f"encoder_token_budget:{encoder_batch_tokens}>"
+                    f"{self.max_encoder_batch_tokens}"
+                )
         return None
 
-    def stop_reason_for_next_cost(self, next_batch_cost: float) -> str | None:
+    def stop_reason_for_next(
+        self,
+        *,
+        next_batch_cost: float,
+        next_encoder_batch_tokens: int | None,
+    ) -> str | None:
         if self.max_cost is not None and next_batch_cost > self.max_cost:
             return f"cost_budget_next:{next_batch_cost:.0f}>{self.max_cost:.0f}"
+        if self.max_encoder_batch_tokens is not None:
+            if next_encoder_batch_tokens is None:
+                return "encoder_token_budget_next:unavailable"
+            if next_encoder_batch_tokens > self.max_encoder_batch_tokens:
+                return (
+                    f"encoder_token_budget_next:{next_encoder_batch_tokens}>"
+                    f"{self.max_encoder_batch_tokens}"
+                )
         return None
 
 
@@ -75,6 +104,7 @@ class BatchingRule:
     offload: bool | None = None
     max_batch_size: int = 1
     max_cost: float | None = None
+    max_encoder_batch_tokens: int | None = None
     source: str = "user"
 
     @classmethod
@@ -97,6 +127,9 @@ class BatchingRule:
             offload=_optional_bool(data.get("offload")),
             max_batch_size=int(data["max_batch_size"]),
             max_cost=_optional_float(data.get("max_cost")),
+            max_encoder_batch_tokens=_optional_int(
+                data.get("max_encoder_batch_tokens")
+            ),
             source=source,
         )
         rule.validate()
@@ -113,6 +146,13 @@ class BatchingRule:
             raise ValueError("batching config rule max_batch_size must be >= 1")
         if self.max_cost is not None and self.max_cost <= 0.0:
             raise ValueError("batching config rule max_cost must be > 0")
+        if (
+            self.max_encoder_batch_tokens is not None
+            and self.max_encoder_batch_tokens <= 0
+        ):
+            raise ValueError(
+                "batching config rule max_encoder_batch_tokens must be > 0"
+            )
         if (
             self.device_memory_gb_min is not None
             and self.device_memory_gb_max is not None
@@ -188,10 +228,13 @@ class BatchAdmissionController:
         if batch_size > limit.max_batch_size:
             return limit.cap_reason or f"config_cap:{limit.max_batch_size}"
         if limit.max_cost is None:
-            return None
+            batch_cost = 0.0
+        else:
+            batch_cost = self.estimate_batch_cost(proposed)
         return limit.reject_reason(
             batch_size=batch_size,
-            batch_cost=self.estimate_batch_cost(proposed),
+            batch_cost=batch_cost,
+            encoder_batch_tokens=self._estimate_encoder_batch_tokens(proposed, limit),
         )
 
     def batch_is_full(self, reqs: list[Req]) -> bool:
@@ -202,11 +245,24 @@ class BatchAdmissionController:
         limit = self.limit_for(reqs[0])
         if self._effective_batch_size(reqs) >= limit.max_batch_size:
             return True
-        if limit.max_cost is None:
+        if limit.max_cost is None and limit.max_encoder_batch_tokens is None:
             return False
 
-        next_cost = self.estimate_batch_cost(reqs + [reqs[0]])
-        return next_cost > limit.max_cost
+        proposed = reqs + [reqs[0]]
+        return (
+            limit.reject_reason(
+                batch_size=self._effective_batch_size(proposed),
+                batch_cost=(
+                    self.estimate_batch_cost(proposed)
+                    if limit.max_cost is not None
+                    else 0.0
+                ),
+                encoder_batch_tokens=self._estimate_encoder_batch_tokens(
+                    proposed, limit
+                ),
+            )
+            is not None
+        )
 
     def limit_reason_for_batch(self, reqs: list[Req]) -> str | None:
         if not self.enabled or not reqs:
@@ -215,11 +271,20 @@ class BatchAdmissionController:
         limit = self.limit_for(reqs[0])
         if self._effective_batch_size(reqs) >= limit.max_batch_size:
             return limit.cap_reason or f"config_cap:{limit.max_batch_size}"
-        if limit.max_cost is None:
+        if limit.max_cost is None and limit.max_encoder_batch_tokens is None:
             return None
 
-        next_cost = self.estimate_batch_cost(reqs + [reqs[0]])
-        return limit.stop_reason_for_next_cost(next_cost)
+        proposed = reqs + [reqs[0]]
+        return limit.stop_reason_for_next(
+            next_batch_cost=(
+                self.estimate_batch_cost(proposed)
+                if limit.max_cost is not None
+                else 0.0
+            ),
+            next_encoder_batch_tokens=self._estimate_encoder_batch_tokens(
+                proposed, limit
+            ),
+        )
 
     def max_admissible_batch_size(self, req: Req) -> int:
         return self.limit_for(req).max_batch_size
@@ -238,9 +303,17 @@ class BatchAdmissionController:
             else None
         )
         costs = [rule.max_cost for rule in rules if rule.max_cost is not None]
+        encoder_token_caps = [
+            rule.max_encoder_batch_tokens
+            for rule in rules
+            if rule.max_encoder_batch_tokens is not None
+        ]
         return AdmissionLimit(
             max_batch_size=max(1, max_batch_size),
             max_cost=min(costs) if costs else None,
+            max_encoder_batch_tokens=(
+                min(encoder_token_caps) if encoder_token_caps else None
+            ),
             cap_reason=cap_reason,
         )
 
@@ -248,6 +321,23 @@ class BatchAdmissionController:
         return sum(
             float(self._pipeline_config.estimate_request_cost(req)) for req in reqs
         )
+
+    def _estimate_encoder_batch_tokens(
+        self,
+        reqs: list[Req],
+        limit: AdmissionLimit,
+    ) -> int | None:
+        if limit.max_encoder_batch_tokens is None:
+            return None
+        estimator = getattr(
+            self._pipeline_config, "estimate_encoder_batch_tokens", None
+        )
+        if not callable(estimator):
+            return None
+        value = estimator(reqs)
+        if value is None:
+            return None
+        return int(value)
 
     @staticmethod
     def _effective_batch_size(reqs: list[Req]) -> int:
@@ -342,6 +432,14 @@ def _optional_float(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("expected an integer, got a boolean")
+    return int(value)
 
 
 def _optional_bool(value: Any) -> bool | None:

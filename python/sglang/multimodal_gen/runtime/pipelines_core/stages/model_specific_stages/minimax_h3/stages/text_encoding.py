@@ -337,6 +337,9 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
             minimax_h3_text_only_ids,
         )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.prompt_admission import (
+            minimax_h3_precomputed_presentation,
+        )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
             minimax_h3_plan_from_batch,
         )
@@ -349,9 +352,16 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         ):
             return None
 
-        input_ids = [
-            minimax_h3_text_only_ids(self.tokenizer, plan.prompt) for plan in plans
-        ]
+        input_ids = []
+        for batch, plan in zip(representatives, plans, strict=True):
+            precomputed = minimax_h3_precomputed_presentation(
+                batch, plan, tokenizer=self.tokenizer
+            )
+            input_ids.append(
+                precomputed[0]
+                if precomputed is not None
+                else minimax_h3_text_only_ids(self.tokenizer, plan.prompt)
+            )
         self._manage_text_encoder_use(0)
         started = time.perf_counter()
         with set_forward_context(current_timestep=0, attn_metadata=None):
@@ -451,6 +461,9 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
             minimax_h3_text_only_ids,
         )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.prompt_admission import (
+            minimax_h3_precomputed_presentation,
+        )
 
         prompt = plan.prompt
         keyframes = [
@@ -497,7 +510,14 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                     prompt=prompt,
                 )
             else:
-                positive_ids = minimax_h3_text_only_ids(self.tokenizer, prompt)
+                precomputed = minimax_h3_precomputed_presentation(
+                    batch, plan, tokenizer=self.tokenizer
+                )
+                positive_ids = (
+                    precomputed[0]
+                    if precomputed is not None
+                    else minimax_h3_text_only_ids(self.tokenizer, prompt)
+                )
                 embeddings = {
                     "positive": {
                         "hidden_states": encode_ids(positive_ids),
@@ -522,6 +542,9 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
             minimax_h3_multi_image_presentation,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.prompt_admission import (
+            minimax_h3_precomputed_presentation,
         )
 
         # The SAME prepared target-canvas images feed
@@ -549,11 +572,20 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         image_token_counts = [
             int(image_grid_thw[i].prod().item()) // merge for i in range(len(images))
         ]
-        pos_ids, pos_tags = minimax_h3_multi_image_presentation(
-            self.tokenizer,
-            prompt=prompt,
+        precomputed = minimax_h3_precomputed_presentation(
+            batch,
+            plan,
+            tokenizer=self.tokenizer,
             image_token_counts=image_token_counts,
         )
+        if precomputed is None:
+            pos_ids, pos_tags = minimax_h3_multi_image_presentation(
+                self.tokenizer,
+                prompt=prompt,
+                image_token_counts=image_token_counts,
+            )
+        else:
+            pos_ids, pos_tags = precomputed
         pos_hidden = encode_ids(
             pos_ids,
             pixel_values=pixel_values,
@@ -575,8 +607,12 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         only — then the verbatim prompt.
         """
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
+            minimax_h3_ref2va_condition_labels,
             minimax_h3_ref2va_presentation,
             minimax_h3_ref2va_video_presentation,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.prompt_admission import (
+            minimax_h3_precomputed_presentation,
         )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.reference_encoding import (
             minimax_h3_prepared_reference_image,
@@ -614,48 +650,26 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             video_has_audio[int(item["condition_index"])] = bool(
                 item["input_has_audio"]
             )
-        condition_labels: list[tuple[str, int]] = []
-        counters = {"image": 0, "audio": 0, "video": 0}
         has_image = False
         has_video = False
         for material in plan.materials:
             if material.material_chain == "image.reference_preserve":
-                counters["image"] += 1
-                condition_labels.append(("image", counters["image"]))
                 has_image = True
             elif material.material_chain == "audio":
-                counters["audio"] += 1
-                condition_labels.append(("audio", counters["audio"]))
+                pass
             elif material.material_chain in (
                 "video.reference_preserve",
                 "video_audio.reference_preserve",
             ):
-                # A plain video contributes an Audio label only when its
-                # probed source actually has a soundtrack. ``video_audio`` is
-                # an explicit caller promise and remains fail-closed in the
-                # audio stage if its stream is missing.
-                if material.material_chain == "video_audio.reference_preserve":
-                    contributes_audio = True
-                else:
-                    condition_index = int(material.condition_index)
-                    if condition_index not in video_has_audio:
-                        raise KeyError(
-                            "prepared reference videos carry no "
-                            f"'input_has_audio' probe for condition "
-                            f"{condition_index}; the canonical minimax_h3 "
-                            "producer must supply it"
-                        )
-                    contributes_audio = video_has_audio[condition_index]
-                if contributes_audio:
-                    counters["audio"] += 1
-                    condition_labels.append(("audio", counters["audio"]))
-                counters["video"] += 1
-                condition_labels.append(("video", counters["video"]))
                 has_video = True
             else:
                 raise NotImplementedError(
                     f"ref2va does not support chain {material.material_chain!r}"
                 )
+        condition_labels = minimax_h3_ref2va_condition_labels(
+            plan,
+            video_has_audio=video_has_audio,
+        )
 
         pixel_values = None
         image_grid_thw = None
@@ -729,7 +743,18 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 video_block_token_counts.append([per_block] * n_blocks)
                 video_block_timestamps.append(timestamps)
 
-        if has_video:
+        precomputed = minimax_h3_precomputed_presentation(
+            batch,
+            plan,
+            tokenizer=self.tokenizer,
+            image_token_counts=(counts if has_image else []),
+            condition_labels=condition_labels,
+            video_block_token_counts=video_block_token_counts,
+            video_block_timestamps=video_block_timestamps,
+        )
+        if precomputed is not None:
+            pos_ids, pos_tags = precomputed
+        elif has_video:
             pos_ids, pos_tags = minimax_h3_ref2va_video_presentation(
                 self.tokenizer,
                 prompt=plan.prompt,

@@ -117,6 +117,16 @@ async def lifespan(app: FastAPI):
 
     # 1. Initialize the singleton client that connects to the backend Scheduler
     server_args = app.state.server_args
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        MiniMaxH3PipelineConfig,
+    )
+
+    if isinstance(server_args.pipeline_config, MiniMaxH3PipelineConfig):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.prompt_admission import (
+            minimax_h3_initialize_prompt_admission,
+        )
+
+        await asyncio.to_thread(minimax_h3_initialize_prompt_admission, server_args)
     async_scheduler_client.initialize(server_args)
     warmup_done = asyncio.Event()
     app.state.server_warmup_done = warmup_done
@@ -236,6 +246,19 @@ def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
     scheduler_ports = server_args.scheduler_ports
     if scheduler_ports is None:
         scheduler_ports = [server_args.scheduler_port]
+    minimax_h3_prompt_admission = None
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        MiniMaxH3PipelineConfig,
+    )
+
+    if isinstance(server_args.pipeline_config, MiniMaxH3PipelineConfig):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.prompt_admission import (
+            minimax_h3_prompt_admission_runtime_info,
+        )
+
+        minimax_h3_prompt_admission = minimax_h3_prompt_admission_runtime_info(
+            server_args
+        )
     return {
         "backend": backend,
         "model_variant": server_args.model_variant,
@@ -296,6 +319,7 @@ def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
                 "SGLANG_H3_MEMORY_PROFILE_RELEASE_ENCODER", "0"
             ),
             "cuda_launch_blocking": os.environ.get("CUDA_LAUNCH_BLOCKING", "0"),
+            "prompt_admission": minimax_h3_prompt_admission,
         },
         "ports": {
             "http": server_args.port,

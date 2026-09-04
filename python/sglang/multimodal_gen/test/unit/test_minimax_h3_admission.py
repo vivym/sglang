@@ -180,6 +180,25 @@ def test_batch_admission_cost_uses_h3_packed_target_rows():
     assert MiniMaxH3PipelineConfig().estimate_request_cost(batch) == 75420.0
 
 
+def test_encoder_batch_admission_counts_right_padding_not_raw_token_sum():
+    config = MiniMaxH3PipelineConfig()
+    batches = [
+        SimpleNamespace(
+            extra={
+                "minimax_h3_precomputed_presentation": {
+                    "presentation_token_count": count
+                }
+            },
+            num_outputs_per_prompt=1,
+        )
+        for count in (30000, 10000)
+    ]
+
+    assert config.estimate_encoder_batch_tokens(batches) == 60000
+    batches[1].extra.clear()
+    assert config.estimate_encoder_batch_tokens(batches) is None
+
+
 def test_mixed_duration_requests_share_encoder_batch_signature():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.server_args = SimpleNamespace(pipeline_config=MiniMaxH3PipelineConfig())

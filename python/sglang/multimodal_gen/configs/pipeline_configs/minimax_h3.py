@@ -119,6 +119,31 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 return float((video_rows + audio_rows) * outputs)
         return super().estimate_request_cost(batch)
 
+    def estimate_encoder_batch_tokens(self, batches) -> int | None:
+        """Count the right-padded tokens consumed by text-only K>1 encode."""
+
+        counts = []
+        output_slots = 0
+        for batch in batches:
+            extra = getattr(batch, "extra", None)
+            presentation = (
+                extra.get("minimax_h3_precomputed_presentation")
+                if isinstance(extra, Mapping)
+                else None
+            )
+            count = (
+                presentation.get("presentation_token_count")
+                if isinstance(presentation, Mapping)
+                else None
+            )
+            if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                return None
+            counts.append(count)
+            output_slots += max(1, int(batch.num_outputs_per_prompt or 1))
+        if not counts:
+            return 0
+        return max(counts) * output_slots
+
     @property
     def requires_audio_output(self) -> bool:
         return True

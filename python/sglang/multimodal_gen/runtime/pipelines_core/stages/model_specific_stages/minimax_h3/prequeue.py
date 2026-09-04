@@ -28,6 +28,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_plan_from_batch,
     minimax_h3_resolve_spatial_shape,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.prompt_admission import (
+    MINIMAX_H3_PRESENTATION_EXTRA_KEY,
+    minimax_h3_prepare_prompt_admission,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
     minimax_h3_align_frame_count,
     minimax_h3_audio_latent_t,
@@ -330,12 +334,14 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
         batch.height = int(shape["height"])
         batch.fps = MINIMAX_H3_SUPPORTED_FPS
         batch.num_frames = int(work_frames)
+        minimax_h3_prepare_prompt_admission(batch, resolved_plan)
         _preserve_prequeue_material_dirs(batch)
         return resolved_plan
     except Exception:
         minimax_h3_cleanup_temp_dirs(batch)
         batch.extra.pop(MINIMAX_H3_PROBE_FACTS_EXTRA_KEY, None)
         batch.extra.pop(MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY, None)
+        batch.extra.pop(MINIMAX_H3_PRESENTATION_EXTRA_KEY, None)
         raise
 
 

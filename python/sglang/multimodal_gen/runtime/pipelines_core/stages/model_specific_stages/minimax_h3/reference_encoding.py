@@ -676,6 +676,26 @@ MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS = 2.0
 MINIMAX_H3_QWEN_TEMPORAL_PATCH = 2
 
 
+def minimax_h3_reference_video_block_timestamps(frame_count: int) -> list[float]:
+    """Return the Qwen block timestamps implied by a prepared frame count."""
+
+    if isinstance(frame_count, bool) or not isinstance(frame_count, int):
+        raise ValueError("reference-video frame_count must be an integer")
+    if frame_count <= 0:
+        raise ValueError("reference-video frame_count must be positive")
+    sample_stride = int(MINIMAX_H3_SUPPORTED_FPS / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS)
+    sampled_count = (frame_count + sample_stride - 1) // sample_stride
+    timestamps = [
+        index / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS for index in range(sampled_count)
+    ]
+    pad = (-len(timestamps)) % MINIMAX_H3_QWEN_TEMPORAL_PATCH
+    timestamps += [timestamps[-1]] * pad
+    return [
+        (timestamps[index] + timestamps[index + MINIMAX_H3_QWEN_TEMPORAL_PATCH - 1]) / 2
+        for index in range(0, len(timestamps), MINIMAX_H3_QWEN_TEMPORAL_PATCH)
+    ]
+
+
 def minimax_h3_sample_reference_video_frames(
     frames: Any,
 ) -> dict[str, Any]:
@@ -697,16 +717,7 @@ def minimax_h3_sample_reference_video_frames(
         )
     sample_stride = int(MINIMAX_H3_SUPPORTED_FPS / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS)
     sampled_frames = frames[::sample_stride]
-    ts = [
-        i / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS
-        for i in range(int(sampled_frames.shape[0]))
-    ]
-    pad = (-len(ts)) % MINIMAX_H3_QWEN_TEMPORAL_PATCH
-    ts = ts + [ts[-1]] * pad
-    block_timestamps = [
-        (ts[i] + ts[i + MINIMAX_H3_QWEN_TEMPORAL_PATCH - 1]) / 2
-        for i in range(0, len(ts), MINIMAX_H3_QWEN_TEMPORAL_PATCH)
-    ]
+    block_timestamps = minimax_h3_reference_video_block_timestamps(int(frames.shape[0]))
     return {"frames": sampled_frames, "block_timestamps": block_timestamps}
 
 
@@ -913,6 +924,7 @@ __all__ = [
     "minimax_h3_encode_reference_video_rows",
     "minimax_h3_prepared_reference_image",
     "minimax_h3_prepared_reference_videos",
+    "minimax_h3_reference_video_block_timestamps",
     "minimax_h3_resolve_reference_image_shape",
     "minimax_h3_sample_reference_video_frames",
 ]

@@ -89,11 +89,53 @@ def minimax_h3_text_only_ids(tokenizer: Any, prompt: str) -> torch.Tensor:
     return torch.tensor(_text_ids(tokenizer, prompt), dtype=torch.long)
 
 
+def minimax_h3_ref2va_condition_labels(
+    plan: Any,
+    *,
+    video_has_audio: dict[int, bool],
+) -> list[tuple[str, int]]:
+    """Build the canonical Qwen label order for a Ref2VA request."""
+
+    labels: list[tuple[str, int]] = []
+    counters = {"image": 0, "audio": 0, "video": 0}
+    for material in plan.materials:
+        chain = material.material_chain
+        if chain == "image.reference_preserve":
+            counters["image"] += 1
+            labels.append(("image", counters["image"]))
+        elif chain == "audio":
+            counters["audio"] += 1
+            labels.append(("audio", counters["audio"]))
+        elif chain in (
+            "video.reference_preserve",
+            "video_audio.reference_preserve",
+        ):
+            condition_index = int(material.condition_index)
+            if chain == "video_audio.reference_preserve":
+                contributes_audio = True
+            else:
+                if condition_index not in video_has_audio:
+                    raise KeyError(
+                        "reference video has no 'input_has_audio' probe for "
+                        f"condition {condition_index}"
+                    )
+                contributes_audio = bool(video_has_audio[condition_index])
+            if contributes_audio:
+                counters["audio"] += 1
+                labels.append(("audio", counters["audio"]))
+            counters["video"] += 1
+            labels.append(("video", counters["video"]))
+        else:
+            raise NotImplementedError(f"ref2va does not support chain {chain!r}")
+    return labels
+
+
 def minimax_h3_multi_image_presentation(
     tokenizer: Any,
     *,
     prompt: str,
     image_token_counts: list[int],
+    prompt_ids: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not image_token_counts:
         raise ValueError("image_token_counts must be non-empty")
@@ -103,7 +145,11 @@ def minimax_h3_multi_image_presentation(
             raise ValueError("image_token_count must be positive")
         presentation.text(_text_ids(tokenizer, f"<Picture {index}>: "))
         presentation.vision(_vision_block_ids(tokenizer, IMAGE_PAD, count))
-    presentation.text(_text_ids(tokenizer, prompt))
+    presentation.text(
+        _text_ids(tokenizer, prompt)
+        if prompt_ids is None
+        else [int(value) for value in prompt_ids]
+    )
     return presentation.build()
 
 
@@ -113,6 +159,7 @@ def minimax_h3_ref2va_presentation(
     prompt: str,
     condition_labels: list[tuple[str, int]],
     image_token_count: int | list[int] | None,
+    prompt_ids: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """ref2va positive presentation:
 
@@ -131,6 +178,7 @@ def minimax_h3_ref2va_presentation(
         image_token_count=image_token_count,
         video_block_token_counts=None,
         video_block_timestamps=None,
+        prompt_ids=prompt_ids,
     )
 
 
@@ -196,6 +244,7 @@ def minimax_h3_ref2va_video_presentation(
     image_token_count: int | list[int] | None,
     video_block_token_counts: list[int] | list[list[int]] | None,
     video_block_timestamps: list[float] | list[list[float]] | None,
+    prompt_ids: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """ref2va (optionally with video refs) positive presentation:
 
@@ -266,12 +315,17 @@ def minimax_h3_ref2va_video_presentation(
         raise ValueError("unused image_token_count entries")
     if video_seen != len(video_counts_by_ref):
         raise ValueError("unused video block token count entries")
-    presentation.text(_text_ids(tokenizer, prompt))
+    presentation.text(
+        _text_ids(tokenizer, prompt)
+        if prompt_ids is None
+        else [int(value) for value in prompt_ids]
+    )
     return presentation.build()
 
 
 __all__ = [
     "minimax_h3_multi_image_presentation",
+    "minimax_h3_ref2va_condition_labels",
     "minimax_h3_ref2va_presentation",
     "minimax_h3_ref2va_video_presentation",
     "minimax_h3_text_only_ids",
