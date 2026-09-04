@@ -82,6 +82,33 @@ class TestDecodingStageParallelism(unittest.TestCase):
                 stage._compiled_vae_decode.compiled_module, new_compiled_vae_decode
             )
 
+    def test_vae_compile_override_preserves_legacy_behavior(self):
+        cases = (
+            (False, None, False),
+            (True, None, True),
+            (False, True, True),
+            (True, False, False),
+        )
+        for global_enabled, vae_override, expected_compile in cases:
+            with self.subTest(
+                global_enabled=global_enabled,
+                vae_override=vae_override,
+            ):
+                vae = FakeVAE()
+                stage = DecodingStage(vae)
+                server_args = SimpleNamespace(
+                    enable_torch_compile=global_enabled,
+                    enable_vae_torch_compile=vae_override,
+                )
+                with patch(
+                    "torch.compile", side_effect=lambda fn, **_: fn
+                ) as compile_fn:
+                    decode_fn = stage._get_vae_decode_fn(vae, server_args)
+
+                self.assertEqual(compile_fn.called, expected_compile)
+                if not expected_compile:
+                    self.assertEqual(decode_fn, vae.decode)
+
     def test_cfg_parallel_keeps_main_rank_decode_without_parallel_decode(self):
         stage = object.__new__(DecodingStage)
         stage.vae = SimpleNamespace(use_parallel_decode=False)

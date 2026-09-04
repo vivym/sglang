@@ -666,6 +666,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         warmup_mode=None,
         warmup_resolutions=None,
         enable_torch_compile=False,
+        enable_vae_torch_compile=None,
         enable_breakable_cuda_graph=False,
         disagg_role=None,
     ):
@@ -675,6 +676,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa.warmup_mode = warmup_mode
         sa.warmup_resolutions = warmup_resolutions
         sa.enable_torch_compile = enable_torch_compile
+        sa.enable_vae_torch_compile = enable_vae_torch_compile
         sa.enable_breakable_cuda_graph = enable_breakable_cuda_graph
         sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
         sa._adjust_warmup()
@@ -723,6 +725,19 @@ class TestWarmupModeNormalization(unittest.TestCase):
         )
         self.assertEqual(sa.warmup_mode, "server")
 
+    def test_vae_only_compile_defaults_to_server_warmup(self):
+        sa = self._resolve(enable_vae_torch_compile=True)
+
+        self.assertEqual(sa.warmup_mode, "server")
+
+    def test_explicit_vae_compile_off_does_not_disable_dit_warmup(self):
+        sa = self._resolve(
+            enable_torch_compile=True,
+            enable_vae_torch_compile=False,
+        )
+
+        self.assertEqual(sa.warmup_mode, "server")
+
     def test_breakable_cuda_graph_forces_server_warmup(self):
         sa = self._resolve(enable_breakable_cuda_graph=True)
         self.assertEqual(sa.warmup_mode, "server")
@@ -754,6 +769,25 @@ class TestWarmupModeNormalization(unittest.TestCase):
     def test_invalid_mode_raises(self):
         with self.assertRaises(ValueError):
             self._resolve(warmup_mode="bogus")
+
+
+class TestVaeTorchCompileCli(unittest.TestCase):
+    def test_vae_compile_override_is_tristate(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        cases = (
+            ([], None),
+            (["--enable-vae-torch-compile"], True),
+            (["--enable-vae-torch-compile", "true"], True),
+            (["--enable-vae-torch-compile", "false"], False),
+        )
+        for extra_args, expected in cases:
+            with self.subTest(extra_args=extra_args):
+                args, _unknown = parser.parse_known_args(
+                    ["--model-path", "/fake", *extra_args]
+                )
+                self.assertEqual(args.enable_vae_torch_compile, expected)
 
 
 class TestWarmupImageIsModelValid(unittest.TestCase):

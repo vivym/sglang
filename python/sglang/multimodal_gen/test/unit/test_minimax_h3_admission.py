@@ -352,6 +352,7 @@ def _quality_server_args():
         component_attention_backends={},
         enable_breakable_cuda_graph=False,
         enable_torch_compile=False,
+        enable_vae_torch_compile=None,
         is_dit_layerwise_offload_selected=False,
         performance_mode="speed",
         quantization=None,
@@ -412,6 +413,10 @@ def test_quality_admission_fails_closed_outside_validated_request():
         ),
     ):
         assert stage.forward(batch, server_args) is batch
+        server_args.enable_vae_torch_compile = True
+        with pytest.raises(ValueError, match="enable_vae_torch_compile"):
+            stage.forward(batch, server_args)
+        server_args.enable_vae_torch_compile = None
         batch.num_inference_steps = 40
         with pytest.raises(ValueError, match="validated only"):
             stage.forward(batch, server_args)

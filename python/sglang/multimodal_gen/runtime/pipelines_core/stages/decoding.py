@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
     build_torch_compile_kwargs,
+    is_vae_torch_compile_enabled,
     resolve_torch_compile_mode,
 )
 
@@ -173,7 +174,9 @@ class DecodingStage(PipelineStage):
         compiled_callable: ActiveTargetCompiledCallable | None = None,
     ):
         decode_fn = decode_fn or vae.decode
-        if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
+        if not is_vae_torch_compile_enabled(server_args) or not isinstance(
+            vae, nn.Module
+        ):
             return decode_fn
 
         compiled_callable = compiled_callable or self._compiled_vae_decode

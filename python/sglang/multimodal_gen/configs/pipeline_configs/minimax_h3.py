@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    is_vae_torch_compile_enabled,
+)
 
 logger = init_logger(__name__)
 
@@ -185,6 +188,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "component_attention_backends": {},
             "enable_breakable_cuda_graph": server_args.enable_breakable_cuda_graph,
             "enable_torch_compile": server_args.enable_torch_compile,
+            "enable_vae_torch_compile": is_vae_torch_compile_enabled(server_args),
             "is_dit_layerwise_offload_selected": (
                 server_args.is_dit_layerwise_offload_selected
             ),
@@ -208,6 +212,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "component_attention_backends": {},
             "enable_breakable_cuda_graph": False,
             "enable_torch_compile": False,
+            "enable_vae_torch_compile": False,
             "is_dit_layerwise_offload_selected": False,
             "model_variant": "fl2va",
             "num_gpus": 4,

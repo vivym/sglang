@@ -64,6 +64,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    is_vae_torch_compile_enabled,
+)
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
@@ -334,6 +337,9 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Compilation
     enable_torch_compile: bool = False
+    # None inherits enable_torch_compile for backward compatibility. An explicit
+    # bool controls VAE decode compilation independently from the DiT.
+    enable_vae_torch_compile: bool | None = None
     regional_compile: bool = False
 
     # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
@@ -1020,12 +1026,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"expected one of {WARMUP_MODES}."
             )
 
-        if self.enable_torch_compile and self.warmup_mode is None:
+        if (
+            self.enable_torch_compile or is_vae_torch_compile_enabled(self)
+        ) and self.warmup_mode is None:
             self.warmup_mode = "server"
             logger.info(
-                "Automatically enabled server warmup for torch.compile so first "
-                "real requests do not pay compile latency. Set --warmup-mode off "
-                "to disable this behavior."
+                "Automatically enabled server warmup for DiT or VAE torch.compile "
+                "so first real requests do not pay compile latency for the warmup "
+                "shape. Set --warmup-mode off to disable this behavior."
             )
 
         # Explicit resolutions need a request path unless an existing server
@@ -1781,6 +1789,16 @@ class ServerArgs(DisaggServerArgsMixin):
             + "When no warmup mode is configured, this enables server warmup "
             + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-vae-torch-compile",
+            action=StoreBoolean,
+            default=ServerArgs.enable_vae_torch_compile,
+            help=(
+                "Compile VAE decode independently from the DiT. Unset inherits "
+                "--enable-torch-compile for backward compatibility; explicit false "
+                "keeps VAE decode eager even when DiT compile is enabled."
+            ),
         )
         parser.add_argument(
             "--regional-compile",

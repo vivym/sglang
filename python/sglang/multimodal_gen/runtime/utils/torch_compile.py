@@ -45,6 +45,14 @@ def resolve_torch_compile_mode(
     return default
 
 
+def is_vae_torch_compile_enabled(server_args: object) -> bool:
+    """Resolve the VAE compile override while preserving the legacy global flag."""
+    override = getattr(server_args, "enable_vae_torch_compile", None)
+    if override is None:
+        return bool(getattr(server_args, "enable_torch_compile", False))
+    return bool(override)
+
+
 def compile_matching_submodules(
     module: nn.Module,
     *,
