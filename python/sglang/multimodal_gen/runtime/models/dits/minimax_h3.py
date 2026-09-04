@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.activation.activation import (
+    silu_and_mul_with_activation_rounding,
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion.qknorm_rope import (
@@ -272,15 +273,19 @@ def _modulate_gate(
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
-def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
+def _silu_mul(
+    hidden: torch.Tensor, *, reuse_input: bool, use_fused_kernel: bool
+) -> torch.Tensor:
     if (
-        reuse_input
+        use_fused_kernel
         and hidden.is_cuda
         and hidden.dtype == _BF16_DTYPE
         and hidden.is_contiguous()
         and hidden.shape[-1] % 16 == 0
     ):
-        return silu_and_mul_with_activation_rounding_(hidden)
+        if reuse_input:
+            return silu_and_mul_with_activation_rounding_(hidden)
+        return silu_and_mul_with_activation_rounding(hidden)
     gate, up = hidden.chunk(2, dim=-1)
     return nn.functional.silu(gate) * up
 
@@ -787,10 +792,17 @@ class MiniMaxH3MLP(nn.Module):
             prefix=f"{prefix}.fc2",
         )
         self.reuse_fc1_activation = quant_config is None
+        self.use_fused_activation = os.environ.get(
+            "MINIMAX_H3_DIT_FUSED_SILU_MUL", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
-        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        hidden = _silu_mul(
+            hidden,
+            reuse_input=self.reuse_fc1_activation,
+            use_fused_kernel=self.use_fused_activation,
+        )
         out, _ = self.fc2(hidden)
         return out
 

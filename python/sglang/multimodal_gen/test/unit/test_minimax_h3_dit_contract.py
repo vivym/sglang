@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_PARAM_NAMES,
     MiniMaxH3Attention,
     MiniMaxH3DiTModel,
+    MiniMaxH3MLP,
     _copy_grouped_qkv_tp_shard,
     _reorder_grouped_qkv_to_qkv,
 )
@@ -243,6 +244,19 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
             assert tensor.dtype == torch.bfloat16, name
 
 
+def test_mlp_fused_activation_has_explicit_fallback(monkeypatch):
+    _ensure_single_process_parallel_runtime()
+    arch = MiniMaxH3DiTArchConfig(hidden_size=256, ffn_hidden_size=256)
+    with torch.device("meta"):
+        default_mlp = MiniMaxH3MLP(arch, None, prefix="blocks.0.mlp")
+    assert default_mlp.use_fused_activation is True
+
+    monkeypatch.setenv("MINIMAX_H3_DIT_FUSED_SILU_MUL", "0")
+    with torch.device("meta"):
+        fallback_mlp = MiniMaxH3MLP(arch, None, prefix="blocks.0.mlp")
+    assert fallback_mlp.use_fused_activation is False
+
+
 def test_deferred_attention_preserves_component_backend_selection():
     _ensure_single_process_parallel_runtime()
     with component_attn_backend_context_manager(AttentionBackendEnum.SAGE_ATTN):
@@ -265,10 +279,13 @@ def test_deferred_attention_rejects_backend_fallback():
         get_enum=lambda: AttentionBackendEnum.FA,
     )
 
-    with patch(
-        "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
-        return_value=fallback_backend,
-    ), pytest.raises(RuntimeError, match="fallback is disabled"):
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
+            return_value=fallback_backend,
+        ),
+        pytest.raises(RuntimeError, match="fallback is disabled"),
+    ):
         model._resolve_attention_backend_once()
 
 
