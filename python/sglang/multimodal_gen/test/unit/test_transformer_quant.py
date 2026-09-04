@@ -2,6 +2,9 @@
 This unittest is introduced in #22360, preventing duplicate transformer safetensors variants being loaded together
 """
 
+# Runtime imports intentionally follow the dependency stubs installed below.
+# ruff: noqa: E402
+
 import json
 import os
 import sys
