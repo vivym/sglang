@@ -2,6 +2,7 @@
 """Numerical boundaries for the one-pass Ref2VA media path."""
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -244,6 +245,147 @@ def test_video_vae_compile_cache_preseed_follows_compile_control(monkeypatch, en
 
     assert vae.inputs == ([latent] if enabled else [])
     assert report == ({"prepared": True} if enabled else None)
+
+
+def test_vae_graph_delta_logging_is_zero_overhead_when_disabled(monkeypatch):
+    monkeypatch.delenv(decoding._VAE_GRAPH_DELTA_ENV, raising=False)
+    monkeypatch.setattr(decoding, "is_vae_torch_compile_enabled", lambda _: True)
+
+    def unexpected_counter_read():
+        raise AssertionError(
+            "Dynamo counters must not be read when logging is disabled"
+        )
+
+    monkeypatch.setattr(decoding, "_dynamo_graph_counters", unexpected_counter_read)
+    latent = torch.ones(1, 24, 37, 2, 2)
+
+    output = MiniMaxH3DecodingStage._run_vae_decode_with_graph_delta(
+        lambda value: value + 1,
+        latent,
+        component="video_vae",
+        batch=SimpleNamespace(request_id="request-1", is_warmup=False),
+        server_args=SimpleNamespace(),
+    )
+
+    assert torch.equal(output, latent + 1)
+
+
+def test_vae_graph_delta_logging_records_component_request_and_counter_delta(
+    monkeypatch, caplog
+):
+    snapshots = iter(
+        [
+            {
+                "frames_total": 10,
+                "frames_ok": 9,
+                "calls_captured": 200,
+                "unique_graphs": 15,
+            },
+            {
+                "frames_total": 16,
+                "frames_ok": 15,
+                "calls_captured": 280,
+                "unique_graphs": 21,
+            },
+        ]
+    )
+    monkeypatch.setenv(decoding._VAE_GRAPH_DELTA_ENV, "1")
+    monkeypatch.setattr(decoding, "is_vae_torch_compile_enabled", lambda _: True)
+    monkeypatch.setattr(decoding, "_dynamo_graph_counters", lambda: next(snapshots))
+    caplog.set_level(logging.INFO, logger=decoding.__name__)
+    latent = torch.ones(2, 32, 120)
+
+    output = MiniMaxH3DecodingStage._run_vae_decode_with_graph_delta(
+        lambda value: value * 2,
+        latent,
+        component="audio_vae",
+        batch=SimpleNamespace(request_id="warmup-15s", is_warmup=True),
+        server_args=SimpleNamespace(),
+    )
+
+    assert torch.equal(output, latent * 2)
+    record = next(
+        record
+        for record in caplog.records
+        if record.message.startswith("MiniMax H3 VAE torch.compile graph delta: ")
+    )
+    payload = json.loads(record.message.split(": ", 1)[1])
+    assert payload == {
+        "schema": "minimax-h3-vae-compile-graph-delta-v1",
+        "component": "audio_vae",
+        "request_id": "warmup-15s",
+        "is_warmup": True,
+        "latent_shape": [2, 32, 120],
+        "counter_scope": "process",
+        "before": {
+            "frames_total": 10,
+            "frames_ok": 9,
+            "calls_captured": 200,
+            "unique_graphs": 15,
+        },
+        "after": {
+            "frames_total": 16,
+            "frames_ok": 15,
+            "calls_captured": 280,
+            "unique_graphs": 21,
+        },
+        "delta": {
+            "frames_total": 6,
+            "frames_ok": 6,
+            "calls_captured": 80,
+            "unique_graphs": 6,
+        },
+        "succeeded": True,
+    }
+
+
+def test_vae_graph_delta_logging_preserves_decode_failure(monkeypatch, caplog):
+    snapshots = iter(
+        [
+            {
+                "frames_total": 21,
+                "frames_ok": 21,
+                "calls_captured": 300,
+                "unique_graphs": 21,
+            },
+            {
+                "frames_total": 22,
+                "frames_ok": 21,
+                "calls_captured": 300,
+                "unique_graphs": 21,
+            },
+        ]
+    )
+    monkeypatch.setenv(decoding._VAE_GRAPH_DELTA_ENV, "true")
+    monkeypatch.setattr(decoding, "is_vae_torch_compile_enabled", lambda _: True)
+    monkeypatch.setattr(decoding, "_dynamo_graph_counters", lambda: next(snapshots))
+    caplog.set_level(logging.INFO, logger=decoding.__name__)
+
+    def fail_decode(_latent):
+        raise RuntimeError("decode failed")
+
+    with pytest.raises(RuntimeError, match="decode failed"):
+        MiniMaxH3DecodingStage._run_vae_decode_with_graph_delta(
+            fail_decode,
+            torch.ones(1, 24, 107, 2, 2),
+            component="video_vae",
+            batch=SimpleNamespace(request_id="request-15s", is_warmup=False),
+            server_args=SimpleNamespace(),
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.message.startswith("MiniMax H3 VAE torch.compile graph delta: ")
+    )
+    payload = json.loads(record.message.split(": ", 1)[1])
+    assert payload["succeeded"] is False
+    assert payload["delta"] == {
+        "calls_captured": 0,
+        "frames_ok": 0,
+        "frames_total": 1,
+        "unique_graphs": 0,
+    }
 
 
 def test_ffprobe_falls_back_when_stream_side_data_is_unknown(monkeypatch):

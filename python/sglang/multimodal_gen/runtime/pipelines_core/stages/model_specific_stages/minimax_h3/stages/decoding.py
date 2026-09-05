@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 from collections.abc import Mapping
 
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled,
     resolve_decode_precision,
@@ -39,6 +41,28 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 
 
 logger = logging.getLogger(__name__)
+
+_VAE_GRAPH_DELTA_ENV = "SGLANG_H3_VAE_TORCH_COMPILE_LOG_GRAPH_DELTAS"
+
+
+def _dynamo_graph_counters() -> dict[str, int]:
+    from torch._dynamo.utils import counters
+
+    return {
+        "frames_total": int(counters.get("frames", {}).get("total", 0)),
+        "frames_ok": int(counters.get("frames", {}).get("ok", 0)),
+        "calls_captured": int(counters.get("stats", {}).get("calls_captured", 0)),
+        "unique_graphs": int(counters.get("stats", {}).get("unique_graphs", 0)),
+    }
+
+
+def _counter_delta(
+    before: Mapping[str, int], after: Mapping[str, int]
+) -> dict[str, int]:
+    return {
+        name: int(after.get(name, 0)) - int(before.get(name, 0))
+        for name in sorted(set(before) | set(after))
+    }
 
 
 def _required_tensor(value, path: str) -> torch.Tensor:
@@ -278,6 +302,46 @@ class MiniMaxH3DecodingStage(DecodingStage):
             )
         return prepare(visual_decode_latent)
 
+    @staticmethod
+    def _run_vae_decode_with_graph_delta(
+        decode,
+        latent: torch.Tensor,
+        *,
+        component: str,
+        batch: Req,
+        server_args: ServerArgs,
+    ):
+        if not (
+            is_vae_torch_compile_enabled(server_args)
+            and get_bool_env_var(_VAE_GRAPH_DELTA_ENV)
+        ):
+            return decode(latent)
+
+        before = _dynamo_graph_counters()
+        succeeded = False
+        try:
+            output = decode(latent)
+            succeeded = True
+            return output
+        finally:
+            after = _dynamo_graph_counters()
+            payload = {
+                "schema": "minimax-h3-vae-compile-graph-delta-v1",
+                "component": component,
+                "request_id": getattr(batch, "request_id", None),
+                "is_warmup": bool(getattr(batch, "is_warmup", False)),
+                "latent_shape": list(latent.shape),
+                "counter_scope": "process",
+                "before": before,
+                "after": after,
+                "delta": _counter_delta(before, after),
+                "succeeded": succeeded,
+            }
+            logger.info(
+                "MiniMax H3 VAE torch.compile graph delta: %s",
+                json.dumps(payload, sort_keys=True),
+            )
+
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DECODER
@@ -327,6 +391,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self,
         audio_latent: torch.Tensor,
         server_args: ServerArgs,
+        *,
+        batch: Req,
     ) -> dict:
         with self.use_declared_component(
             component_name="audio_vae",
@@ -361,13 +427,20 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     decode_fn=audio_vae.decode,
                     compiled_callable=self._compiled_audio_vae_decode,
                 )
-                self._warmup_audio_vae_decode(
-                    audio_vae,
-                    audio_decode,
-                    audio_decode_latent,
-                )
+
+                def decode_audio(latent):
+                    self._warmup_audio_vae_decode(audio_vae, audio_decode, latent)
+                    return audio_decode(latent)
+
                 waveform = _required_tensor(
-                    audio_decode(audio_decode_latent), "audio_vae.decode"
+                    self._run_vae_decode_with_graph_delta(
+                        decode_audio,
+                        audio_decode_latent,
+                        component="audio_vae",
+                        batch=batch,
+                        server_args=server_args,
+                    ),
+                    "audio_vae.decode",
                 )
             return {
                 "waveform": waveform,
@@ -433,7 +506,13 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 )
                 reset_vae_ffn_probe()
                 try:
-                    visual_frames = video_decode(visual_decode_latent)
+                    visual_frames = self._run_vae_decode_with_graph_delta(
+                        video_decode,
+                        visual_decode_latent,
+                        component="video_vae",
+                        batch=batch,
+                        server_args=server_args,
+                    )
                 finally:
                     flush_vae_ffn_probe()
                 visual_frames = selected_video_vae.processor.revert_tensor(
@@ -470,7 +549,11 @@ class MiniMaxH3DecodingStage(DecodingStage):
         audio_payload = None
         if is_audio_owner:
             try:
-                audio_payload = self._decode_audio(audio_latent, server_args)
+                audio_payload = self._decode_audio(
+                    audio_latent,
+                    server_args,
+                    batch=batch,
+                )
             except Exception as exc:
                 owner_exception = exc
                 owner_error = f"{type(exc).__name__}: {exc}"
