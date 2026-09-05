@@ -9,20 +9,22 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any
+from collections import defaultdict
+from collections.abc import Iterable, Iterator
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
     silu_and_mul_with_activation_rounding_,
 )
-from sglang.kernels.ops.diffusion.qknorm_rope import (
+from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
-)
-from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
+    indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
 )
@@ -54,6 +56,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    claim_deferred_component_attn_backend,
     get_attn_backend,
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
@@ -67,26 +70,108 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.usp import _ring_attention_varlen
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
+    MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
+    MiniMaxH3AdalnCache,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
+    _plan_key as _adaln_plan_key,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
+    native_adaln_weight_files,
+)
+from sglang.multimodal_gen.runtime.models.parameter import BlockQuantScaleParameter
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
 
+logger = init_logger(__name__)
+
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
+
+_NON_LORA_DELTA_SUFFIXES = (".diff", ".diff_b", ".set_weight")
+
+
+def _reject_non_lora_delta_tensors(adapter: dict[str, torch.Tensor]) -> None:
+    offending = sorted(key for key in adapter if key.endswith(_NON_LORA_DELTA_SUFFIXES))
+    if offending:
+        raise ValueError(
+            f"LoRA adapter carries {len(offending)} non-LoRA tensors "
+            f"(.diff/.diff_b/.set_weight, e.g. {offending[0]}) that no MiniMax-H3 "
+            "LoRA mapping rule applies; serve a checkpoint with them merged instead."
+        )
+
+
+def _diffusers_h3_checkpoint(
+    iterator: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Map Diffusers H3 names/layout to the fused native checkpoint layout."""
+    mapping = get_param_names_mapping(_ARCH_DEFAULTS.param_names_mapping)
+    pending: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
+
+    for source_name, tensor in iterator:
+        target_name, merge_index, merge_count = mapping(source_name)
+
+        # Diffusers SwiGLU stores [value, gate]; the native fused MLP consumes
+        # [gate, value]. Packed GPTQ tensors carry output channels on dim 1.
+        if ".ff.net.0.proj." in source_name:
+            output_dim = (
+                1 if source_name.endswith((".qweight", ".qzeros", ".scales")) else 0
+            )
+            value, gate = tensor.chunk(2, dim=output_dim)
+            tensor = torch.cat((gate, value), dim=output_dim)
+
+        if merge_index is None:
+            yield target_name, tensor
+            continue
+
+        assert merge_count is not None
+        pending[target_name][merge_index] = tensor
+        if len(pending[target_name]) != merge_count:
+            continue
+
+        merge_dim = 1 if target_name.endswith((".qweight", ".qzeros", ".scales")) else 0
+        yield (
+            target_name,
+            torch.cat(
+                [pending[target_name][index] for index in range(merge_count)],
+                dim=merge_dim,
+            ),
+        )
+        del pending[target_name]
+
+    if pending:
+        incomplete = ", ".join(sorted(pending))
+        raise ValueError(f"Incomplete Diffusers H3 fused parameters: {incomplete}")
+
+
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
-_ADALN_ARTIFACT_CONFIG_KEY = "minimax_h3_adaln_table"
-_ADALN_ARTIFACT_FORMAT_VERSION = "1"
-_ADALN_ARTIFACT_LAYOUT = "full"
+_MPS_MLP_TOKEN_CHUNK_SIZE = 128
+# keep MPS activation chunks below the allocator high-watermark; CUDA keeps
+# its fused full-sequence projection
+_MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE = 128
+_MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE = 128
+
+_MPS_EMBED_WEIGHT_PREFIXES = (
+    "condition_proj",
+    "video_patch_proj",
+    "audio_patch_proj",
+    "time_embedder",
+    "token_refiner.final_norm",
+)
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
@@ -121,12 +206,14 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "img_position_ids",
         "rope_cache",
         "unique_timesteps",
+        "adaln_cache_slot",
         "inverse_indices",
         "update_mask",
         "update_audio_mask",
         "token_tags",
         "block_token_tags",
         "block_combined_indices",
+        "subblock_sparse_query_block_mask",
         "skip_mask_out_condition",
         "prompt_embeds",
         "refined_prompt_embeds_length",
@@ -173,6 +260,63 @@ def _reorder_grouped_qkv_to_qkv(
     )
 
 
+def _install_qkv_row_reorder(
+    param: torch.Tensor,
+    reorder: Callable[[torch.Tensor], torch.Tensor],
+    qkv_rows: int,
+) -> None:
+    """Reorder a per-output-row qkv parameter the same way its rows are reordered.
+
+    Applied to quantization metadata rather than the weight itself. Anything whose
+    leading dim is not the checkpoint's qkv row count is passed through: per-tensor
+    scales are scalars, and a swizzled block-scale layout is not row-indexed.
+    """
+
+    def _maybe_reorder(loaded_weight: torch.Tensor) -> torch.Tensor:
+        if loaded_weight.dim() >= 2 and loaded_weight.shape[0] == qkv_rows:
+            return reorder(loaded_weight)
+        return loaded_weight
+
+    base_loader = (
+        param._weight_loader
+        if hasattr(param, "_weight_loader")
+        else param.weight_loader
+    )
+
+    def _weight_loader(p: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        base_loader(p, _maybe_reorder(loaded_weight))
+
+    if hasattr(param, "_weight_loader"):
+        param._weight_loader = _weight_loader
+    else:
+        param.weight_loader = _weight_loader
+    param.rank_local_weight_transform = _maybe_reorder
+
+
+def _qkv_scale_block_rows(qkv_proj: nn.Module, head_dim: int) -> int:
+    """Weight rows covered by one row of the qkv projection's scale.
+
+    Per-channel and NVFP4 scales hold one row per weight row and report 1. A
+    block-FP8 scale holds one row per weight_block_size[0] weight rows, so the
+    qkv row permutation has to count its rows in blocks instead. Only whole
+    scale rows can move, so a block spanning two heads' q/k/v rows cannot be
+    repaired by a permutation and is rejected rather than silently mis-scaled.
+    """
+    quant_config = getattr(
+        getattr(qkv_proj, "quant_method", None), "quant_config", None
+    )
+    block_size = getattr(quant_config, "weight_block_size", None)
+    if not block_size:
+        return 1
+    block_rows = block_size[0]
+    if head_dim % block_rows:
+        raise ValueError(
+            "block-quantized qkv needs a block size that divides the head dim: "
+            f"head_dim={head_dim}, weight_block_size={block_size}."
+        )
+    return block_rows
+
+
 def _copy_grouped_qkv_tp_shard(
     param: torch.Tensor,
     loaded_weight: torch.Tensor,
@@ -190,8 +334,8 @@ def _copy_grouped_qkv_tp_shard(
         or getattr(param, "output_dim", None) != 0
         or getattr(param, "is_sharded_weight", False)
         or getattr(param, "packed_dim", None) is not None
-        or param.dtype != _BF16_DTYPE
-        or loaded_weight.dtype != _BF16_DTYPE
+        or param.dtype != loaded_weight.dtype
+        or param.dtype not in (_BF16_DTYPE, torch.float8_e4m3fn)
         or not param.is_contiguous()
         or not loaded_weight.is_contiguous()
     ):
@@ -257,8 +401,9 @@ def _modulate_gate(
     indices: torch.Tensor,
     *,
     dtype: torch.dtype,
+    allow_inplace: bool = True,
 ) -> torch.Tensor:
-    """Apply indexed gated residual, reusing disposable CUDA BF16 input."""
+    """Apply an indexed gated residual, optionally reusing the input buffer."""
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
         x.is_cuda
@@ -269,7 +414,9 @@ def _modulate_gate(
         and x.is_contiguous()
         and other.is_contiguous()
     ):
-        return indexed_gate_bf16_(x, gate, other, indices)
+        if allow_inplace:
+            return indexed_gate_bf16_(x, gate, other, indices)
+        return indexed_gate_bf16(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
@@ -305,6 +452,7 @@ def _apply_qk_norm(
         and q.stride(-2) == k.stride(-2) == head_dim
         and q_norm.eps == k_norm.eps
         and not torch.compiler.is_compiling()
+        and current_platform.is_cuda()
     ):
         fused_inplace_qknorm(
             q,
@@ -401,6 +549,18 @@ def _apply_rope_qk(
     return q, k
 
 
+def _apply_rope(
+    x: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the eager (non-CUDA) H3 RoPE path to one Q or K tensor."""
+    half = cos_sin_cache.shape[-1] // 2
+    cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
+    cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
+    sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
+    return _apply_rope_cos_sin(x, cos, sin)
+
+
 class MiniMaxH3TimeEmbedder(nn.Module):
     def __init__(
         self,
@@ -466,7 +626,9 @@ def _minimax_h3_attention_core_impl(
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
     ulysses_active: bool,
+    subblock_sparse_query_block_mask: torch.Tensor | None = None,
     ring_active: bool = False,
+    gate_compress: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
@@ -477,11 +639,14 @@ def _minimax_h3_attention_core_impl(
 
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
+            _usp_input_all_to_all,
             _usp_input_all_to_all_packed_qkv,
             _usp_output_all_to_all,
         )
 
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        if gate_compress is not None:
+            gate_compress = _usp_input_all_to_all(gate_compress[None], head_dim=2)[0]
 
     if os.environ.get("MINIMAX_H3_W28_CAPTURE", "").strip().lower() in {
         "1",
@@ -512,9 +677,30 @@ def _minimax_h3_attention_core_impl(
             get_attn_backend(
                 attention.head_dim,
                 q.dtype,
+                selected_attention_backend=attention._selected_attention_backend,
                 attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
+
+    if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+        attn_metadata = (
+            get_forward_context().attn_metadata
+            if attention.prefix.startswith("blocks.")
+            else None
+        )
+        out = attention._attention_impl.forward_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cu_seqlens_host=cu_seqlens_host,
+            attn_metadata=attn_metadata,
+            gate_compress=gate_compress,
+        )
+        if ulysses_active:
+            out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+        return out
 
     if ring_active:
         ring_ws, _ = get_ring_ctx()
@@ -529,19 +715,52 @@ def _minimax_h3_attention_core_impl(
             q,
             k,
             v,
-            softmax_scale=attention.softmax_scale,
+            attn_impl=attention._attention_impl,
             real_seq_len=max_seqlen,
             ring_ws=ring_ws,
         )
     else:
-        out = attention._attention_impl.forward_varlen(
-            q,
-            k,
-            v,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            cu_seqlens_host=cu_seqlens_host,
-        )
+        if (
+            attention._attention_backend_enum
+            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        ):
+            impl = attention._attention_impl
+            sparse_will_run = (
+                cu_seqlens_host is not None
+                and impl._sparse_ready(q, k)
+                and any(
+                    stop - start >= impl.schedule.min_seq_len
+                    for start, stop in zip(
+                        cu_seqlens_host[:-1],
+                        cu_seqlens_host[1:],
+                    )
+                )
+            )
+            if sparse_will_run and subblock_sparse_query_block_mask is None:
+                raise ValueError(
+                    "MiniMax H3 requires subblock_sparse_query_block_mask "
+                    "when SubBlock sparse attention is active"
+                )
+            out = attention._attention_impl.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
+                first_segment_sparse_query_block_mask=(
+                    subblock_sparse_query_block_mask
+                ),
+            )
+        else:
+            out = attention._attention_impl.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
+            )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out
@@ -558,6 +777,7 @@ class MiniMaxH3Attention(nn.Module):
         *,
         prefix: str,
         bcg_breakpoint: bool = True,
+        cube_sparse_capable: bool = True,
     ) -> None:
         super().__init__()
         self.bcg_breakpoint = bcg_breakpoint
@@ -576,6 +796,13 @@ class MiniMaxH3Attention(nn.Module):
         self.prefix = prefix
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
+        # attention initializes on the first real QKV tensors, after the
+        # component-loading context has ended; retain the transformer-scoped
+        # selection so a component override is not silently lost at runtime
+        self._selected_attention_backend = get_component_forced_attn_backend()
+        # Cube metadata describes only the packed multimodal sequence. The
+        # text-only token refiner must preserve the exact dense FA baseline.
+        self._cube_sparse_capable = cube_sparse_capable
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
         # matrix must be sharded independently; a plain ColumnParallelLinear
         # would instead slice across the concatenated tensor and is incorrect
@@ -589,7 +816,17 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        self._install_qkv_weight_loader(arch)
+        # Official safetensors interleave Q/K/V by head. Comfy and GGUF
+        # checkpoints already store [q_all, k_all, v_all].
+        checkpoint_qkv_is_native = quant_config is not None and (
+            quant_config.get_name() == "gguf"
+            or quant_config.checkpoint_uses_native_qkv_layout
+        )
+        checkpoint_qkv_is_native = (
+            checkpoint_qkv_is_native or arch.checkpoint_uses_diffusers_layout
+        )
+        if not checkpoint_qkv_is_native:
+            self._install_qkv_weight_loader(arch)
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         # cache width covers cos/sin for temporal, height, and width frequencies
@@ -614,8 +851,29 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
+        # VSA compression gate; stays bf16 and unquantized (zero gate == pure sparse).
+        self.to_gate_compress: ColumnParallelLinear | None = None
+        if arch.has_gate_compress and prefix.startswith("blocks."):
+            self.to_gate_compress = ColumnParallelLinear(
+                arch.hidden_size,
+                self.inner_dim,
+                bias=False,
+                gather_output=False,
+                params_dtype=_BF16_DTYPE,
+                quant_config=None,
+                prefix=f"{prefix}.to_gate_compress",
+            )
 
     def _set_attention_backend(self, backend) -> None:
+        if (
+            backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
+            and not self._cube_sparse_capable
+        ):
+            backend = get_attn_backend(
+                self.head_dim,
+                _BF16_DTYPE,
+                selected_attention_backend=AttentionBackendEnum.FA,
+            )
         impl_cls = backend.get_impl_cls()
         self._attention_impl = impl_cls(
             num_heads=self.num_heads,
@@ -624,6 +882,7 @@ class MiniMaxH3Attention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=self.num_heads,
             prefix=self.prefix,
+            packed_trailing_padding=True,
         )
         # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
         # the resolved enum alongside the impl instance instead of a second
@@ -632,15 +891,25 @@ class MiniMaxH3Attention(nn.Module):
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         weight = self.qkv_proj.weight
+        # h3 checkpoints interleave each attention head's Q, K, and V rows
+        # this parameter needs reordering before the native QKV projection
+        weight.checkpoint_mapping_unsafe = True
         base_loader = weight.weight_loader
 
-        def _reorder_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
-            return _reorder_grouped_qkv_to_qkv(
-                loaded_weight,
-                num_query_groups=arch.num_attention_heads,
-                heads_per_group=1,
-                head_dim=arch.attention_head_dim,
-            )
+        def _make_row_reorder(
+            head_dim: int,
+        ) -> Callable[[torch.Tensor], torch.Tensor]:
+            def _reorder(loaded_weight: torch.Tensor) -> torch.Tensor:
+                return _reorder_grouped_qkv_to_qkv(
+                    loaded_weight,
+                    num_query_groups=arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=head_dim,
+                )
+
+            return _reorder
+
+        _reorder_checkpoint_weight = _make_row_reorder(arch.attention_head_dim)
 
         def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
             # The grouped checkpoint layout is
@@ -665,17 +934,128 @@ class MiniMaxH3Attention(nn.Module):
         # rank-local FSDP must reorder grouped QKV before selecting each shard
         weight.rank_local_weight_transform = _reorder_checkpoint_weight
 
-        # 序列化 INT8 的 per-channel weight_scale 也要用与 weight 相同的行重排。
-        # 否则 weight 被重排成 [Q_all,K_all,V_all] 而 scale 仍按 grouped 布局加载，
-        # 每行 weight 与其 scale 大面积错位（见 docs/h3-int8-qkv-scale-layout-investigation.md，
-        # 实测 98.4% 行错位，MAE 45%）。
-        weight_scale = getattr(self.qkv_proj, "weight_scale", None)
-        if weight_scale is not None:
-            if hasattr(weight_scale, "_weight_loader"):
-                weight_scale._weight_loader = _weight_loader
-            else:
-                weight_scale.weight_loader = _weight_loader
-            weight_scale.rank_local_weight_transform = _reorder_checkpoint_weight
+        # A quantized checkpoint stores metadata indexed by output row next to the
+        # rows themselves (NVFP4 block scales, fp8 per-channel scales). Those rows
+        # are permuted above, so the per-row metadata has to be permuted the same
+        # way. Row count is the gate: a swizzled scale layout is not row-indexed,
+        # and per-tensor scales are scalars, so both are passed through untouched.
+        # A block-FP8 scale is row-indexed too, but in blocks rather than rows:
+        # it carries one row per block of weight rows, so both its permutation
+        # and the row count gating it are scaled down by the block height.
+        qkv_rows = 3 * arch.num_attention_heads * arch.attention_head_dim
+        block_rows = _qkv_scale_block_rows(self.qkv_proj, arch.attention_head_dim)
+        for name, param in self.qkv_proj.named_parameters(recurse=False):
+            if name == "weight":
+                continue
+            rows_per_scale_row = (
+                block_rows if isinstance(param, BlockQuantScaleParameter) else 1
+            )
+            _install_qkv_row_reorder(
+                param,
+                _make_row_reorder(arch.attention_head_dim // rows_per_scale_row),
+                qkv_rows // rows_per_scale_row,
+            )
+
+    def _forward_mps_streamed_attention(
+        self,
+        x: torch.Tensor,
+        *,
+        rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_host: tuple[int, ...] | None,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """Run MPS attention without materializing the full QKV activation.
+
+        H3's fused QKV output alone is roughly 1.45 GiB at 768px.  MPS shares
+        unified memory with the host, so retaining it alongside the packed
+        residual and SDPA workspace can evict the OS.  Build normalized K/V
+        once, then project Q a small chunk at a time and immediately consume it
+        through attention and the output projection.  The formula, weights,
+        and complete K/V context are unchanged; this is intentionally limited
+        to single-device MPS where Ulysses collectives are not active.
+        """
+        total = x.shape[0]
+        key = torch.empty(
+            (total, self.num_heads, self.head_dim), dtype=x.dtype, device=x.device
+        )
+        value = torch.empty_like(key)
+        cos_sin_cache = None if rope_cache is None else rope_cache[0]
+
+        # Do not retain Q while producing the K/V cache.  Dropping the chunk
+        # before the next transfer keeps only two full-width attention tensors.
+        for start in range(0, total, _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE):
+            stop = min(start + _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE, total)
+            qkv, _ = self.qkv_proj(x[start:stop])
+            q_chunk, k_chunk, v_chunk = qkv.split(self.local_inner_dim, dim=-1)
+            del q_chunk
+            k_chunk = self.k_norm(k_chunk.view(-1, self.num_heads, self.head_dim))
+            if cos_sin_cache is not None:
+                k_chunk = _apply_rope(k_chunk, cos_sin_cache[start:stop])
+            key[start:stop].copy_(k_chunk)
+            value[start:stop].copy_(v_chunk.view(-1, self.num_heads, self.head_dim))
+            del qkv, k_chunk, v_chunk
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+
+        if self._attention_impl is None:
+            self._set_attention_backend(
+                get_attn_backend(
+                    self.head_dim,
+                    x.dtype,
+                    attention_requirements=AttentionRequirements(packed_varlen=True),
+                )
+            )
+        bounds = (
+            cu_seqlens_host
+            if cu_seqlens_host is not None
+            else tuple(int(item) for item in cu_seqlens.tolist())
+        )
+        out = torch.empty_like(x)
+        for sequence_start, sequence_stop in zip(bounds[:-1], bounds[1:]):
+            if sequence_start == sequence_stop:
+                continue
+            keys = key[sequence_start:sequence_stop].unsqueeze(0)
+            values = value[sequence_start:sequence_stop].unsqueeze(0)
+            for start in range(
+                sequence_start,
+                sequence_stop,
+                _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE,
+            ):
+                stop = min(start + _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE, sequence_stop)
+                qkv, _ = self.qkv_proj(x[start:stop])
+                q_chunk, k_chunk, v_chunk = qkv.split(self.local_inner_dim, dim=-1)
+                del k_chunk, v_chunk
+                for query_start in range(
+                    start, stop, _MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE
+                ):
+                    query_stop = min(
+                        query_start + _MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE, stop
+                    )
+                    q = self.q_norm(
+                        q_chunk[query_start - start : query_stop - start].view(
+                            -1, self.num_heads, self.head_dim
+                        )
+                    )
+                    if cos_sin_cache is not None:
+                        q = _apply_rope(q, cos_sin_cache[query_start:query_stop])
+                    attention_out = self._attention_impl.forward(
+                        q.unsqueeze(0), keys, values, None
+                    )[0]
+                    projected, _ = self.out_proj(
+                        attention_out.reshape(
+                            query_stop - query_start, self.local_inner_dim
+                        )
+                    )
+                    out[query_start:query_stop].copy_(projected)
+                    del q, attention_out, projected
+                del qkv, q_chunk
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+
+        del key, value
+        torch.mps.empty_cache()
+        return out
 
     def forward(
         self,
@@ -685,6 +1065,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
+        subblock_sparse_query_block_mask: torch.Tensor | None = None,
         ulysses_active: bool = False,
         ring_active: bool = False,
     ) -> torch.Tensor:
@@ -699,6 +1080,15 @@ class MiniMaxH3Attention(nn.Module):
         so cu_seqlens retains global packed-document semantics. The inverse
         all-to-all restores the row shard before the output projection.
         """
+        if x.device.type == "mps" and not ulysses_active:
+            return self._forward_mps_streamed_attention(
+                x,
+                rope_cache=rope_cache,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+            )
+
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
@@ -739,6 +1129,14 @@ class MiniMaxH3Attention(nn.Module):
                 )
                 q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
 
+        gate_compress = None
+        if (
+            self._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+            and self.to_gate_compress is not None
+        ):
+            gate_flat, _ = self.to_gate_compress(x)
+            gate_compress = gate_flat.view(total, self.num_heads, self.head_dim)
+
         attention_core = (
             _minimax_h3_attention_core_bcg
             if self.bcg_breakpoint
@@ -752,8 +1150,10 @@ class MiniMaxH3Attention(nn.Module):
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
+            subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            gate_compress=gate_compress,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -791,12 +1191,30 @@ class MiniMaxH3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
         )
-        self.reuse_fc1_activation = quant_config is None
+        self.reuse_fc1_activation = quant_config is None or (
+            quant_config.get_name() == "gguf"
+        )
         self.use_fused_activation = os.environ.get(
             "MINIMAX_H3_DIT_FUSED_SILU_MUL", "1"
         ).strip().lower() not in {"0", "false", "no", "off"}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "mps":
+            out = torch.empty_like(x)
+            for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
+                stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
+                hidden, _ = self.fc1(x[start:stop])
+                hidden = _silu_mul(
+                    hidden,
+                    reuse_input=self.reuse_fc1_activation,
+                    use_fused_kernel=self.use_fused_activation,
+                )
+                chunk, _ = self.fc2(hidden)
+                out[start:stop].copy_(chunk)
+                del hidden, chunk
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+            return out
         hidden, _ = self.fc1(x)
         hidden = _silu_mul(
             hidden,
@@ -835,31 +1253,22 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
-        # 存表不存参数（默认）：不创建 linear，避免分配 26GB bf16 adaln 权重，
-        # 推理走离线调制表。仅当 MINIMAX_H3_LOAD_ADALN_WEIGHTS=1 时才创建 linear
-        # 回退到在线建表路径。
-        load_weights = os.environ.get(
-            "MINIMAX_H3_LOAD_ADALN_WEIGHTS", "0"
-        ).strip().lower() in ("1", "true", "yes", "on")
-        if load_weights:
-            self.linear = ColumnParallelLinear(
-                arch.time_embed_dim,
-                out_features,
-                bias=True,
-                gather_output=False,
-                params_dtype=_BF16_DTYPE,
-                quant_config=quant_config,
-                prefix=f"{prefix}.linear",
-            )
-        else:
-            self.linear = None
+        # Curve checkpoints store both the sampled curve and their reduced
+        # AdaLN projections in FP32. Preserve that precision island to match
+        # the published pruned implementation; these outputs intentionally do
+        # not enter the BF16-only fused modulation kernels.
+        params_dtype = _FP32_DTYPE if arch.adaln_curve_grid is not None else _BF16_DTYPE
+        self.linear = ColumnParallelLinear(
+            arch.time_embed_dim,
+            out_features,
+            bias=True,
+            gather_output=False,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear",
+        )
 
     def project_local(self, adaln_input: torch.Tensor) -> torch.Tensor:
-        if self.linear is None:
-            raise RuntimeError(
-                "adaln_proj.linear is None (offline table mode); "
-                "project_local is only valid with on-demand adaln weights."
-            )
         x, _ = self.linear(adaln_input)
         return x
 
@@ -869,7 +1278,7 @@ class MiniMaxH3AdalnProj(nn.Module):
         return tuple(x.chunk(self.expand_ratio, dim=-1))
 
     def forward(self, adaln_input: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """adaln_input: SiLU(t_emb) BF16 -> expand_ratio tensors of [M*modality_num, H]."""
+        """Project the post-SiLU embedding in its checkpoint-defined dtype."""
         x = self.project_local(adaln_input)
         if get_tp_world_size() > 1:
             x = tensor_model_parallel_all_gather(x)
@@ -896,6 +1305,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             quant_config,
             prefix=f"{prefix}.attn",
             bcg_breakpoint=False,
+            cube_sparse_capable=False,
         )
         self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
 
@@ -964,6 +1374,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        use_adaln_cache: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
@@ -974,15 +1385,19 @@ class MiniMaxH3DiTBlock(nn.Module):
             prefix=f"{prefix}.attn",
         )
         self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
-        self.adaln_proj = MiniMaxH3AdalnProj(
-            arch,
-            arch.adaln_out_features,
-            # AdaLN 保留 bf16：推理期「存表不存参数」（build_adaln_table 后 drop 权重）
-            None,
-            prefix=f"{prefix}.adaln_proj",
-            expand_ratio=6,
-            modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
+        self.adaln_proj = (
+            None
+            if use_adaln_cache
+            else MiniMaxH3AdalnProj(
+                arch,
+                arch.adaln_out_features,
+                quant_config,
+                prefix=f"{prefix}.adaln_proj",
+                expand_ratio=6,
+                modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
+            )
         )
+        self.preserve_input_for_cache_dit = False
 
     def forward(
         self,
@@ -994,6 +1409,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
+        subblock_sparse_query_block_mask: torch.Tensor | None = None,
         ulysses_active: bool = False,
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
@@ -1006,9 +1422,13 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm2 -> scale/shift -> MLP -> gated residual.
         """
         if adaln_params is None:
+            if self.adaln_proj is None:
+                raise ValueError("MiniMax H3 AdaLN cache parameters are required")
             adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
-
+        # Cache-DiT retains the inputs to its Fn and Mn block ranges. Only the
+        # first gated residual writes to that tensor; the second one operates on
+        # a block-local buffer.
         residual = x
         h = self.norm1(x)
         h = _modulate_scale_shift(
@@ -1020,10 +1440,18 @@ class MiniMaxH3DiTBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
+            subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
-        x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
+        x = _modulate_gate(
+            residual,
+            gate_msa,
+            h,
+            combined_indices,
+            dtype=_BF16_DTYPE,
+            allow_inplace=not self.preserve_input_for_cache_dit,
+        )
 
         residual = x
         h = self.norm2(x)
@@ -1031,8 +1459,14 @@ class MiniMaxH3DiTBlock(nn.Module):
             h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
         )
         h = self.mlp(h)
+        # `residual` is block-local here (see above), so this stays in-place
+        # even while Cache-DiT is attached.
         return _modulate_gate(
-            residual, gate_mlp, h, combined_indices, dtype=_BF16_DTYPE
+            residual,
+            gate_mlp,
+            h,
+            combined_indices,
+            dtype=_BF16_DTYPE,
         )
 
 
@@ -1043,6 +1477,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        use_adaln_cache: bool = False,
     ) -> None:
         super().__init__()
         video_patch_dim = (
@@ -1052,14 +1487,17 @@ class MiniMaxH3FinalLayer(nn.Module):
             * arch.patch_size[2]
         )
         self.norm = _norm(arch.hidden_size, eps=arch.final_norm_eps)
-        self.adaln_proj = MiniMaxH3AdalnProj(
-            arch,
-            arch.final_adaln_out_features,
-            # AdaLN 保留 bf16：推理期「存表不存参数」
-            None,
-            prefix=f"{prefix}.adaln_proj",
-            expand_ratio=2,
-            modality_num=1,
+        self.adaln_proj = (
+            None
+            if use_adaln_cache
+            else MiniMaxH3AdalnProj(
+                arch,
+                arch.final_adaln_out_features,
+                quant_config,
+                prefix=f"{prefix}.adaln_proj",
+                expand_ratio=2,
+                modality_num=1,
+            )
         )
         self.video_out = ColumnParallelLinear(
             arch.hidden_size,
@@ -1096,8 +1534,42 @@ class MiniMaxH3FinalLayer(nn.Module):
         preserving the GEMM shape while reducing collective payload.
         """
         if adaln_params is None:
+            if self.adaln_proj is None:
+                raise ValueError("MiniMax H3 AdaLN cache parameters are required")
             adaln_params = self.adaln_proj(adaln_input)
         shift, scale = adaln_params
+        if x.device.type == "mps":
+            video = audio = None
+            for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
+                stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
+                h = self.norm(x[start:stop])
+                h = _modulate_scale_shift(
+                    h,
+                    shift,
+                    scale,
+                    inverse_indices[start:stop],
+                    dtype=_BF16_DTYPE,
+                ).to(_FP32_DTYPE)
+                video_chunk, _ = self.video_out(h)
+                audio_chunk, _ = self.audio_out(h)
+                if video is None:
+                    video = torch.empty(
+                        (x.shape[0], video_chunk.shape[-1]),
+                        dtype=video_chunk.dtype,
+                        device=x.device,
+                    )
+                    audio = torch.empty(
+                        (x.shape[0], audio_chunk.shape[-1]),
+                        dtype=audio_chunk.dtype,
+                        device=x.device,
+                    )
+                video[start:stop].copy_(video_chunk)
+                audio[start:stop].copy_(audio_chunk)
+                del h, video_chunk, audio_chunk
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+            assert video is not None and audio is not None
+            return video, audio
         h = self.norm(x)
         h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
         # Preserve full precision through both final output projections.
@@ -1107,11 +1579,36 @@ class MiniMaxH3FinalLayer(nn.Module):
         return video, audio
 
 
+def _reject_adaln_lora(names: list[str]) -> None:
+    """Reject LoRA names touching adaln_proj; callers gate on cache mode.
+
+    Cache modes prune the adaln_proj modules, so these deltas have nothing to
+    attach to: they would be dropped without a trace while the rebuild keeps
+    reading base weights from the checkpoint.
+    """
+    adaln_names = sorted(name for name in names if "adaln_proj" in name)
+    if not adaln_names:
+        return
+    raise ValueError(
+        "MiniMax H3 AdaLN cache modes (--minimax-h3-adaln-online / "
+        "--minimax-h3-adaln-cache-path) cannot apply LoRA deltas on "
+        f"adaln_proj ({len(adaln_names)} name(s), e.g. {adaln_names[0]!r}); "
+        "serve this adapter with resident AdaLN weights"
+    )
+
+
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
+    _aliases = [
+        "MiniMaxH3Transformer3DModel",
+        "MiniMaxH3PrunedTransformer3DModel",
+    ]
     _fsdp_shard_conditions = [is_block]
+    # refine_prompt_embeds drives a forward pass outside __call__.
+    _fsdp_forward_methods = ("refine_prompt_embeds",)
     # parameters mix fp32 (patch projections, timestep embedder, and output
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
+    mps_stream_non_layer_weights = True
     _compile_conditions = [is_block]
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
@@ -1138,8 +1635,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         if parameter is None or parameter.device.type != "cuda":
             return False
 
-        # The CUDA kernel is shape-generic. One vector exercises the same
-        # rounded entry point as production without allocating an H3 activation.
+        # The CUDA kernel is shape-generic, so a single vector loads the same
+        # rounded entry point without allocating a production-sized activation.
         scratch = torch.zeros((1, 16), dtype=_BF16_DTYPE, device=parameter.device)
         if mlp.reuse_fc1_activation:
             silu_and_mul_with_activation_rounding_(scratch)
@@ -1149,9 +1646,161 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self._fused_mlp_activation_prewarmed = True
         return True
 
+    def prepare_lora_adapter(
+        self, adapter: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Project released-checkpoint AdaLN LoRAs onto pruned coordinates."""
+        _reject_non_lora_delta_tensors(adapter)
+        if self._adaln_precomputed:
+            _reject_adaln_lora(list(adapter))
+        full_width = self.arch.adaln_affine_input_dim
+        if full_width is None:
+            return adapter
+
+        suffix = ".adaln_proj.linear.lora_A"
+        a_keys = sorted(key for key in adapter if key.endswith(suffix))
+        if not a_keys:
+            return adapter
+        widths = {int(adapter[key].shape[-1]) for key in a_keys}
+        if widths == {self.arch.time_embed_dim}:
+            return adapter
+        if widths != {full_width}:
+            raise ValueError(
+                "MiniMax H3 pruned AdaLN LoRA inputs must be uniformly "
+                f"{self.arch.time_embed_dim} or {full_width} wide, got "
+                f"{sorted(widths)}."
+            )
+
+        basis = self.adaln_basis
+        mean = self.adaln_mean
+        assert basis is not None and mean is not None
+        if isinstance(basis, DTensor):
+            basis = basis.full_tensor()
+            mean = mean.full_tensor()
+        if torch.count_nonzero(basis).item() == 0:
+            raise ValueError(
+                "MiniMax H3 pruned LoRA projection requires adaln_basis and "
+                "adaln_mean from the component checkpoint."
+            )
+
+        projected = dict(adapter)
+        work_device = adapter[a_keys[0]].device
+        work_basis = basis.to(device=work_device, dtype=torch.float64)
+        work_mean = mean.to(device=work_device, dtype=torch.float64)
+        for a_key in a_keys:
+            b_key = a_key[: -len("lora_A")] + "lora_B"
+            if b_key not in adapter:
+                raise ValueError(f"MiniMax H3 AdaLN LoRA is missing {b_key!r}.")
+            a = adapter[a_key]
+            b = adapter[b_key]
+            a64 = a.to(torch.float64)
+            b64 = b.to(device=work_device, dtype=torch.float64)
+            projected[a_key] = (a64 @ work_basis.T).to(torch.float32)
+            projected[a_key[: -len("lora_A")] + "lora_output_offset"] = (
+                b64 @ (a64 @ work_mean)
+            ).to(torch.float32)
+
+        logger.info(
+            "Projected %d MiniMax H3 AdaLN LoRA modules from width %d to %d",
+            len(a_keys),
+            full_width,
+            self.arch.time_embed_dim,
+        )
+        return projected
+
+    def prepare_adaln_plans(
+        self, step_timesteps: list[torch.Tensor]
+    ) -> torch.Tensor | None:
+        """Fill the AdaLN cache for this request before denoising starts.
+
+        Returns the per-step slab slots as a device tensor (None without a
+        cache); forward consumes one scalar view per step so it never has to
+        match timesteps on device. A prebuilt sidecar only resolves slots; the
+        rebuild path needs the model's own timestep embedding so a filled plan
+        is bit-identical to what resident adaln_proj weights would have
+        produced.
+        """
+        cache = self.adaln_cache
+        if cache is None:
+            return None
+        # Keying costs one D2H sync per plan; compute the keys once and share
+        # them between build and resolve.
+        keys = [_adaln_plan_key(timesteps) for timesteps in step_timesteps]
+        if cache.weight_files is not None:
+
+            def embed(timesteps: torch.Tensor) -> torch.Tensor:
+                out = nn.functional.silu(self.time_embedder(timesteps))
+                # 'match' replicates forward's bf16 cast bit-exactly; 'fp32'
+                # keeps the embedding in fp32 for the one-time projection.
+                if cache.precision == "match":
+                    out = out.to(_BF16_DTYPE)
+                return out
+
+            cache.build(step_timesteps, embed=embed, keys=keys)
+        return cache.resolve_slots(step_timesteps, keys=keys)
+
+    def validate_lora_layers(self, layer_names: list[str]) -> None:
+        if self._adaln_precomputed:
+            _reject_adaln_lora(layer_names)
+
+    def validate_weight_update_source(self, *, weights_path: str | None) -> None:
+        """Reject a weight update the AdaLN cache cannot follow.
+
+        Runs before any weight is written: cached AdaLN outputs are derived
+        from adaln_proj, so an update this cache cannot follow would pair new
+        transformer weights with the previous checkpoint's conditioning.
+        """
+        cache = self.adaln_cache
+        if cache is None:
+            return
+        if cache.weight_files is None:
+            raise ValueError(
+                "MiniMax H3 was started with a prebuilt AdaLN sidecar "
+                "(--minimax-h3-adaln-cache-path), which is built offline from "
+                "the startup checkpoint and cannot be regenerated online; "
+                "rebuild the sidecar against the new weights and restart, or "
+                "serve with --minimax-h3-adaln-online"
+            )
+        if weights_path is None:
+            raise ValueError(
+                "MiniMax H3 --minimax-h3-adaln-online rebuilds AdaLN outputs "
+                "by streaming adaln_proj from a checkpoint directory, and a "
+                "tensor weight update carries no such directory (its "
+                "adaln_proj tensors have no resident modules to land in); "
+                "use update_weights_from_disk instead"
+            )
+        if not (
+            os.path.isdir(weights_path) and native_adaln_weight_files(weights_path)
+        ):
+            # The rebuild streams native tensor names; a Diffusers-layout or
+            # quantized export would defer a KeyError to the next request.
+            raise ValueError(
+                "MiniMax H3 --minimax-h3-adaln-online cannot retarget its "
+                f"AdaLN rebuild at {weights_path!r} (no native adaln_proj "
+                "safetensors there), and rebuilding from the original "
+                "checkpoint would serve stale conditioning"
+            )
+
+    def refresh_weight_derived_caches(self, *, weights_path: str | None) -> None:
+        """Drop cached AdaLN plans after a weight swap; retarget the rebuild.
+
+        Cached plans are weight-derived values; keeping them after an update
+        silently serves the previous checkpoint's conditioning.
+        """
+        cache = self.adaln_cache
+        if cache is None:
+            return
+        # validate_weight_update_source ran before the weights were written and
+        # rejected every source this cannot follow; anything else is a broken
+        # call order rather than a deployment the cache can degrade through.
+        self.validate_weight_update_source(weights_path=weights_path)
+        cache.weight_files = native_adaln_weight_files(weights_path)
+        cache.invalidate()
+
     def _can_batch_block_adaln(self) -> bool:
         return (
-            get_tp_world_size() > 1
+            self.adaln_cache is None
+            and get_tp_world_size() > 1
             and not torch.compiler.is_compiling()
             and not envs.SGLANG_CACHE_DIT_ENABLED
             and not hasattr(self, "_sglang_cache_dit_adapter")
@@ -1226,10 +1875,35 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         config: MiniMaxH3DiTConfig,
         hf_config: dict[str, Any],
         quant_config: QuantizationConfig | None = None,
+        adaln_cache_path: str | None = None,
+        adaln_cache_model_variant: str | None = None,
+        adaln_cache_provenance: dict[str, str] | None = None,
+        adaln_weight_files: list[str] | None = None,
+        adaln_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
+        adaln_max_plans: int = 64,
+        adaln_host_cache_bytes: int = 0,
+        adaln_precision: str = "match",
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
+        if (
+            adaln_cache_path is not None or adaln_weight_files is not None
+        ) and quant_config is not None:
+            raise ValueError(
+                "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
+            )
+        if arch.adaln_curve_grid is not None and (
+            adaln_cache_path is not None or adaln_weight_files is not None
+        ):
+            raise ValueError(
+                "MiniMax H3 pruned curve checkpoints cannot use a separate AdaLN cache"
+            )
+        self._adaln_precomputed = (
+            adaln_cache_path is not None or adaln_weight_files is not None
+        )
         self.arch = arch
+        if arch.checkpoint_uses_diffusers_layout:
+            self.preprocess_loaded_state_dict = _diffusers_h3_checkpoint
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim
@@ -1270,19 +1944,51 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             bias=True,
             gather_output=True,
             params_dtype=_BF16_DTYPE,
-            # 文本条件投影保留全精度（官方 int8 release 一致：condition projection 不量化）
-            quant_config=None,
+            quant_config=quant_config,
             prefix="condition_proj",
         )
-        self.time_embedder = MiniMaxH3TimeEmbedder(
-            arch,
-            prefix="time_embedder",
-        )
+        if arch.adaln_curve_grid is None:
+            self.time_embedder = MiniMaxH3TimeEmbedder(
+                arch,
+                prefix="time_embedder",
+            )
+            self.register_parameter("adaln_t_table", None)
+        else:
+            self.time_embedder = None
+            self.adaln_t_table = nn.Parameter(
+                torch.empty(
+                    arch.adaln_curve_grid,
+                    arch.time_embed_dim,
+                    dtype=_FP32_DTYPE,
+                ),
+                requires_grad=False,
+            )
+        if arch.adaln_affine_input_dim is None:
+            self.register_parameter("adaln_basis", None)
+            self.register_parameter("adaln_mean", None)
+        else:
+            self.register_parameter(
+                "adaln_basis",
+                nn.Parameter(
+                    torch.empty(
+                        arch.time_embed_dim,
+                        arch.adaln_affine_input_dim,
+                        dtype=_FP32_DTYPE,
+                    ),
+                    requires_grad=False,
+                ),
+            )
+            self.register_parameter(
+                "adaln_mean",
+                nn.Parameter(
+                    torch.empty(arch.adaln_affine_input_dim, dtype=_FP32_DTYPE),
+                    requires_grad=False,
+                ),
+            )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
-            # token refiner 保留全精度（官方 int8 release 一致：token refiner 不量化）
-            None,
+            quant_config,
             prefix="token_refiner",
         )
         self.blocks = nn.ModuleList(
@@ -1291,55 +1997,130 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     arch,
                     quant_config,
                     prefix=f"blocks.{index}",
+                    use_adaln_cache=self._adaln_precomputed,
                 )
                 for index in range(arch.num_layers)
             ]
         )
-        self.layer_names = ["blocks"]
+        self.layer_names = ["token_refiner.blocks", "blocks"]
         self.final_layer = MiniMaxH3FinalLayer(
             arch,
             quant_config,
             prefix="final_layer",
+            use_adaln_cache=self._adaln_precomputed,
+        )
+        self.adaln_cache = (
+            MiniMaxH3AdalnCache(
+                arch,
+                path=adaln_cache_path,
+                model_variant=adaln_cache_model_variant,
+                legacy_provenance=adaln_cache_provenance,
+                weight_files=adaln_weight_files,
+                max_plans=adaln_max_plans,
+                max_plan_width=adaln_plan_width,
+                host_cache_bytes=adaln_host_cache_bytes,
+                precision=adaln_precision,
+            )
+            if self._adaln_precomputed
+            else None
         )
         self._minimax_h3_teacache_state = MiniMaxH3TeaCacheState()
-        # Attention resolution is deferred until the first forward for BCG, but
-        # a component-specific selection only exists during model construction.
-        self._selected_attention_backend = (
-            get_global_forced_attn_backend() or get_component_forced_attn_backend()
+        # Component overrides disappear when the loader context exits. Preserve
+        # only that selection; process-wide overrides are resolved at first use.
+        self._component_attention_backend_override = (
+            claim_deferred_component_attn_backend()
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
-        # AdaLN 预计算调制表（存表不存参数）。build_adaln_table() 填充后 forward 走查表，
-        # drop_adaln_weights() 后 adaln_proj 权重被释放。
-        self._adaln_table: list[torch.Tensor] | None = None
-        self._adaln_final_table: torch.Tensor | None = None
-        self._adaln_timesteps: torch.Tensor | None = None
-        self._expected_adaln_adapter_identity: tuple[str, float] | None = None
-        self._loaded_adaln_adapter_identity: tuple[str, float] | None = None
-        artifact_config = getattr(quant_config, _ADALN_ARTIFACT_CONFIG_KEY, None)
-        if artifact_config is None:
-            artifact_config = hf_config.get(_ADALN_ARTIFACT_CONFIG_KEY)
-        self._adaln_artifact_config = (
-            dict(artifact_config) if isinstance(artifact_config, dict) else None
-        )
         self._mark_missing_params_required()
+
+    def _minimax_h3_teacache_config(
+        self,
+    ) -> tuple[int, int, float, int, int, list[float]] | None:
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return None
+        batch = forward_context.forward_batch
+        if batch is None or not bool(getattr(batch, "enable_teacache", False)):
+            return None
+        params = getattr(batch, "teacache_params", None)
+        if params is None:
+            raise ValueError("MiniMax H3 TeaCache parameters are missing")
+        if bool(getattr(batch, "do_classifier_free_guidance", False)):
+            raise ValueError(
+                "MiniMax H3 TeaCache requires its native single CFG branch"
+            )
+
+        extra = getattr(batch, "extra", {})
+        num_steps = int(
+            extra.get(
+                MINIMAX_H3_TEACACHE_NUM_STEPS_EXTRA_KEY,
+                getattr(batch, "num_inference_steps", 0),
+            )
+        )
+        if num_steps <= 0:
+            raise ValueError("MiniMax H3 TeaCache requires a positive step count")
+        step = int(forward_context.current_timestep)
+        start_skipping, end_skipping = params.get_skip_boundaries(num_steps, False)
+        return (
+            step,
+            num_steps,
+            float(params.teacache_thresh),
+            int(start_skipping),
+            int(end_skipping),
+            [float(value) for value in params.get_coefficients()],
+        )
+
+    def minimax_h3_teacache_summary(self) -> dict[str, object]:
+        return self._minimax_h3_teacache_state.summary()
+
+    def reset_minimax_h3_teacache(self) -> None:
+        self._minimax_h3_teacache_state.reset()
+
+    def set_cache_dit_input_preservation(self, enabled: bool) -> None:
+        """Stop the blocks from overwriting the input Cache-DiT holds by reference.
+
+        Cache-DiT snapshots the block-stack input to measure its residuals, so a
+        block that rewrites its own input in place makes that residual read as
+        zero. Only the first gated residual of a block writes the block input;
+        the second one operates on a buffer this block just allocated, so it is
+        left on the in-place fused path either way.
+
+        The caller owns the lifecycle. It has to be on before Cache-DiT mounts,
+        because mounting replaces `blocks` with a wrapper and the real blocks
+        stop being reachable by iterating it.
+        """
+        for block in self.blocks:
+            block.preserve_input_for_cache_dit = enabled
 
     def _resolve_attention_backend_once(self) -> None:
         if self._resolved_attention_backend is not None:
             return
+        selected_backend = (
+            get_global_forced_attn_backend()
+            or self._component_attention_backend_override
+        )
+        if selected_backend is None:
+            selected_backend = next(
+                (
+                    module._selected_attention_backend
+                    for module in self.modules()
+                    if isinstance(module, MiniMaxH3Attention)
+                    and module._selected_attention_backend is not None
+                ),
+                None,
+            )
         backend = get_attn_backend(
             self.arch.attention_head_dim,
             _BF16_DTYPE,
-            selected_attention_backend=self._selected_attention_backend,
+            selected_attention_backend=selected_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
         resolved_backend = backend.get_enum()
-        if (
-            self._selected_attention_backend is not None
-            and resolved_backend is not self._selected_attention_backend
-        ):
+        if selected_backend is not None and resolved_backend is not selected_backend:
             raise RuntimeError(
                 "MiniMax H3 attention backend fallback is disabled: requested "
-                f"{self._selected_attention_backend.name.lower()}, resolved "
+                f"{selected_backend.name.lower()}, resolved "
                 f"{resolved_backend.name.lower()}"
             )
         for module in self.modules():
@@ -1349,311 +2130,56 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
-            param.missing_param_init = "error"
+            # A quant method's create_weights() declares its own policy for scales
+            # it can synthesize (weight-only NVFP4 has no input_scale and marks it
+            # "ones"); claiming only undeclared params keeps that intact.
+            if getattr(param, "missing_param_init", None) is None:
+                param.missing_param_init = "error"
 
     def post_load_weights(self) -> None:
-        for name in _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER:
+        fp32_param_names = list(_MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER)
+        if self.adaln_t_table is not None:
+            fp32_param_names = [
+                name
+                for name in fp32_param_names
+                if not name.startswith("time_embedder.")
+            ]
+            fp32_param_names.append("adaln_t_table")
+            if self.adaln_basis is not None:
+                fp32_param_names.extend(("adaln_basis", "adaln_mean"))
+        for name in fp32_param_names:
             param = self.get_parameter(name)
             if param.dtype != _FP32_DTYPE:
                 raise ValueError(
                     f"{name} must stay fp32 after load, got {param.dtype}."
                 )
+        if self.adaln_t_table is not None:
+            for name, param in self.named_parameters():
+                if ".adaln_proj.linear." in name and param.dtype != _FP32_DTYPE:
+                    raise ValueError(
+                        f"{name} must stay fp32 with curve AdaLN, got {param.dtype}."
+                    )
         # assign=True loading may re-register this persistent buffer as a parameter
         rope_inv_freq = self.rope.inv_freq
         if rope_inv_freq.dtype != _FP32_DTYPE:
             raise ValueError(
                 f"rope.inv_freq must stay fp32 after load, got {rope_inv_freq.dtype}."
             )
+        if self.adaln_cache is not None:
+            self.adaln_cache.load(self.video_patch_proj.weight.device)
 
-    def build_adaln_table(self, timesteps: torch.Tensor) -> None:
-        """Precompute per-block AdaLN modulation for the distinct timesteps.
+    def _time_embedding(self, timesteps: torch.Tensor) -> torch.Tensor:
+        if self.adaln_t_table is None:
+            assert self.time_embedder is not None
+            return self.time_embedder(timesteps)
 
-        ``timesteps`` must be the sorted, deduplicated union of every distinct noise
-        level the schedule will present (target video/audio + conditioning levels).
-        The table is computed from the **unquantized** bf16 adaln projections through
-        the fp32 timestep embedding, matching the reference numerics; every block reads
-        the same ``temb``, so this path must stay exact.
-        """
-        if timesteps.ndim != 1:
-            raise ValueError(f"timesteps must be 1D, got {list(timesteps.shape)}")
-        device = self.video_patch_proj.weight.device
-        t_emb = self.time_embedder(timesteps.to(device=device, dtype=torch.float32))
-        adaln_input = torch.nn.functional.silu(t_emb).to(_BF16_DTYPE)
-        with torch.inference_mode():
-            self._adaln_table = []
-            for block in self.blocks:
-                output = block.adaln_proj.project_local(adaln_input)
-                if get_tp_world_size() > 1:
-                    output = tensor_model_parallel_all_gather(output)
-                self._adaln_table.append(output)
-            self._adaln_final_table = self.final_layer.adaln_proj.project_local(
-                adaln_input
-            )
-            if get_tp_world_size() > 1:
-                self._adaln_final_table = tensor_model_parallel_all_gather(
-                    self._adaln_final_table
-                )
-        self._adaln_timesteps = timesteps.to(device=device)
-
-    def set_expected_adaln_adapter_identity(
-        self, digest: str | None, scale: float | None
-    ) -> None:
-        if (digest is None) != (scale is None):
-            raise ValueError("AdaLN adapter digest and scale must be set together")
-        identity = None if digest is None else (digest, float(scale))
-        loaded = getattr(self, "_loaded_adaln_adapter_identity", None)
-        if getattr(self, "_adaln_table", None) is not None and loaded != identity:
-            raise ValueError(
-                "MiniMax H3 AdaLN adapter changed after the offline table was loaded: "
-                f"table={loaded!r}, requested={identity!r}"
-            )
-        self._expected_adaln_adapter_identity = identity
-
-    def load_adaln_table(self, path: str) -> None:
-        """Load a pre-built offline AdaLN table artifact (存表不存参数).
-
-        The artifact (built by scripts/build_adaln_table.py) holds the per-block
-        modulation ``blocks.{i}`` [T, 18H], ``final_layer`` [T, 2H] and the sorted
-        ``timesteps`` [T]. Loading it avoids loading the 26GB bf16 adaln projections
-        into GPU at all. ``path`` may be a safetensors file or a directory.
-        """
-        import os as _os
-
-        from safetensors import safe_open
-
-        if _os.path.isdir(path):
-            files = sorted(f for f in _os.listdir(path) if f.endswith(".safetensors"))
-            if len(files) != 1:
-                raise ValueError(
-                    f"adaln table dir must contain exactly one .safetensors, got {files}"
-                )
-            path = _os.path.join(path, files[0])
-
-        artifact_config = self._adaln_artifact_config
-        if artifact_config is None:
-            raise ValueError(
-                "checkpoint quantization_config is missing "
-                "minimax_h3_adaln_table provenance; "
-                "rebuild or stamp the INT8 checkpoint with build_int8_transformer.py"
-            )
-        expected_fingerprint = artifact_config.get("source_fingerprint")
-        if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
-            raise ValueError(
-                "checkpoint minimax_h3_adaln_table.source_fingerprint is missing"
-            )
-        if artifact_config.get("format_version") != _ADALN_ARTIFACT_FORMAT_VERSION:
-            raise ValueError(
-                "unsupported checkpoint AdaLN table format_version: "
-                f"{artifact_config.get('format_version')!r}; expected "
-                f"{_ADALN_ARTIFACT_FORMAT_VERSION!r}"
-            )
-        if artifact_config.get("table_layout") != _ADALN_ARTIFACT_LAYOUT:
-            raise ValueError(
-                "unsupported checkpoint AdaLN table layout: "
-                f"{artifact_config.get('table_layout')!r}; expected "
-                f"{_ADALN_ARTIFACT_LAYOUT!r}"
-            )
-
-        with safe_open(path, framework="pt", device="cpu") as handle:
-            metadata = handle.metadata() or {}
-            if metadata.get("format_version") != _ADALN_ARTIFACT_FORMAT_VERSION:
-                raise ValueError(
-                    "unsupported AdaLN table format_version: "
-                    f"{metadata.get('format_version')!r}; expected "
-                    f"{_ADALN_ARTIFACT_FORMAT_VERSION!r}"
-                )
-            if metadata.get("table_layout") != _ADALN_ARTIFACT_LAYOUT:
-                raise ValueError(
-                    "unsupported AdaLN table layout: "
-                    f"{metadata.get('table_layout')!r}; expected "
-                    f"{_ADALN_ARTIFACT_LAYOUT!r}"
-                )
-            actual_fingerprint = metadata.get("source_fingerprint")
-            if actual_fingerprint != expected_fingerprint:
-                raise ValueError(
-                    "AdaLN table source checkpoint mismatch: artifact has "
-                    f"{actual_fingerprint!r}, checkpoint expects "
-                    f"{expected_fingerprint!r}"
-                )
-            adapter_digest = metadata.get("adaln_adapter_sha256")
-            adapter_scale = metadata.get("adaln_adapter_scale")
-            if (adapter_digest is None) != (adapter_scale is None):
-                raise ValueError(
-                    "AdaLN table adapter metadata must contain both "
-                    "adaln_adapter_sha256 and adaln_adapter_scale"
-                )
-            table_adapter_identity = None
-            if adapter_digest is not None:
-                try:
-                    parsed_adapter_scale = float(adapter_scale)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        f"invalid AdaLN table adapter scale: {adapter_scale!r}"
-                    ) from exc
-                if not math.isfinite(parsed_adapter_scale) or parsed_adapter_scale <= 0:
-                    raise ValueError(
-                        "AdaLN table adapter scale must be positive and finite, got "
-                        f"{parsed_adapter_scale!r}"
-                    )
-                if metadata.get("adaln_adapter_application") != "table_delta":
-                    raise ValueError(
-                        "adapter-aware AdaLN table must declare table_delta application"
-                    )
-                expected_adapter_tensors = 2 * (len(self.blocks) + 1)
-                try:
-                    adapter_tensors = int(metadata.get("adaln_adapter_tensors", ""))
-                except ValueError as exc:
-                    raise ValueError(
-                        "invalid AdaLN table adapter tensor count: "
-                        f"{metadata.get('adaln_adapter_tensors')!r}"
-                    ) from exc
-                if adapter_tensors != expected_adapter_tensors:
-                    raise ValueError(
-                        "AdaLN table adapter tensor count mismatch: artifact has "
-                        f"{adapter_tensors}, expected {expected_adapter_tensors}"
-                    )
-                table_adapter_identity = (adapter_digest, parsed_adapter_scale)
-            elif (
-                metadata.get("adaln_adapter_application") is not None
-                or metadata.get("adaln_adapter_tensors") is not None
-            ):
-                raise ValueError(
-                    "base AdaLN table cannot declare adapter application metadata"
-                )
-            expected_adapter_identity = getattr(
-                self, "_expected_adaln_adapter_identity", None
-            )
-            if table_adapter_identity != expected_adapter_identity:
-                raise ValueError(
-                    "AdaLN table adapter mismatch: artifact has "
-                    f"{table_adapter_identity!r}, runtime expects "
-                    f"{expected_adapter_identity!r}"
-                )
-
-            required_keys = {
-                "timesteps",
-                "final_layer",
-                *(f"blocks.{i}" for i in range(len(self.blocks))),
-            }
-            actual_keys = set(handle.keys())
-            missing = sorted(required_keys - actual_keys)
-            if missing:
-                raise ValueError(f"adaln table missing tensors: {missing}")
-            unexpected = sorted(actual_keys - required_keys)
-            if unexpected:
-                raise ValueError(f"adaln table has unexpected tensors: {unexpected}")
-            timesteps = handle.get_tensor("timesteps")
-            block_tables = [
-                handle.get_tensor(f"blocks.{i}") for i in range(len(self.blocks))
-            ]
-            final_table = handle.get_tensor("final_layer")
-
-        if timesteps.ndim != 1 or timesteps.numel() == 0:
-            raise ValueError(
-                f"adaln timesteps must be non-empty 1D, got {list(timesteps.shape)}"
-            )
-        if timesteps.dtype != _FP32_DTYPE:
-            raise ValueError(f"adaln timesteps must be float32, got {timesteps.dtype}")
-        if timesteps.numel() > 1 and not bool(
-            torch.all(timesteps[1:] > timesteps[:-1])
-        ):
-            raise ValueError("adaln timesteps must be strictly increasing")
-        expected_block_width = self.arch.adaln_out_features
-        expected_final_width = self.arch.final_adaln_out_features
-        for index, table in enumerate(block_tables):
-            if table.dtype != _BF16_DTYPE:
-                raise ValueError(f"blocks.{index} must be bfloat16, got {table.dtype}")
-            if tuple(table.shape) != (timesteps.numel(), expected_block_width):
-                raise ValueError(
-                    f"blocks.{index} has shape {list(table.shape)}, expected "
-                    f"[{timesteps.numel()}, {expected_block_width}]"
-                )
-        if final_table.dtype != _BF16_DTYPE:
-            raise ValueError(f"final_layer must be bfloat16, got {final_table.dtype}")
-        if tuple(final_table.shape) != (timesteps.numel(), expected_final_width):
-            raise ValueError(
-                f"final_layer has shape {list(final_table.shape)}, expected "
-                f"[{timesteps.numel()}, {expected_final_width}]"
-            )
-        device = self.video_patch_proj.weight.device
-        self._adaln_timesteps = timesteps.to(device=device, dtype=torch.float32)
-        self._adaln_table = [
-            table.to(device=device, dtype=_BF16_DTYPE) for table in block_tables
-        ]
-        self._adaln_final_table = final_table.to(device=device, dtype=_BF16_DTYPE)
-        self._loaded_adaln_adapter_identity = table_adapter_identity
-
-    def drop_adaln_weights(self) -> int:
-        """Delete the per-block and final AdaLN projections after the table is built.
-
-        Returns the number of **bytes** freed (device memory reclaimed on next
-        ``torch.cuda.empty_cache``). Only safe once ``build_adaln_table`` has covered
-        the whole schedule.
-        """
-        freed = 0
-        before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
-        for block in self.blocks:
-            linear = block.adaln_proj.linear
-            if linear is None:
-                continue
-            for param in list(linear.parameters()):
-                freed += param.numel() * param.element_size()
-            block.adaln_proj.linear = None
-        final_linear = self.final_layer.adaln_proj.linear
-        if final_linear is not None:
-            for param in list(final_linear.parameters()):
-                freed += param.numel() * param.element_size()
-            self.final_layer.adaln_proj.linear = None
-        import gc
-
-        gc.collect()
-        torch.cuda.empty_cache()
-        after = torch.cuda.memory_allocated()
-        print(
-            f"[drop_adaln_weights] bytes_freed={freed / 1e9:.2f}GB "
-            f"cuda_alloc {before / 1e9:.2f} -> {after / 1e9:.2f} GB",
-            flush=True,
-        )
-        return freed
-
-    def _adaln_global_indices(self, unique_timesteps: torch.Tensor) -> torch.Tensor:
-        """Map each distinct per-step timestep to its row in the global table."""
-        if self._adaln_timesteps is None:
-            raise RuntimeError("AdaLN table not built")
-        requested = unique_timesteps.to(
-            device=self._adaln_timesteps.device,
-            dtype=self._adaln_timesteps.dtype,
-        )
-        indices = torch.searchsorted(self._adaln_timesteps, requested)
-        if bool(torch.any(indices >= self._adaln_timesteps.numel())):
-            raise ValueError("AdaLN table does not contain every requested timestep")
-        matched = self._adaln_timesteps.index_select(0, indices)
-        if not torch.equal(matched, requested):
-            raise ValueError("AdaLN table does not contain every requested timestep")
-        return indices
-
-    def _prepare_block_adaln_params(
-        self,
-        adaln_input: torch.Tensor,
-        adaln_global_idx: torch.Tensor | None,
-    ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
-        blocks = getattr(self, "_sglang_cache_dit_original_blocks", self.blocks)
-        if self._adaln_table is not None:
-            assert adaln_global_idx is not None
-            return tuple(
-                block.adaln_proj.split_output(table.index_select(0, adaln_global_idx))
-                for block, table in zip(blocks, self._adaln_table, strict=True)
-            )
-        if not self._can_batch_block_adaln():
-            return None
-        local_adaln = torch.stack(
-            [block.adaln_proj.project_local(adaln_input) for block in blocks]
-        )
-        gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
-        return tuple(
-            block.adaln_proj.split_output(output)
-            for block, output in zip(blocks, gathered_adaln, strict=True)
-        )
+        grid = self.adaln_t_table.shape[0]
+        position = timesteps.to(_FP32_DTYPE).clamp(0, 1) * (grid - 1)
+        lower = position.floor().clamp(max=grid - 2).to(torch.long)
+        fraction = (position - lower).unsqueeze(-1)
+        lower_value = self.adaln_t_table.index_select(0, lower)
+        upper_value = self.adaln_t_table.index_select(0, lower + 1)
+        return torch.lerp(lower_value, upper_value, fraction)
 
     @staticmethod
     def _pos_ids(pos_info: Any, key: str) -> torch.Tensor:
@@ -1689,6 +2215,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         device: torch.device,
     ) -> torch.Tensor:
         """Project and refine request-static text conditioning once."""
+        self.materialize_mps_non_layer_weights(
+            "condition_proj", "token_refiner.final_norm"
+        )
         text_len = int(refiner_cu_seqlens[1].item())
         if text_len <= 0 or text_len > int(prompt_embeds.shape[0]):
             raise ValueError(
@@ -1704,12 +2233,14 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
         )
         text_embed, _ = self.condition_proj(text_rows)
-        return self.token_refiner(
+        refined = self.token_refiner(
             text_embed,
             cu_seqlens=true_refiner_cu,
             cu_seqlens_host=(0, text_len, text_len),
             max_seqlen=text_len,
         )
+        self.release_mps_non_layer_weights("condition_proj", "token_refiner.final_norm")
+        return refined
 
     def build_rope_cache(
         self,
@@ -1724,6 +2255,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         chunk) -- see forward()'s row_start derivation for the identity
         this must stay in sync with.
         """
+        self.materialize_mps_non_layer_weights("rope")
         if img_position_ids.dim() != 3 or img_position_ids.shape[0] != 1:
             raise ValueError(
                 "img_position_ids must be [1, S, 3], got "
@@ -1745,7 +2277,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         rope_freqs = self.rope(
             img_position_ids[:, row_start : row_start + local_seq_len]
         ).to(device)
-        return (
+        result = (
             _rope_cos_sin_cache(rope_freqs, dtype=_BF16_DTYPE),
             torch.arange(
                 local_seq_len,
@@ -1753,6 +2285,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 dtype=torch.long,
             ),
         )
+        self.release_mps_non_layer_weights("rope")
+        return result
 
     @eager_on_graph(True)
     def _embed(
@@ -1902,52 +2436,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 audio_embed.to(_BF16_DTYPE),
             )
 
-        t_emb = self.time_embedder(unique_timesteps)
+        t_emb = self._time_embedding(unique_timesteps)
         return embeddings, t_emb
-
-    def _minimax_h3_teacache_config(
-        self,
-    ) -> tuple[int, int, float, int, int, list[float]] | None:
-        try:
-            forward_context = get_forward_context()
-        except AssertionError:
-            return None
-        batch = forward_context.forward_batch
-        if batch is None or not bool(getattr(batch, "enable_teacache", False)):
-            return None
-        params = getattr(batch, "teacache_params", None)
-        if params is None:
-            raise ValueError("MiniMax H3 TeaCache parameters are missing")
-        if bool(getattr(batch, "do_classifier_free_guidance", False)):
-            raise ValueError(
-                "MiniMax H3 TeaCache requires its native single CFG branch"
-            )
-
-        extra = getattr(batch, "extra", {})
-        num_steps = int(
-            extra.get(
-                MINIMAX_H3_TEACACHE_NUM_STEPS_EXTRA_KEY,
-                getattr(batch, "num_inference_steps", 0),
-            )
-        )
-        if num_steps <= 0:
-            raise ValueError("MiniMax H3 TeaCache requires a positive step count")
-        step = int(forward_context.current_timestep)
-        start_skipping, end_skipping = params.get_skip_boundaries(num_steps, False)
-        return (
-            step,
-            num_steps,
-            float(params.teacache_thresh),
-            int(start_skipping),
-            int(end_skipping),
-            [float(value) for value in params.get_coefficients()],
-        )
-
-    def minimax_h3_teacache_summary(self) -> dict[str, object]:
-        return self._minimax_h3_teacache_state.summary()
-
-    def reset_minimax_h3_teacache(self) -> None:
-        self._minimax_h3_teacache_state.reset()
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
@@ -1974,6 +2464,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             _required_kwarg(kwargs, "inverse_indices").view(-1).to(torch.long)
         )
         update_mask = _required_kwarg(kwargs, "update_mask")
+        subblock_sparse_query_block_mask = kwargs.get(
+            "subblock_sparse_query_block_mask"
+        )
         block_token_tags = kwargs.get("block_token_tags")
         token_tags = kwargs.get("token_tags")
         if block_token_tags is None:
@@ -2036,6 +2529,10 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}"
             )
         device = x.device
+        if subblock_sparse_query_block_mask is not None and not isinstance(
+            subblock_sparse_query_block_mask, torch.Tensor
+        ):
+            raise ValueError("subblock_sparse_query_block_mask must be a tensor")
         self._resolve_attention_backend_once()
 
         # Row split is 2D: ring first (an outer, contiguous ring_chunk_len
@@ -2072,6 +2569,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # request-static cache once; direct model callers use this fallback.
         rope_cache = kwargs.get("rope_cache")
         if rope_cache is None:
+            self.materialize_mps_non_layer_weights("rope")
             rope_freqs = self.rope(img_position_ids[:, row_start:row_stop]).to(device)
             rope_cache = (
                 _rope_cos_sin_cache(rope_freqs, dtype=_BF16_DTYPE),
@@ -2081,6 +2579,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     dtype=torch.long,
                 ),
             )
+            self.release_mps_non_layer_weights("rope")
+        self.materialize_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
         img_pos = img_pos.to(device)
         audio_pos = audio_pos.to(device)
         text_pos = text_pos.to(device)
@@ -2101,8 +2601,13 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
             local_embedding_layout=kwargs.get("local_embedding_layout"),
         )
+        self.release_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
         # request-step AdaLN input shared by all blocks
-        adaln_input = nn.functional.silu(t_emb).to(_BF16_DTYPE)
+        adaln_input = (
+            t_emb
+            if self.adaln_t_table is not None
+            else nn.functional.silu(t_emb).to(_BF16_DTYPE)
+        )
         inverse_indices = inverse_indices.to(device)
         block_inverse = inverse_indices[row_start:row_stop]
         if block_token_tags is None:
@@ -2126,12 +2631,29 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
-        adaln_global_idx: torch.Tensor | None = None
-        if self._adaln_table is not None:
-            adaln_global_idx = self._adaln_global_indices(unique_timesteps)
-        block_adaln_params = self._prepare_block_adaln_params(
-            adaln_input, adaln_global_idx
-        )
+        block_adaln_params = None
+        adaln_cache_plan_index = None
+        if self.adaln_cache is not None:
+            # prepare_adaln_plans resolved the slot on the host; the device
+            # lookup remains for callers that drive forward() directly.
+            adaln_cache_plan_index = kwargs.get("adaln_cache_slot")
+            if adaln_cache_plan_index is None:
+                adaln_cache_plan_index = self.adaln_cache.lookup(
+                    unique_timesteps.view(-1).to(device)
+                )
+            block_adaln_params = self.adaln_cache.block_all(
+                cache_plan_index=adaln_cache_plan_index,
+                num_timesteps=adaln_input.shape[0],
+            )
+        elif self._can_batch_block_adaln():
+            local_adaln = torch.stack(
+                [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
+            )
+            gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
+            block_adaln_params = tuple(
+                block.adaln_proj.split_output(output)
+                for block, output in zip(self.blocks, gathered_adaln)
+            )
         cache_dit_grouped_blocks = hasattr(self, "_sglang_cache_dit_original_blocks")
         local_valid_rows = max(
             0,
@@ -2192,8 +2714,6 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # else, including the final layer, is row-local. Only the narrow
         # video/audio logits are gathered after the final layer.
         if teacache_should_compute:
-            # The fused indexed gates mutate their residual input. Preserve the
-            # real block-stack input so the cached output delta is well-defined.
             if teacache_config is not None:
                 hidden = decoder_input.clone()
             for index, block in enumerate(self.blocks):
@@ -2205,6 +2725,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     cu_seqlens=cu_seqlens,
                     cu_seqlens_host=cu_seqlens_host,
                     max_seqlen=max_seqlen,
+                    subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
                     ulysses_active=ulysses_ws > 1,
                     ring_active=ring_ws > 1,
                     adaln_params=(
@@ -2240,17 +2761,21 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     "MiniMax H3 TeaCache residual is missing or has a stale shape"
                 )
             hidden = decoder_input + previous_residual
-        final_adaln_params = None
-        if self._adaln_final_table is not None:
-            final_adaln_params = self.final_layer.adaln_proj.split_output(
-                self._adaln_final_table.index_select(0, adaln_global_idx)
-            )
+        self.materialize_mps_non_layer_weights("final_layer")
         video_logits, audio_logits = self.final_layer(
             hidden,
             adaln_input=adaln_input,
             inverse_indices=block_inverse,
-            adaln_params=final_adaln_params,
+            adaln_params=(
+                None
+                if adaln_cache_plan_index is None
+                else self.adaln_cache.final(
+                    adaln_cache_plan_index,
+                    adaln_input.shape[0],
+                )
+            ),
         )
+        self.release_mps_non_layer_weights("final_layer")
         if sp_ws > 1:
             video_width = video_logits.shape[-1]
             logits = get_sp_group().all_gather(
@@ -2292,5 +2817,6 @@ __all__ = [
     "MINIMAX_H3_FP32_BUFFER_NAMES",
     "MINIMAX_H3_FP32_PARAM_NAMES",
     "MiniMaxH3DiTModel",
+    "_qkv_scale_block_rows",
     "_reorder_grouped_qkv_to_qkv",
 ]

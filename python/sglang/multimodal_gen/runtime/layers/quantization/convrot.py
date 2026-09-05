@@ -52,7 +52,9 @@ def build_hadamard(
     return h_normalized
 
 
-def rotate_weight(weight: torch.Tensor, h: torch.Tensor, group_size: int) -> torch.Tensor:
+def rotate_weight(
+    weight: torch.Tensor, h: torch.Tensor, group_size: int
+) -> torch.Tensor:
     """离线旋转权重：W_rot = W @ H^T（按 group 分组）。"""
     out_f, in_f = weight.shape
     if in_f % group_size != 0:
@@ -64,12 +66,16 @@ def rotate_weight(weight: torch.Tensor, h: torch.Tensor, group_size: int) -> tor
     return weight_rotated.reshape(out_f, in_f)
 
 
-def rotate_activation(x: torch.Tensor, h: torch.Tensor, group_size: int) -> torch.Tensor:
+def rotate_activation(
+    x: torch.Tensor, h: torch.Tensor, group_size: int
+) -> torch.Tensor:
     """在线旋转激活：x_rot = x @ H（按 group 分组）。"""
     orig_shape = x.shape
     features = orig_shape[-1]
     if features % group_size != 0:
-        raise ValueError(f"features {features} not divisible by group_size {group_size}")
+        raise ValueError(
+            f"features {features} not divisible by group_size {group_size}"
+        )
     n_groups = features // group_size
     x_grouped = x.reshape(-1, n_groups, group_size)
     h = h.to(dtype=x.dtype, device=x.device)

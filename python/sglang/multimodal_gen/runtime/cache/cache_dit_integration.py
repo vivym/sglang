@@ -21,6 +21,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+logger = init_logger(__name__)
+
 import cache_dit
 from cache_dit import (
     BlockAdapter,
@@ -34,8 +36,6 @@ from cache_dit.caching.block_adapters import BlockAdapterRegister
 from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
-
-logger = init_logger(__name__)
 
 _original_similarity = None
 
@@ -58,10 +58,14 @@ def _finite_tensor_summary(value: torch.Tensor) -> dict[str, float | int | str]:
         "nan_elements": int(torch.isnan(value).sum().item()),
         "inf_elements": int(torch.isinf(value).sum().item()),
         "finite_abs_max": (
-            float(finite_values.abs().max().item()) if finite_values.numel() else float("nan")
+            float(finite_values.abs().max().item())
+            if finite_values.numel()
+            else float("nan")
         ),
         "finite_abs_mean": (
-            float(finite_values.abs().mean().item()) if finite_values.numel() else float("nan")
+            float(finite_values.abs().mean().item())
+            if finite_values.numel()
+            else float("nan")
         ),
     }
 
@@ -276,6 +280,75 @@ def get_scm_mask(
     return mask
 
 
+# Keys accepted in SamplingParams.cache_dit_params; "secondary" nests the
+# DBCache knobs for the second transformer of dual-DiT models.
+CACHE_DIT_REQUEST_KNOB_KEYS = frozenset(
+    {
+        "Fn_compute_blocks",
+        "Bn_compute_blocks",
+        "max_warmup_steps",
+        "residual_diff_threshold",
+        "max_continuous_cached_steps",
+        "enable_taylorseer",
+        "taylorseer_order",
+    }
+)
+CACHE_DIT_REQUEST_SCM_KEYS = frozenset(
+    {
+        "scm_preset",
+        "scm_compute_bins",
+        "scm_cache_bins",
+        "scm_policy",
+    }
+)
+CACHE_DIT_REQUEST_PARAM_KEYS = (
+    CACHE_DIT_REQUEST_KNOB_KEYS | CACHE_DIT_REQUEST_SCM_KEYS | {"secondary"}
+)
+
+
+def resolve_cache_dit_request_overrides(raw: dict | None) -> dict:
+    """Validate cache_dit_params and return a copy; unknown keys fail the request."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"cache_dit_params must be a dict, got {type(raw).__name__}.")
+    unknown = set(raw) - CACHE_DIT_REQUEST_PARAM_KEYS
+    if unknown:
+        raise ValueError(
+            f"Unknown cache_dit_params keys: {sorted(unknown)}. "
+            f"Valid keys: {sorted(CACHE_DIT_REQUEST_PARAM_KEYS)}."
+        )
+    overrides = dict(raw)
+    secondary = overrides.get("secondary")
+    if secondary is not None:
+        if not isinstance(secondary, dict):
+            raise ValueError(
+                "cache_dit_params['secondary'] must be a dict, got "
+                f"{type(secondary).__name__}."
+            )
+        unknown = set(secondary) - CACHE_DIT_REQUEST_KNOB_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown cache_dit_params['secondary'] keys: {sorted(unknown)}. "
+                f"Valid keys: {sorted(CACHE_DIT_REQUEST_KNOB_KEYS)}."
+            )
+        overrides["secondary"] = dict(secondary)
+    return overrides
+
+
+def cache_dit_overrides_key(overrides: dict) -> tuple:
+    """Hashable snapshot of request overrides, for mount-change detection."""
+
+    def _freeze(value):
+        if isinstance(value, dict):
+            return tuple(sorted((k, _freeze(v)) for k, v in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(_freeze(v) for v in value)
+        return value
+
+    return _freeze(overrides)
+
+
 @dataclass
 class CacheDitConfig:
     """Configuration for cache-dit integration.
@@ -357,16 +430,26 @@ DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec]
 }
 
 
-# Custom BlockAdapter for DiT models absent from cache-dit's BlockAdapterRegister.
-# Value: (blocks attr, forward_pattern). forward_pattern must
-# match the block's forward signature (see cache_dit.ForwardPattern; e.g., ERNIE
-# uses Pattern_3). has_separate_cfg follows the run (passed by
-# enable_cache_on_transformer); cache-dit auto-resolves the remaining
-# fields.
-_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern]] = {
-    "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3),
-    "Krea2Transformer2DModel": ("transformer_blocks", ForwardPattern.Pattern_3),
-    "MiniMaxH3DiTModel": ("blocks", ForwardPattern.Pattern_3),
+@dataclass(frozen=True)
+class CustomBlockAdapterSpec:
+    blocks_attr: str
+    forward_pattern: ForwardPattern
+
+
+# Custom BlockAdapter metadata for models absent from cache-dit's registry.
+_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
+    "ErnieImageTransformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
+    "Krea2Transformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="transformer_blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
+    "MiniMaxH3DiTModel": CustomBlockAdapterSpec(
+        blocks_attr="blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
 }
 
 
@@ -447,14 +530,15 @@ class _MiniMaxH3CacheDitBlock(torch.nn.Module):
         )
         selected_adaln_params = adaln_params
         if adaln_params is not None:
-            if not isinstance(adaln_params, tuple) or len(adaln_params) != self.block_count:
+            if (
+                not isinstance(adaln_params, tuple)
+                or len(adaln_params) != self.block_count
+            ):
                 raise ValueError(
                     "Cache-DiT H3 grouped AdaLN parameters must contain exactly "
                     f"{self.block_count} block entries"
                 )
             selected_adaln_params = adaln_params[self.block_index]
-        # H3's fused gated residual updates its first argument in place. Cache-DiT
-        # needs the input at each residual-cache segment boundary to remain unchanged.
         block_input = (
             hidden_states.clone() if self.clone_input_before_forward else hidden_states
         )
@@ -513,21 +597,19 @@ def _build_custom_block_adapter(
     spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
     if spec is None:
         return None
-    blocks_attr, forward_pattern = spec
-    blocks = getattr(transformer, blocks_attr, None)
+    blocks = getattr(transformer, spec.blocks_attr, None)
     if blocks is None:
         raise ValueError(
             f"Transformer {transformer.__class__.__name__} has no attribute "
-            f"{blocks_attr!r} for cache-dit blocks."
+            f"{spec.blocks_attr!r} for cache-dit blocks."
         )
+    blocks_name = spec.blocks_attr
     if transformer.__class__.__name__ == "MiniMaxH3DiTModel" and isinstance(
         blocks, torch.nn.ModuleList
     ):
         block_count = len(blocks)
         segment_starts = (
-            {0, h3_fn_compute_blocks}
-            if h3_fn_compute_blocks is not None
-            else set()
+            {0, h3_fn_compute_blocks} if h3_fn_compute_blocks is not None else set()
         )
         blocks = torch.nn.ModuleList(
             _MiniMaxH3CacheDitBlock(
@@ -538,13 +620,11 @@ def _build_custom_block_adapter(
             )
             for index, block in enumerate(blocks)
         )
-        blocks_attr = "blocks"
-
     return BlockAdapter(
         transformer=transformer,
         blocks=blocks,
-        blocks_name=blocks_attr,
-        forward_pattern=forward_pattern,
+        blocks_name=blocks_name,
+        forward_pattern=spec.forward_pattern,
         has_separate_cfg=has_separate_cfg,
     )
 

@@ -213,7 +213,9 @@ def _qkv_snapshot_path(
         raise ValueError(f"{QKV_SNAPSHOT_PATH_ENV} must be an absolute path")
     path = path.resolve()
     if path == Path("/tmp") or Path("/tmp") in path.parents:
-        raise ValueError(f"{QKV_SNAPSHOT_PATH_ENV} must use persistent storage, not /tmp")
+        raise ValueError(
+            f"{QKV_SNAPSHOT_PATH_ENV} must use persistent storage, not /tmp"
+        )
     if path.suffix != ".safetensors":
         raise ValueError(f"{QKV_SNAPSHOT_PATH_ENV} must end in .safetensors")
     if max_samples != 1:
@@ -230,7 +232,9 @@ def _qkv_snapshot_dir(environment: Mapping[str, str]) -> Path | None:
         raise ValueError(f"{QKV_SNAPSHOT_DIR_ENV} must be an absolute path")
     path = path.resolve()
     if path == Path("/tmp") or Path("/tmp") in path.parents:
-        raise ValueError(f"{QKV_SNAPSHOT_DIR_ENV} must use persistent storage, not /tmp")
+        raise ValueError(
+            f"{QKV_SNAPSHOT_DIR_ENV} must use persistent storage, not /tmp"
+        )
     if path.exists() and not path.is_dir():
         raise ValueError(f"{QKV_SNAPSHOT_DIR_ENV} must be a directory")
     return path
@@ -665,12 +669,8 @@ def _write_qkv_snapshot(
         "sha256": _sha256(path),
         "format": "safetensors",
         "git_eligible": False,
-        "tensor_shapes": {
-            name: list(tensor.shape) for name, tensor in tensors.items()
-        },
-        "tensor_dtypes": {
-            name: str(tensor.dtype) for name, tensor in tensors.items()
-        },
+        "tensor_shapes": {name: list(tensor.shape) for name, tensor in tensors.items()},
+        "tensor_dtypes": {name: str(tensor.dtype) for name, tensor in tensors.items()},
     }
 
 
@@ -743,12 +743,8 @@ def _write_qkv_bundle(
         "schema_version": "2.0.0",
         "git_eligible": False,
         "q_block_starts": sorted(queries),
-        "tensor_shapes": {
-            name: list(tensor.shape) for name, tensor in tensors.items()
-        },
-        "tensor_dtypes": {
-            name: str(tensor.dtype) for name, tensor in tensors.items()
-        },
+        "tensor_shapes": {name: list(tensor.shape) for name, tensor in tensors.items()},
+        "tensor_dtypes": {name: str(tensor.dtype) for name, tensor in tensors.items()},
     }
 
 
@@ -766,7 +762,9 @@ def _write_full_qkv_snapshot(
     from safetensors.torch import save_file
 
     if query.ndim != 4 or query.shape != key.shape or query.shape != value.shape:
-        raise ValueError("full Q/K/V snapshot requires matching four-dimensional tensors")
+        raise ValueError(
+            "full Q/K/V snapshot requires matching four-dimensional tensors"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     partial_path = path.with_name(path.name + ".partial")
     if path.exists() or partial_path.exists():
@@ -816,12 +814,8 @@ def _write_full_qkv_snapshot(
         "format": "safetensors",
         "schema_version": "3.0.0",
         "git_eligible": False,
-        "tensor_shapes": {
-            name: list(tensor.shape) for name, tensor in tensors.items()
-        },
-        "tensor_dtypes": {
-            name: str(tensor.dtype) for name, tensor in tensors.items()
-        },
+        "tensor_shapes": {name: list(tensor.shape) for name, tensor in tensors.items()},
+        "tensor_dtypes": {name: str(tensor.dtype) for name, tensor in tensors.items()},
     }
 
 

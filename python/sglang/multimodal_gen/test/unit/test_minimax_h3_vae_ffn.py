@@ -16,9 +16,7 @@ def test_fp16_gated_ffn_preserves_large_product_cancellation(monkeypatch):
     with torch.no_grad():
         module.w1.weight.zero_()
         module.w1.bias.fill_(512.0)
-        module.w2.weight.copy_(
-            torch.tensor([[1.0, -1.0], [-1.0, 1.0]], device="cuda")
-        )
+        module.w2.weight.copy_(torch.tensor([[1.0, -1.0], [-1.0, 1.0]], device="cuda"))
         module.w2.bias.fill_(7.0)
 
     inputs = torch.zeros((1, 2), device="cuda", dtype=torch.float16)

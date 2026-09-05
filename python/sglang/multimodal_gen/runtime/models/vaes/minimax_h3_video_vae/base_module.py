@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Transformer building blocks for the MiniMax H3 visual VAE ViT decoder.
+import functools
 import json
 import math
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -12,14 +14,14 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
-from sglang.kernels.ops.diffusion.triton.minimax_h3_vae import (
+from sglang.kernels.ops.diffusion import (
+    try_fused_scaled_residual_add_exact,
     try_mul_reduce_max_f32_exact,
     try_restore_scale_add_bias_f32_exact,
     try_scale_cast_f16_exact,
 )
-from sglang.kernels.ops.diffusion.triton.scale_shift import (
-    try_fused_scaled_residual_add_exact,
-)
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .attention import Attention
 from .vit_utils import _env_flag, _vit_torch_compile_kwargs
@@ -97,10 +99,11 @@ def flush_vae_ffn_probe() -> None:
             "max_abs_finite": float(stacked[:, offset + 2].amax().item()),
         }
 
-    if first_nonfinite is None:
-        selected: list[dict[str, object]] = []
-    else:
-        selected = materialized[max(0, first_nonfinite - 1) : first_nonfinite + 3]
+    selected = (
+        []
+        if first_nonfinite is None
+        else materialized[max(0, first_nonfinite - 1) : first_nonfinite + 3]
+    )
     summary = {
         "records": len(materialized),
         "first_nonfinite_record": first_nonfinite,
@@ -120,6 +123,33 @@ def _vit_norm_input(module, hidden_states):
 def _scaled_residual_add(residual, x, scale):
     fused = try_fused_scaled_residual_add_exact(residual, x, scale)
     return residual + x * scale if fused is None else fused
+
+
+@functools.lru_cache(maxsize=1)
+def _is_sm120() -> bool:
+    return bool(current_platform.is_sm120())
+
+
+def _unfused_bias_linear(
+    linear: nn.Linear, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """``linear`` as a plain matmul plus a separate bias add on SM12.x.
+
+    For the decoder's w2 shape ([~1800, 8192] x [8192, 2048], fp16/bf16) the
+    fused ``addmm`` epilogue makes cuBLAS on a GB10 pick a 16x16 wmma kernel
+    that runs at 14 TFLOPS; the same product without the fused bias runs at
+    76-91 TFLOPS (measured: 4.0 ms -> 0.8 ms per call, 3780 calls per decode).
+    """
+    if (
+        linear.bias is None
+        or not hidden_states.is_cuda
+        or hidden_states.dtype != linear.weight.dtype
+        or not _is_sm120()
+    ):
+        return linear(hidden_states)
+    out = torch.matmul(hidden_states, linear.weight.t())
+    out += linear.bias
+    return out
 
 
 class FeedForward(nn.Module):
@@ -152,6 +182,12 @@ class FeedForward(nn.Module):
             self.act_fn = nn.GELU(approximate="tanh")
         else:
             raise ValueError(f"Unsupported activation function: {activation_fn}")
+
+        self.silu_and_mul = (
+            SiluAndMul()
+            if use_gated and activation_fn == "silu" and current_platform.is_npu()
+            else None
+        )
 
         self.w2 = nn.Linear(inner_dim, dim_out, bias=bias)
         self._compile_forward_enabled = _env_flag(
@@ -191,23 +227,25 @@ class FeedForward(nn.Module):
         product_unscaled_stats = None
 
         if self.use_gated:
-            if (
+            fp32_product = _env_flag("MINIMAX_H3_VAE_FFN_FP32_ACT", "1")
+            if self.silu_and_mul is not None:
+                hidden_states = self.silu_and_mul(hidden_states)
+                if probe_enabled:
+                    product_unscaled_stats = _deferred_probe_stats(hidden_states)
+            elif (
                 isinstance(self.act_fn, nn.SiLU)
                 and hidden_states.is_cuda
                 and hidden_states.dtype in (torch.float16, torch.bfloat16)
                 and hidden_states.is_contiguous()
                 and hidden_states.shape[-1] % 32 == 0
-                and not _env_flag("MINIMAX_H3_VAE_FFN_FP32_ACT", "1")
+                and not fp32_product
             ):
                 hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
                 if probe_enabled:
                     product_unscaled_stats = _deferred_probe_stats(hidden_states)
             else:
                 gate, hidden_states = hidden_states.chunk(2, dim=-1)
-                # H3's fp16 decode can produce |gate| and |value| in the hundreds.
-                # Keep their product in fp32, then power-of-two scale each token
-                # before w2. This preserves cancellation inside the fp16 GEMM.
-                if _env_flag("MINIMAX_H3_VAE_FFN_FP32_ACT", "1"):
+                if fp32_product:
                     activation_dtype = hidden_states.dtype
                     gate_fp32 = self.act_fn(gate.float())
                     if _env_flag("MINIMAX_H3_VAE_FFN_FP32_PRODUCT_SCALE", "1"):
@@ -215,9 +253,7 @@ class FeedForward(nn.Module):
                         if (
                             activation_dtype == torch.float16
                             and not probe_enabled
-                            and _env_flag(
-                                "MINIMAX_H3_VAE_FFN_FUSED_SCALE_CAST", "1"
-                            )
+                            and _env_flag("MINIMAX_H3_VAE_FFN_FUSED_SCALE_CAST", "1")
                         ):
                             fused_product = try_mul_reduce_max_f32_exact(
                                 gate_fp32, hidden_states
@@ -233,16 +269,12 @@ class FeedForward(nn.Module):
                             )
                         if activation_dtype == torch.float16:
                             if max_abs is None:
-                                max_abs = hidden_states.detach().abs().amax(
-                                    dim=-1, keepdim=True
+                                max_abs = (
+                                    hidden_states.detach()
+                                    .abs()
+                                    .amax(dim=-1, keepdim=True)
                                 )
-                            if _env_flag(
-                                "MINIMAX_H3_VAE_FFN_OUTPUT_BOUND_SCALE", "0"
-                            ):
-                                # Bound each w2 dot product by
-                                # ||input||_inf * max_row(||weight||_1). The
-                                # half-range output limit leaves margin for
-                                # FP16 input rounding and FP32 accumulation.
+                            if _env_flag("MINIMAX_H3_VAE_FFN_OUTPUT_BOUND_SCALE", "0"):
                                 ratio = (
                                     max_abs
                                     * self._get_fp16_w2_output_bound()
@@ -267,8 +299,6 @@ class FeedForward(nn.Module):
                         else:
                             hidden_states = hidden_states.to(activation_dtype)
                     else:
-                        # Diagnostic control that reproduces the previous partial
-                        # fix: SiLU was fp32, but the product was still fp16.
                         hidden_states = gate_fp32.to(activation_dtype).mul_(
                             hidden_states
                         )
@@ -289,20 +319,12 @@ class FeedForward(nn.Module):
         w2_input = hidden_states
         w2_input_stats = _deferred_probe_stats(w2_input) if probe_enabled else None
         if fp16_restore_scale is None:
-            hidden_states = self.w2(w2_input)
+            hidden_states = _unfused_bias_linear(self.w2, w2_input)
             if probe_enabled:
                 w2_linear_stats = _deferred_probe_stats(hidden_states)
-                restore_scale_stats = _deferred_probe_stats(
-                    hidden_states.new_ones(())
-                )
+                restore_scale_stats = _deferred_probe_stats(hidden_states.new_ones(()))
         else:
-            # The bias is not part of the scaled linear term. Restore the token
-            # scale in fp32, then add the unscaled bias exactly once. Keep the
-            # result in fp32: casting a finite restored value above 65504 back
-            # to fp16 would recreate the overflow this path is meant to avoid.
-            w2_linear = torch.nn.functional.linear(
-                w2_input, self.w2.weight, bias=None
-            )
+            w2_linear = torch.nn.functional.linear(w2_input, self.w2.weight, bias=None)
             if probe_enabled:
                 w2_linear_stats = _deferred_probe_stats(w2_linear)
                 restore_scale_stats = _deferred_probe_stats(fp16_restore_scale)
@@ -424,7 +446,10 @@ class RotaryEmbeddingND(nn.Module):
         if D != self.n_dim:
             raise ValueError(f"Expected {self.n_dim} dimensions, got {D}")
 
-        with torch.autocast("cuda", enabled=False):
+        autocast_context = (
+            torch.autocast("cuda", enabled=False) if img_ids.is_cuda else nullcontext()
+        )
+        with autocast_context:
             angles = (
                 self.angle_scale
                 * img_ids[:, :, :, None]
@@ -507,12 +532,11 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states: torch.FloatTensor,
         rotary_pos_emb: Optional[torch.FloatTensor] = None,
-        pack_info: dict = {},
     ):
         norm_hidden_states = self.norm1(_vit_norm_input(self.norm1, hidden_states)).to(
             hidden_states.dtype
         )
-        attn_output = self.attn(norm_hidden_states, rotary_pos_emb, pack_info)
+        attn_output = self.attn(norm_hidden_states, rotary_pos_emb)
         if self.use_scale:
             hidden_states = _scaled_residual_add(
                 hidden_states, attn_output, self.scale1

@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler_ancestral import (
     _minimax_h3_euler_eta0_step,
     _minimax_h3_rf_v_to_x0,
@@ -31,6 +33,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
     MiniMaxH3DenoisingStage,
+    _build_cube_attn_metadata,
+    _minimax_h3_nsys_capture,
+    _precompute_refined_prompt_embeds,
     _resolve_debug_latent_dump_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
@@ -213,11 +218,8 @@ def test_inplace_res_multistep_update_matches_reference_math():
         torch.tensor(1.0 - sigmas[1]),
     )
     sigma_ratio = torch.tensor(sigmas[2] / sigmas[1])
-    # This is deliberately left-associative to match the pinned upstream
-    # res_multistep expression, including its fp32 rounding points.
-    expected = (
-        sigma_ratio * state + hb1 * denoised + hb2 * previous_denoised
-    )
+    # Preserve the reference implementation's left-associative fp32 order.
+    expected = sigma_ratio * state + hb1 * denoised + hb2 * previous_denoised
 
     actual = state.clone()
     denoised_scratch = torch.empty_like(actual)
@@ -236,18 +238,25 @@ def test_inplace_res_multistep_update_matches_reference_math():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+class _TinyDenoiseModel:
+    def __init__(self, branch: MiniMaxH3DenoiseBranch):
+        self.branch = branch
+
+    def prepare_adaln_plans(self, _timesteps):
+        return None
+
+    def __call__(self, **kwargs):
+        video_state = kwargs["x"][0].index_select(0, self.branch.img_target_seq_idx)
+        audio_state = kwargs["audio_x"][0].index_select(0, self.branch.audio_pos_dev)
+        return video_state.square().mul(0.025).add(0.01), audio_state.mul(-0.15)
+
+
 def _run_tiny_loop(*, sampler_mode: str | None, video_sigmas, audio_sigmas):
     branch = _branch("t2va")
     video = torch.linspace(-1.0, 1.0, branch.img_pos.numel() * 96).reshape(-1, 96)
     audio = torch.linspace(-0.5, 0.5, branch.audio_pos.numel() * 32).reshape(-1, 32)
-
-    def model(**kwargs):
-        video_state = kwargs["x"][0].index_select(0, branch.img_target_seq_idx)
-        audio_state = kwargs["audio_x"][0].index_select(0, branch.audio_pos_dev)
-        return video_state.square().mul(0.025).add(0.01), audio_state.mul(-0.15)
-
     kwargs = dict(
-        model=model,
+        model=_TinyDenoiseModel(branch),
         positive=branch,
         initial_video_rows=video,
         initial_audio_rows=audio,
@@ -298,12 +307,12 @@ def test_res_multistep_full_loop_matches_independent_modality_recurrences():
     video_sigmas = [1.0, 0.82, 0.51, 0.23, 0.0]
     audio_sigmas = [1.0, 0.61, 0.29, 0.08, 0.0]
     branch = _branch("t2va")
-    initial_video = torch.linspace(
-        -1.0, 1.0, branch.img_pos.numel() * 96
-    ).reshape(-1, 96)
-    initial_audio = torch.linspace(
-        -0.5, 0.5, branch.audio_pos.numel() * 32
-    ).reshape(-1, 32)
+    initial_video = torch.linspace(-1.0, 1.0, branch.img_pos.numel() * 96).reshape(
+        -1, 96
+    )
+    initial_audio = torch.linspace(-0.5, 0.5, branch.audio_pos.numel() * 32).reshape(
+        -1, 32
+    )
 
     def velocity(state: torch.Tensor, modality: str) -> torch.Tensor:
         if modality == "video":
@@ -427,28 +436,35 @@ def test_debug_latent_dump_path_can_distinguish_grouped_requests():
 
 def test_teacache_request_unmounts_active_cache_dit_hook():
     stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
-    stage.transformer = object()
+    preservation = []
+    stage.transformer = SimpleNamespace(
+        set_cache_dit_input_preservation=preservation.append
+    )
+    stage.transformer_2 = None
     stage._cache_dit_enabled = True
     stage._cached_num_steps = 19
+    stage._cache_dit_active_key = object()
     stage._minimax_h3_cache_mode = "generic"
     batch = SimpleNamespace(
-        sampling_params=SimpleNamespace(enable_teacache=True),
+        sampling_params=SimpleNamespace(
+            enable_teacache=True,
+            quality="lossless",
+            sampler_mode="euler",
+        ),
     )
-    restored = object()
 
     with patch(
-        "sglang.multimodal_gen.runtime.pipelines_core.stages."
-        "model_specific_stages.minimax_h3.stages.denoising."
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
         "disable_cache_on_transformer",
-        return_value=restored,
     ) as disable:
         stage._maybe_enable_cache_dit(19, batch)
 
-    disable.assert_called_once()
-    assert stage.transformer is restored
+    disable.assert_called_once_with(stage.transformer)
     assert not stage._cache_dit_enabled
     assert stage._cached_num_steps is None
+    assert stage._cache_dit_active_key is None
     assert stage._minimax_h3_cache_mode is None
+    assert preservation == [False]
 
 
 def test_teacache_summary_is_copied_into_request_metrics():
@@ -465,3 +481,188 @@ def test_teacache_summary_is_copied_into_request_metrics():
     MiniMaxH3DenoisingStage._record_minimax_h3_teacache_metrics(model, batch)
 
     assert recorded == {"minimax_h3_teacache": summary}
+
+
+def test_cube_metadata_builder_uses_packed_layout_and_validates_step_count():
+    packed = minimax_h3_packed_sequence(
+        text_len=3,
+        latent_t=2,
+        latent_h=8,
+        latent_w=8,
+        audio_t=3,
+        include_keyframe_cond=False,
+    )
+    server_args = SimpleNamespace(
+        attention_backend="cube_sparse_attn",
+        component_attention_backends={},
+        attention_backend_config={
+            "local_cube_size": [4, 4, 4],
+            "topk_ratio_list": [1.0, 0.5],
+        },
+    )
+
+    metadata = _build_cube_attn_metadata(
+        server_args,
+        packed=packed,
+        num_steps=2,
+        device=torch.device("cpu"),
+    )
+    assert metadata.topk_ratio_list == [1.0, 0.5]
+    assert metadata.precomputed.layout.cube_token_size == 64
+
+    with pytest.raises(ValueError, match="denoise steps"):
+        _build_cube_attn_metadata(
+            server_args,
+            packed=packed,
+            num_steps=3,
+            device=torch.device("cpu"),
+        )
+
+
+def test_cube_metadata_follows_transformer_backend_override():
+    packed = minimax_h3_packed_sequence(
+        text_len=3,
+        latent_t=2,
+        latent_h=8,
+        latent_w=8,
+        audio_t=3,
+        include_keyframe_cond=False,
+    )
+    server_args = SimpleNamespace(
+        attention_backend="fa",
+        component_attention_backends={"transformer": "cube_sparse_attn"},
+        attention_backend_config={
+            "local_cube_size": [4, 4, 4],
+            "topk_ratio_list": [0.5],
+        },
+    )
+    assert (
+        _build_cube_attn_metadata(
+            server_args,
+            packed=packed,
+            num_steps=1,
+            device=torch.device("cpu"),
+        )
+        is not None
+    )
+
+    server_args.attention_backend = "cube_sparse_attn"
+    server_args.component_attention_backends["transformer"] = "fa"
+    assert (
+        _build_cube_attn_metadata(
+            server_args,
+            packed=packed,
+            num_steps=1,
+            device=torch.device("cpu"),
+        )
+        is None
+    )
+
+
+def test_cube_metadata_is_updated_per_step():
+    branch = _branch("t2va")
+    metadata = SimpleNamespace(current_timestep=-1, topk_ratio_list=[1.0, 0.25])
+    seen = []
+
+    def model_forward(_model, _kwargs, step):
+        seen.append((step, metadata.current_timestep))
+        return (
+            torch.zeros(int(branch.update_mask.sum()), 96),
+            torch.zeros(branch.audio_pos.numel(), 32),
+        )
+
+    minimax_h3_denoise_loop(
+        model=SimpleNamespace(prepare_adaln_plans=lambda _: None),
+        model_forward=model_forward,
+        positive=branch,
+        initial_video_rows=torch.zeros(branch.img_pos.numel(), 96),
+        initial_audio_rows=torch.zeros(branch.audio_pos.numel(), 32),
+        keyframe_cond_rows=None,
+        sigmas_video=[1.0, 0.5, 0.0],
+        sigmas_audio=[1.0, 0.5, 0.0],
+        device=torch.device("cpu"),
+        attn_metadata=metadata,
+    )
+
+    assert seen == [(0, 0), (1, 1)]
+
+
+def test_native_dit_forward_publishes_cube_metadata_in_forward_context():
+    metadata = SimpleNamespace(current_timestep=0, topk_ratio_list=[0.5])
+    batch = SimpleNamespace()
+
+    def model(**_kwargs):
+        context = get_forward_context()
+        assert context.current_timestep == 0
+        assert context.attn_metadata is metadata
+        assert context.forward_batch is batch
+        return torch.zeros(1, 96), torch.zeros(1, 32)
+
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    with patch.object(
+        MiniMaxH3DenoisingStage,
+        "_maybe_get_bcg_runner",
+        return_value=None,
+    ):
+        video, audio = stage._forward_dit(
+            model,
+            {},
+            0,
+            batch=batch,
+            attn_metadata=metadata,
+        )
+    assert video.shape == (1, 96)
+    assert audio.shape == (1, 32)
+
+
+def test_grouped_outputs_share_prompt_refinement():
+    class Refiner:
+        calls = 0
+
+        def refine_prompt_embeds(self, prompt_embeds, refiner_cu, *, device):
+            del refiner_cu
+            self.calls += 1
+            return torch.ones(
+                prompt_embeds.shape[0], 5376, dtype=prompt_embeds.dtype, device=device
+            )
+
+    model = Refiner()
+    conditioning = {}
+    first, second = _branch("t2va"), _branch("t2va")
+
+    for branch in (first, second):
+        assert _precompute_refined_prompt_embeds(
+            model,
+            branch,
+            device=torch.device("cpu"),
+            shared_conditioning=conditioning,
+        )
+
+    assert model.calls == 1
+    assert first.static_kwargs["prompt_embeds"] is second.static_kwargs["prompt_embeds"]
+
+
+def test_nsys_capture_stops_when_dit_use_site_raises():
+    events = []
+    with (
+        patch.object(
+            torch.cuda,
+            "synchronize",
+            side_effect=lambda: events.append("synchronize"),
+        ),
+        patch.object(
+            torch.cuda.profiler,
+            "start",
+            side_effect=lambda: events.append("start"),
+        ),
+        patch.object(
+            torch.cuda.profiler,
+            "stop",
+            side_effect=lambda: events.append("stop"),
+        ),
+        pytest.raises(RuntimeError, match="placement failed"),
+    ):
+        with _minimax_h3_nsys_capture(True):
+            raise RuntimeError("placement failed")
+
+    assert events == ["synchronize", "start", "synchronize", "stop"]

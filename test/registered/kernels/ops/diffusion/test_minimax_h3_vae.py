@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.diffusion.triton.minimax_h3_vae import (
+from sglang.kernels.ops.diffusion import (
     try_mul_reduce_max_f32_exact,
     try_restore_scale_add_bias_f32_exact,
     try_scale_cast_f16_exact,
@@ -127,25 +127,26 @@ def test_fusions_reject_unsupported_inputs():
     scale = torch.ones((2, 3, 1), device="cuda", dtype=torch.float32)
     bias = torch.randn(16, device="cuda", dtype=torch.float16)
     nonuniform_value = value.transpose(0, 1)
-    noncontiguous_product = torch.randn(
-        (2, 3, 32), device="cuda", dtype=torch.float32
-    )[..., ::2]
-    noncontiguous_output = torch.randn(
-        (2, 3, 32), device="cuda", dtype=torch.float16
-    )[..., ::2]
+    noncontiguous_product = torch.randn((2, 3, 32), device="cuda", dtype=torch.float32)[
+        ..., ::2
+    ]
+    noncontiguous_output = torch.randn((2, 3, 32), device="cuda", dtype=torch.float16)[
+        ..., ::2
+    ]
 
     assert try_mul_reduce_max_f32_exact(gate.cpu(), value.cpu()) is None
     assert try_mul_reduce_max_f32_exact(gate, value.bfloat16()) is None
     assert (
-        try_mul_reduce_max_f32_exact(gate.transpose(0, 1).contiguous(), nonuniform_value)
+        try_mul_reduce_max_f32_exact(
+            gate.transpose(0, 1).contiguous(), nonuniform_value
+        )
         is None
     )
     assert try_scale_cast_f16_exact(product.bfloat16(), scale) is None
     assert try_scale_cast_f16_exact(noncontiguous_product, scale) is None
     assert try_restore_scale_add_bias_f32_exact(value, scale, bias.float()) is None
     assert (
-        try_restore_scale_add_bias_f32_exact(noncontiguous_output, scale, bias)
-        is None
+        try_restore_scale_add_bias_f32_exact(noncontiguous_output, scale, bias) is None
     )
 
 

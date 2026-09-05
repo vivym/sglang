@@ -57,12 +57,8 @@ def test_relative_l1_reduces_numerator_and_denominator_together():
 
 
 def test_relative_l1_by_modality_matches_global_and_tagged_rows():
-    previous = torch.tensor(
-        [[1.0, 1.0], [2.0, 2.0], [4.0, 4.0], [8.0, 8.0]]
-    )
-    current = previous + torch.tensor(
-        [[1.0, 1.0], [2.0, 2.0], [1.0, 1.0], [4.0, 4.0]]
-    )
+    previous = torch.tensor([[1.0, 1.0], [2.0, 2.0], [4.0, 4.0], [8.0, 8.0]])
+    current = previous + torch.tensor([[1.0, 1.0], [2.0, 2.0], [1.0, 1.0], [4.0, 4.0]])
 
     global_value, modalities = _relative_l1_by_modality(
         current,

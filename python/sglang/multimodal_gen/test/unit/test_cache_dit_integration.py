@@ -312,6 +312,29 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         self.assertEqual(adapter.forward_pattern, "Pattern_3")
         self.assertFalse(adapter.has_separate_cfg)
 
+    def test_minimax_h3_similarity_excludes_packed_padding_rows(self):
+        module = _import_module_with_stub()
+        manager = types.SimpleNamespace(_sglang_h3_valid_rows=3)
+
+        class Rows:
+            shape = (4, 1)
+
+            def __init__(self, values):
+                self.values = values
+
+            def __getitem__(self, key):
+                return self.values[key]
+
+        previous = Rows([[1.0], [2.0], [3.0], [1e30]])
+        current = Rows([[1.1], [2.1], [3.1], [-1e30]])
+
+        sliced_previous, sliced_current = module._h3_similarity_tensors(
+            manager, previous, current
+        )
+
+        self.assertEqual(sliced_previous, previous[:3])
+        self.assertEqual(sliced_current, current[:3])
+
     def test_minimax_h3_wrapper_dispatches_per_block_adaln_params(self):
         module = _import_module_with_stub()
 

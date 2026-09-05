@@ -22,12 +22,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_rank_text_encode"
+_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_copy_text_encode"
 _MINIMAX_H3_DEBUG_TEXT_HIDDEN_STATES_ENV = "MINIMAX_H3_DEBUG_TEXT_HIDDEN_STATES_PATH"
 
 
@@ -160,7 +161,13 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                             "Reused fixed MiniMax H3 text embeddings for diagnostics"
                         )
                         return batch
-                self._encode_from_plan(batch, plan)
+                self._encode_from_plan(
+                    batch,
+                    plan,
+                    include_video_token_mask=(
+                        server_args.pipeline_config.uses_subblock_attention(server_args)
+                    ),
+                )
                 _apply_debug_text_hidden_states_override(batch)
                 if debug_cache_key is not None:
                     self._debug_text_embedding_cache_key = debug_cache_key
@@ -171,6 +178,8 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                     )
                 self._publish_native_text_conditioning(batch)
                 self._release_encoder_for_memory_profile()
+                if current_platform.is_mps():
+                    self._finish_active_component_use()
             except Exception:
                 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.material_io import (
                     minimax_h3_cleanup_temp_dirs,
@@ -245,13 +254,14 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         batches: list[Req],
         server_args: ServerArgs,
     ) -> list[Req]:
-        """Distribute independent H3 presentations over replicated encoders.
+        """Distribute independent H3 presentations over encoder copies.
 
         H3 presentations have variable multimodal layouts, so they cannot be
         stacked into the generic text batch without changing padding/kernels.
-        Assigning one complete request to a rank preserves the exact
-        single-request encoder path, then broadcasts that request's native
-        payload to the other ranks.
+        Assigning one complete request to a copy preserves the exact
+        single-request encoder path. A copy may itself span a TP group; the
+        orthogonal encoder-DP group then broadcasts that request's native
+        payload to the other copies.
         """
         grouped = self._group_requests_by_fingerprint(
             batches,
@@ -282,14 +292,14 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             payload = None
             if dp_group.rank_in_group == owner:
                 try:
-                    first_batch.extra[_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY] = (
+                    first_batch.extra[_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY] = (
                         True
                     )
                     try:
                         first_result = self(first_batch, server_args)
                     finally:
                         first_batch.extra.pop(
-                            _MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY, None
+                            _MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY, None
                         )
                     payload = first_result.extra.get(
                         MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY
@@ -327,7 +337,6 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
 
     def _run_text_only_encoder_batch(self, grouped, server_args: ServerArgs):
         """Batch distinct text-only presentations while loading each layer once."""
-
         if len(grouped) < 2:
             return None
         encode_ids_batch = getattr(self.text_encoder, "encode_ids_batch", None)
@@ -362,7 +371,6 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 if precomputed is not None
                 else minimax_h3_text_only_ids(self.tokenizer, plan.prompt)
             )
-        self._manage_text_encoder_use(0)
         started = time.perf_counter()
         with set_forward_context(current_timestep=0, attn_metadata=None):
             hidden_states = encode_ids_batch(input_ids)
@@ -416,7 +424,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         self._dp_choice_logged = True
         logger.info(
             "encoder_parallel: distributing %d independent MiniMax H3 "
-            "presentations over %d replicated encoder ranks",
+            "presentations over %d encoder copies",
             batch_size,
             world_size,
         )
@@ -450,7 +458,13 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         batch.prompt_embeds = [hidden_states]
         batch.prompt_seq_lens = [[text_len]]
 
-    def _encode_from_plan(self, batch: Req, plan) -> None:
+    def _encode_from_plan(
+        self,
+        batch: Req,
+        plan,
+        *,
+        include_video_token_mask: bool = False,
+    ) -> None:
         """Encode the positive Qwen3VL presentation into layer-50 states.
 
         MiniMax H3 only supports the CFG-distilled model path, so every task
@@ -469,11 +483,11 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         keyframes = [
             m for m in plan.materials if m.material_chain == "image.target_canvas"
         ]
-        if plan.task == "fl2va":
+        if plan.task in {"fl2va", "ref2va"} and keyframes:
             frame_indices = tuple(material.frame_index for material in keyframes)
             if frame_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES:
                 raise ValueError(
-                    "fl2va text encoding requires an ordered keyframe signature "
+                    "MiniMax H3 text encoding requires an ordered keyframe signature "
                     f"in {MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES!r}, got "
                     f"{frame_indices!r}"
                 )
@@ -498,10 +512,14 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             raise ValueError(
                 "MiniMaxH3TextEncodingStage direct encode requires a tokenizer component"
             )
-        self._manage_text_encoder_use(0)
         with set_forward_context(current_timestep=0, attn_metadata=None):
             if plan.task == "ref2va":
-                embeddings = self._encode_ref2va(batch, plan, encode_ids)
+                embeddings = self._encode_ref2va(
+                    batch,
+                    plan,
+                    encode_ids,
+                    include_video_token_mask=include_video_token_mask,
+                )
             elif keyframes:
                 embeddings = self._encode_fl2va_keyframes(
                     batch,
@@ -596,18 +614,25 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 "hidden_states": pos_hidden,
                 "text_len": int(pos_ids.shape[0]),
                 "text_token_tags": pos_tags,
-            },
+            }
         }
 
-    def _encode_ref2va(self, batch: Req, plan, encode_ids) -> dict:
+    def _encode_ref2va(
+        self,
+        batch: Req,
+        plan,
+        encode_ids,
+        *,
+        include_video_token_mask: bool = False,
+    ) -> dict:
         """Encode the positive ref2va presentation.
 
         Per condition in order — image i: '<Picture i>: ' label +
         vision block (prepared reference image); audio j: '<Audio j>: ' label
-        only — then the verbatim prompt.
+        only — then the verbatim prompt. Hybrid keyframes are deliberately
+        omitted: they are guide latents appended after reference presentation.
         """
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
-            minimax_h3_ref2va_condition_labels,
             minimax_h3_ref2va_presentation,
             minimax_h3_ref2va_video_presentation,
         )
@@ -633,7 +658,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 share_across_replicas=(
                     world > 1
                     and not bool(
-                        batch.extra.get(_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY)
+                        batch.extra.get(_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY)
                     )
                 ),
             )
@@ -650,26 +675,50 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             video_has_audio[int(item["condition_index"])] = bool(
                 item["input_has_audio"]
             )
+        condition_labels: list[tuple[str, int]] = []
+        counters = {"image": 0, "audio": 0, "video": 0}
         has_image = False
         has_video = False
         for material in plan.materials:
+            if material.material_chain == "image.target_canvas":
+                continue
             if material.material_chain == "image.reference_preserve":
+                counters["image"] += 1
+                condition_labels.append(("image", counters["image"]))
                 has_image = True
             elif material.material_chain == "audio":
-                pass
+                counters["audio"] += 1
+                condition_labels.append(("audio", counters["audio"]))
             elif material.material_chain in (
                 "video.reference_preserve",
                 "video_audio.reference_preserve",
             ):
+                # A plain video contributes an Audio label only when its
+                # probed source actually has a soundtrack. ``video_audio`` is
+                # an explicit caller promise and remains fail-closed in the
+                # audio stage if its stream is missing.
+                if material.material_chain == "video_audio.reference_preserve":
+                    contributes_audio = True
+                else:
+                    condition_index = int(material.condition_index)
+                    if condition_index not in video_has_audio:
+                        raise KeyError(
+                            "prepared reference videos carry no "
+                            f"'input_has_audio' probe for condition "
+                            f"{condition_index}; the canonical minimax_h3 "
+                            "producer must supply it"
+                        )
+                    contributes_audio = video_has_audio[condition_index]
+                if contributes_audio:
+                    counters["audio"] += 1
+                    condition_labels.append(("audio", counters["audio"]))
+                counters["video"] += 1
+                condition_labels.append(("video", counters["video"]))
                 has_video = True
             else:
                 raise NotImplementedError(
                     f"ref2va does not support chain {material.material_chain!r}"
                 )
-        condition_labels = minimax_h3_ref2va_condition_labels(
-            plan,
-            video_has_audio=video_has_audio,
-        )
 
         pixel_values = None
         image_grid_thw = None
@@ -751,18 +800,29 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             condition_labels=condition_labels,
             video_block_token_counts=video_block_token_counts,
             video_block_timestamps=video_block_timestamps,
+            return_video_mask=include_video_token_mask,
         )
         if precomputed is not None:
-            pos_ids, pos_tags = precomputed
+            if include_video_token_mask:
+                pos_ids, pos_tags, pos_video_mask = precomputed
+            else:
+                pos_ids, pos_tags = precomputed
+                pos_video_mask = None
         elif has_video:
-            pos_ids, pos_tags = minimax_h3_ref2va_video_presentation(
+            presentation = minimax_h3_ref2va_video_presentation(
                 self.tokenizer,
                 prompt=plan.prompt,
                 condition_labels=condition_labels,
                 image_token_count=n_image_tokens,
                 video_block_token_counts=video_block_token_counts,
                 video_block_timestamps=video_block_timestamps,
+                return_video_mask=include_video_token_mask,
             )
+            if include_video_token_mask:
+                pos_ids, pos_tags, pos_video_mask = presentation
+            else:
+                pos_ids, pos_tags = presentation
+                pos_video_mask = None
         else:
             pos_ids, pos_tags = minimax_h3_ref2va_presentation(
                 self.tokenizer,
@@ -770,6 +830,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 condition_labels=condition_labels,
                 image_token_count=n_image_tokens,
             )
+            pos_video_mask = None
         pos_hidden = encode_ids(
             pos_ids,
             pixel_values=pixel_values,
@@ -777,15 +838,16 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
         )
-        if batch.extra.get(_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY):
+        if batch.extra.get(_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY):
             batch.extra.pop(MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY, None)
-        return {
-            "positive": {
-                "hidden_states": pos_hidden,
-                "text_len": int(pos_ids.shape[0]),
-                "text_token_tags": pos_tags,
-            },
+        positive = {
+            "hidden_states": pos_hidden,
+            "text_len": int(pos_ids.shape[0]),
+            "text_token_tags": pos_tags,
         }
+        if pos_video_mask is not None:
+            positive["text_video_token_mask"] = pos_video_mask
+        return {"positive": positive}
 
 
 __all__ = ["MiniMaxH3TextEncodingStage"]

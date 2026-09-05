@@ -181,7 +181,9 @@ def _rescale_distance(value: float, coefficients: list[float]) -> float:
             raise ValueError("MiniMax H3 TeaCache coefficient is non-finite")
         result = result * value + coefficient
     if not math.isfinite(result):
-        raise ValueError(f"MiniMax H3 TeaCache rescaled relative L1 is invalid: {result}")
+        raise ValueError(
+            f"MiniMax H3 TeaCache rescaled relative L1 is invalid: {result}"
+        )
     return result
 
 

@@ -26,7 +26,10 @@ def test_lifespan_fails_startup_when_broker_bind_fails(monkeypatch):
             scheduler_client,
         )
         app = FastAPI()
-        app.state.server_args = SimpleNamespace(warmup_mode="off")
+        app.state.server_args = SimpleNamespace(
+            pipeline_config=None,
+            warmup_mode="off",
+        )
         entered = False
 
         with pytest.raises(RuntimeError, match="broker bind failed"):

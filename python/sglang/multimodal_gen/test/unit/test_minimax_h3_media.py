@@ -12,7 +12,12 @@ import numpy as np
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vae_vit import (
+    ViT3DDecoder,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+    keyframe_encoding,
     material_io,
     reference_encoding,
 )
@@ -22,6 +27,32 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
     decoding,
 )
+
+
+def test_video_vae_decoder_rope_cache_can_be_prepared_before_forward():
+    decoder = ViT3DDecoder(
+        patch_size=1,
+        patch_size_t=1,
+        in_channels=2,
+        out_channels=2,
+        num_layers=1,
+        heads=1,
+        dim_head=6,
+        ffn_activation_fn="silu",
+        ffn_use_gated=True,
+        num_register_tokens=1,
+    ).eval()
+
+    kwargs = {
+        "batch_size": 1,
+        "latent_size": (2, 3, 4),
+        "device": torch.device("cpu"),
+        "input_dtype": torch.float32,
+        "rotary_dtype": torch.float32,
+    }
+    assert decoder.prepare_rotary_pos_emb_cache(**kwargs)
+    assert not decoder.prepare_rotary_pos_emb_cache(**kwargs)
+    assert decoder.transformer_blocks[0].ff._debug_name.endswith(".0.ff")
 
 
 def test_video_vae_decode_weights_are_prepared_before_first_denoise(monkeypatch):
@@ -36,6 +67,7 @@ def test_video_vae_decode_weights_are_prepared_before_first_denoise(monkeypatch)
     video_vae = FakeVideoVAE()
     server_args = SimpleNamespace(
         disable_autocast=False,
+        component_precisions={},
         pipeline_config=SimpleNamespace(vae_decode_precision="fp16"),
     )
     monkeypatch.setattr(decoding, "autocast_enabled", lambda *_args: True)
@@ -68,6 +100,7 @@ def test_video_vae_decode_weight_preparation_respects_autocast(
     video_vae = FakeVideoVAE()
     server_args = SimpleNamespace(
         disable_autocast=disable_autocast,
+        component_precisions={},
         pipeline_config=SimpleNamespace(vae_decode_precision=decode_precision),
     )
     monkeypatch.setattr(
@@ -388,6 +421,15 @@ def test_vae_graph_delta_logging_preserves_decode_failure(monkeypatch, caplog):
     }
 
 
+def test_keyframe_rng_supports_cpu_and_default_device():
+    initial_state = torch.random.get_rng_state()
+
+    for device in (None, torch.device("cpu")):
+        with keyframe_encoding.minimax_h3_scoped_encode_rng(42, device):
+            assert torch.initial_seed() == 42
+        torch.testing.assert_close(torch.random.get_rng_state(), initial_state)
+
+
 def test_ffprobe_falls_back_when_stream_side_data_is_unknown(monkeypatch):
     material_io._ffprobe_entries = None
     calls = []
@@ -487,7 +529,7 @@ def test_video_transform_can_share_one_host_decode(monkeypatch):
         os.write(output_fd, expected.tobytes())
         return SimpleNamespace(stderr=b"")
 
-    monkeypatch.setattr(reference_encoding, "get_world_group", FakeGroup)
+    monkeypatch.setattr(reference_encoding, "get_replica_group", FakeGroup)
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(subprocess, "run", run)
     reference_encoding._reference_video_host_leader.cache_clear()
@@ -534,7 +576,7 @@ def test_shared_video_transform_falls_back_when_proc_fd_is_blocked(monkeypatch):
             raise PermissionError("blocked by test policy")
         return real_open(path, flags)
 
-    monkeypatch.setattr(reference_encoding, "get_world_group", FakeGroup)
+    monkeypatch.setattr(reference_encoding, "get_replica_group", FakeGroup)
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(os, "open", guarded_open)
@@ -576,7 +618,7 @@ def test_shared_video_transform_propagates_any_host_decode_failure(monkeypatch):
             ]
         gather_index += 1
 
-    monkeypatch.setattr(reference_encoding, "get_world_group", FakeGroup)
+    monkeypatch.setattr(reference_encoding, "get_replica_group", FakeGroup)
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(
         reference_encoding,
@@ -627,3 +669,42 @@ def test_audio_decode_is_bounded_float_pcm_without_temp_files(monkeypatch):
     assert ffmpeg[ffmpeg.index("-ss") + 1] == "2.25"
     assert ffmpeg.index("-ss") < ffmpeg.index("-i")
     assert ffmpeg[-3:] == ["-f", "f32le", "pipe:1"]
+
+
+def test_reference_audio_encode_sets_forward_context(monkeypatch):
+    class FakeAudioVAE(torch.nn.Module):
+        attn_proj = True
+
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(1))
+            self.mean_proj = torch.nn.Identity()
+
+        def preprocess(self, waveform, _sample_rate):
+            return waveform
+
+        def encoder(self, _audio_data):
+            return torch.ones(2, 32, 4)
+
+        def pre_block(self, hidden_states):
+            assert get_forward_context().current_timestep == 0
+            return hidden_states
+
+    monkeypatch.setattr(
+        reference_encoding,
+        "_load_waveform",
+        lambda *_args, **_kwargs: (torch.ones(2, 320), 32000),
+    )
+
+    result = reference_encoding.minimax_h3_encode_reference_audio_rows(
+        FakeAudioVAE(),
+        "/input/ref.wav",
+        SimpleNamespace(
+            latent_channels=32,
+            latents_mean=[0.0] * 32,
+            latents_std=[1.0] * 32,
+        ),
+    )
+
+    assert result["rows"].shape == (8, 32)
+    assert result["ref_audio_t"] == 4

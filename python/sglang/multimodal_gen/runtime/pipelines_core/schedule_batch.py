@@ -108,6 +108,10 @@ class Req:
     pooled_embeds: list[torch.Tensor] = field(default_factory=list)
     neg_pooled_embeds: list[torch.Tensor] = field(default_factory=list)
 
+    # GLM-Image autoregressive prior tokens
+    prior_token_id: torch.Tensor | None = None
+    prior_token_image_ids: torch.Tensor | list[torch.Tensor] | None = None
+
     # Additional text-related parameters
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
@@ -235,13 +239,13 @@ class Req:
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
-        for name, field in self.__class__.__dataclass_fields__.items():
+        for name, dataclass_field in self.__class__.__dataclass_fields__.items():
             if name in kwargs:
                 object.__setattr__(self, name, kwargs.pop(name))
-            elif field.default is not MISSING:
-                object.__setattr__(self, name, field.default)
-            elif field.default_factory is not MISSING:
-                object.__setattr__(self, name, field.default_factory())
+            elif dataclass_field.default is not MISSING:
+                object.__setattr__(self, name, dataclass_field.default)
+            elif dataclass_field.default_factory is not MISSING:
+                object.__setattr__(self, name, dataclass_field.default_factory())
 
         for name, value in kwargs.items():
             setattr(self, name, value)

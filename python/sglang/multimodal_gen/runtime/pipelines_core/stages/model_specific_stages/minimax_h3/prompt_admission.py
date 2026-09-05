@@ -547,7 +547,12 @@ def minimax_h3_precomputed_presentation(
     condition_labels: list[tuple[str, int]] | None = None,
     video_block_token_counts: list[list[int]] | None = None,
     video_block_timestamps: list[list[float]] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+    return_video_mask: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | None
+):
     payload = batch.extra.get(MINIMAX_H3_PRESENTATION_EXTRA_KEY)
     if payload is None:
         return None
@@ -605,10 +610,20 @@ def minimax_h3_precomputed_presentation(
         raise ValueError("MiniMax H3 precomputed vision token count mismatch")
     if sum(value == 1 for value in token_tags) != payload.get("text_token_count"):
         raise ValueError("MiniMax H3 precomputed text token count mismatch")
-    return (
-        torch.tensor(input_ids, dtype=torch.long),
-        torch.tensor(token_tags, dtype=torch.long),
+    ids = torch.tensor(input_ids, dtype=torch.long)
+    tags = torch.tensor(token_tags, dtype=torch.long)
+    if not return_video_mask:
+        return ids, tags
+    if tokenizer is None:
+        raise ValueError(
+            "MiniMax H3 precomputed video mask requires the worker tokenizer"
+        )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
+        VIDEO_PAD,
     )
+
+    video_token_id = tokenizer.convert_tokens_to_ids(VIDEO_PAD)
+    return ids, tags, ids.eq(video_token_id)
 
 
 __all__ = [

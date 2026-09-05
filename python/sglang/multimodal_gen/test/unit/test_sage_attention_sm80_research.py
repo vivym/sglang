@@ -125,9 +125,7 @@ def test_sm80_research_forward_cannot_fall_back_to_generic_sage(monkeypatch) -> 
         qattn_extension=root / "sageattention/_qattn_sm80.so",
         qattn_sha256="a" * 64,
     )
-    monkeypatch.setattr(
-        sage_attn, "current_sage_sm80_research_config", lambda: config
-    )
+    monkeypatch.setattr(sage_attn, "current_sage_sm80_research_config", lambda: config)
     monkeypatch.setattr(
         sage_attn,
         "sageattn",
