@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import json
 import os
 from collections.abc import Iterable
 
@@ -57,6 +58,7 @@ from sglang.srt.model_loader.checkpoint_quantization import (
 logger = init_logger(__name__)
 VAE_CHANNELS_LAST_3D_ENV = "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D"
 _VAE_CHECKPOINT_ARCH_METADATA = ("latents_mean", "latents_std")
+_DECODE_DTYPE_STORE_SCHEMA = "sglang-vae-decode-dtype-store-v2"
 
 
 def _require_native_loader_for_quantized_vae(
@@ -170,6 +172,61 @@ def _decode_dtype_store_path(
     )
 
 
+def _canonical_sha256(payload) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _module_layout_sha256(vae) -> str:
+    return _canonical_sha256(
+        sorted(
+            [name, list(tensor.shape), str(tensor.dtype)]
+            for name, tensor in vae.state_dict().items()
+        )
+    )
+
+
+def _checkpoint_stat_sha256(component_model_path: str) -> str:
+    """Identify ordinary checkpoint changes without rereading multi-GiB weights."""
+    resolved = os.path.realpath(component_model_path)
+    if os.path.isfile(resolved):
+        paths = [resolved]
+        root = os.path.dirname(resolved)
+    elif os.path.isdir(resolved):
+        paths = []
+        root = resolved
+        for directory, _, filenames in os.walk(resolved):
+            paths.extend(os.path.join(directory, name) for name in filenames)
+    else:
+        return _canonical_sha256({"missing": resolved})
+
+    entries = []
+    for path in sorted(paths):
+        stat = os.stat(path)
+        entries.append(
+            [
+                os.path.relpath(path, root),
+                stat.st_size,
+                stat.st_mtime_ns,
+            ]
+        )
+    return _canonical_sha256(entries)
+
+
+def _decode_dtype_store_identity(
+    vae, dtype: torch.dtype, component_model_path: str, component_name: str
+) -> dict[str, str]:
+    return {
+        "schema": _DECODE_DTYPE_STORE_SCHEMA,
+        "component_name": component_name,
+        "dtype": str(dtype),
+        "module_layout_sha256": _module_layout_sha256(vae),
+        "checkpoint_stat_sha256": _checkpoint_stat_sha256(component_model_path),
+    }
+
+
 def _assign_matching_store(vae, mapped: dict, dtype: torch.dtype) -> bool:
     """Adopt a decode-dtype store if it matches the module, else refuse."""
     state = vae.state_dict()
@@ -179,6 +236,30 @@ def _assign_matching_store(vae, mapped: dict, dtype: torch.dtype) -> bool:
             return False
     vae.load_state_dict(mapped, strict=False, assign=True)
     return True
+
+
+def _adopt_decode_dtype_store(
+    path: str, vae, dtype: torch.dtype, identity: dict[str, str]
+) -> int | None:
+    with safe_open(path, framework="pt", device="cpu") as checkpoint:
+        metadata = checkpoint.metadata() or {}
+    if any(metadata.get(key) != value for key, value in identity.items()):
+        return None
+
+    mapped = safetensors_load_file(path)
+    names_sha256 = _canonical_sha256(sorted(mapped))
+    if metadata.get("tensor_names_sha256") != names_sha256:
+        return None
+    try:
+        tensor_count = int(metadata["tensor_count"])
+        converted_count = int(metadata["converted_count"])
+    except (KeyError, ValueError):
+        return None
+    if tensor_count != len(mapped) or converted_count <= 0:
+        return None
+    if not mapped or not _assign_matching_store(vae, mapped, dtype):
+        return None
+    return converted_count
 
 
 def _rehome_cast_weights_to_file(
@@ -197,13 +278,33 @@ def _rehome_cast_weights_to_file(
     Returns (weights held, file-backed?).
     """
     path = _decode_dtype_store_path(component_model_path, component_name, dtype)
+    identity = _decode_dtype_store_identity(
+        vae, dtype, component_model_path, component_name
+    )
+    converted = 0
+    temporary = None
     try:
         if os.path.exists(path):
-            mapped = safetensors_load_file(path)
-            if mapped and _assign_matching_store(vae, mapped, dtype):
-                return len(mapped), True
-            raise ValueError("existing decode-dtype store does not match the module")
-        converted = prepare(dtype)
+            try:
+                held = _adopt_decode_dtype_store(path, vae, dtype, identity)
+            except Exception as exc:
+                logger.warning(
+                    "VAE: discarding unreadable %s decode-dtype store %s (%s)",
+                    component_name,
+                    path,
+                    exc,
+                )
+                held = None
+            if held is not None:
+                return held, True
+            logger.warning(
+                "VAE: rebuilding incompatible %s decode-dtype store %s",
+                component_name,
+                path,
+            )
+            os.remove(path)
+
+        converted = int(prepare(dtype))
         if not converted:
             return 0, False
         cast_state = {
@@ -211,14 +312,26 @@ def _rehome_cast_weights_to_file(
             for name, tensor in vae.state_dict().items()
             if tensor.dtype == dtype and tensor.device.type == "cpu"
         }
+        if not cast_state:
+            raise ValueError("decode-dtype preparation produced no CPU tensors")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.tmp.{os.getpid()}"
-        safetensors_save_file({k: v.contiguous() for k, v in cast_state.items()}, tmp)
-        os.replace(tmp, path)
-        mapped = safetensors_load_file(path)
-        if set(mapped) != set(cast_state):
+        temporary = f"{path}.tmp.{os.getpid()}"
+        metadata = {
+            **identity,
+            "tensor_names_sha256": _canonical_sha256(sorted(cast_state)),
+            "tensor_count": str(len(cast_state)),
+            "converted_count": str(converted),
+        }
+        safetensors_save_file(
+            {name: tensor.contiguous() for name, tensor in cast_state.items()},
+            temporary,
+            metadata=metadata,
+        )
+        os.replace(temporary, path)
+        temporary = None
+        held = _adopt_decode_dtype_store(path, vae, dtype, identity)
+        if held != converted:
             raise ValueError("decode-dtype store does not match the cast weights")
-        vae.load_state_dict(mapped, strict=False, assign=True)
         return converted, True
     except Exception as exc:
         logger.warning(
@@ -229,11 +342,15 @@ def _rehome_cast_weights_to_file(
             exc,
         )
         try:
+            if temporary is not None and os.path.exists(temporary):
+                os.remove(temporary)
             if os.path.exists(path):
                 os.remove(path)
         except OSError:
             pass
-        return prepare(dtype), False
+        if not converted:
+            converted = int(prepare(dtype))
+        return converted, False
 
 
 def _hold_decoder_weights_in_decode_dtype(
