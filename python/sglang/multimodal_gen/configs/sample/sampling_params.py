@@ -402,6 +402,18 @@ class SamplingParams:
         """Resolve model-specific facts for one synthetic warmup request."""
         del req, server_args
 
+    def synthetic_warmup_sampling_params(
+        self, server_args: Any, *, server_based_warmup: bool
+    ) -> tuple["SamplingParams", ...]:
+        """Return ordered model-specific parameter variants for warmup.
+
+        The request builder copies each returned object before lowering it, so
+        models can opt into additional representative shapes without changing
+        the generic warmup policy for every other pipeline.
+        """
+        del server_args, server_based_warmup
+        return (self,)
+
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         """Return model-resolved fields to publish with the queued video job."""
         del req

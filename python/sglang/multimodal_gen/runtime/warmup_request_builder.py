@@ -360,66 +360,78 @@ def build_warmup_reqs(
         sampling_defaults,
         server_based_warmup=server_based_warmup,
     )
+    sampling_param_variants = sampling_defaults.synthetic_warmup_sampling_params(
+        server_args, server_based_warmup=server_based_warmup
+    )
 
     # build warmup reqs
     warmup_reqs = []
     include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
     for width, height in resolutions:
-        req_kwargs = dict(
-            data_type=task_type.data_type(),
-            width=width,
-            height=height,
-            prompt=DEFAULT_PLACEHOLDER_PROMPT,
-        )
-        req_kwargs["sampling_params"] = copy(sampling_defaults)
-        req_kwargs.update(
-            negative_prompt=negative_prompt,
-            guidance_scale=sampling_defaults.guidance_scale,
-            guidance_scale_2=sampling_defaults.guidance_scale_2,
-            true_cfg_scale=sampling_defaults.true_cfg_scale,
-            num_inference_steps=sampling_defaults.num_inference_steps,
-            num_frames=warmup_num_frames,
-        )
-        if include_warmup_image:
-            if warmup_input_path is None:
-                raise RuntimeError(
-                    "Warmup image path is required for image-input model"
-                )
-            req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
-            req_kwargs["image_path"] = [warmup_input_path]
-        if server_args.enable_cfg_parallel:
-            if not req_kwargs.get("negative_prompt"):
-                req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
-            req_kwargs["do_classifier_free_guidance"] = True
-        elif negative_prompt is not None and cfg_scale is not None and cfg_scale > 1.0:
-            req_kwargs["do_classifier_free_guidance"] = True
-
-        run_real_path_prewarm = server_based_warmup and server_args.enable_torch_compile
-        prompts = (
-            (DEFAULT_PLACEHOLDER_PROMPT,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
-            if run_real_path_prewarm
-            else (DEFAULT_PLACEHOLDER_PROMPT,)
-        )
-        for prompt_idx, prompt in enumerate(prompts):
-            prompt_req_kwargs = req_kwargs.copy()
-            prompt_req_kwargs["prompt"] = prompt
-            prompt_req_kwargs["sampling_params"] = copy(req_kwargs["sampling_params"])
-            req = Req(**prompt_req_kwargs)
-            if not run_real_path_prewarm or prompt_idx == 0:
-                req.set_as_warmup(warmup_steps)
-            else:
-                req.sampling_params.num_inference_steps = warmup_steps
-                req.save_output = False
-                req.suppress_logs = True
-                req.metrics.suppress_stage_breakdown = True
-                req.extra["server_internal_prewarm"] = True
-            req.sampling_params.prepare_synthetic_warmup_request_for_queue(
-                req, server_args
+        for sampling_param_variant in sampling_param_variants:
+            req_kwargs = dict(
+                data_type=task_type.data_type(),
+                width=width,
+                height=height,
+                prompt=DEFAULT_PLACEHOLDER_PROMPT,
             )
-            if return_warmup_result:
-                req.extra["return_warmup_result"] = True
-            if server_based_warmup:
-                req.extra["server_based_warmup"] = True
-            warmup_reqs.append(req)
+            req_kwargs["sampling_params"] = copy(sampling_param_variant)
+            req_kwargs.update(
+                negative_prompt=negative_prompt,
+                guidance_scale=sampling_defaults.guidance_scale,
+                guidance_scale_2=sampling_defaults.guidance_scale_2,
+                true_cfg_scale=sampling_defaults.true_cfg_scale,
+                num_inference_steps=sampling_defaults.num_inference_steps,
+                num_frames=warmup_num_frames,
+            )
+            if include_warmup_image:
+                if warmup_input_path is None:
+                    raise RuntimeError(
+                        "Warmup image path is required for image-input model"
+                    )
+                req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
+                req_kwargs["image_path"] = [warmup_input_path]
+            if server_args.enable_cfg_parallel:
+                if not req_kwargs.get("negative_prompt"):
+                    req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
+                req_kwargs["do_classifier_free_guidance"] = True
+            elif (
+                negative_prompt is not None
+                and cfg_scale is not None
+                and cfg_scale > 1.0
+            ):
+                req_kwargs["do_classifier_free_guidance"] = True
+
+            run_real_path_prewarm = (
+                server_based_warmup and server_args.enable_torch_compile
+            )
+            prompts = (
+                (DEFAULT_PLACEHOLDER_PROMPT,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
+                if run_real_path_prewarm
+                else (DEFAULT_PLACEHOLDER_PROMPT,)
+            )
+            for prompt_idx, prompt in enumerate(prompts):
+                prompt_req_kwargs = req_kwargs.copy()
+                prompt_req_kwargs["prompt"] = prompt
+                prompt_req_kwargs["sampling_params"] = copy(
+                    req_kwargs["sampling_params"]
+                )
+                req = Req(**prompt_req_kwargs)
+                if not run_real_path_prewarm or prompt_idx == 0:
+                    req.set_as_warmup(warmup_steps)
+                else:
+                    req.sampling_params.num_inference_steps = warmup_steps
+                    req.save_output = False
+                    req.suppress_logs = True
+                    req.metrics.suppress_stage_breakdown = True
+                    req.extra["server_internal_prewarm"] = True
+                req.sampling_params.prepare_synthetic_warmup_request_for_queue(
+                    req, server_args
+                )
+                if return_warmup_result:
+                    req.extra["return_warmup_result"] = True
+                if server_based_warmup:
+                    req.extra["server_based_warmup"] = True
+                warmup_reqs.append(req)
 
     return warmup_reqs

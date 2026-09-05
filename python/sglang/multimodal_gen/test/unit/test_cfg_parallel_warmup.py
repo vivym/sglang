@@ -24,6 +24,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
+)
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
@@ -104,6 +108,28 @@ def _make_validation_server_args(enable_cfg_parallel: bool) -> MagicMock:
     return sa
 
 
+def _make_h3_warmup_server_args(
+    *,
+    enable_vae_torch_compile: bool | None,
+    enable_torch_compile: bool = False,
+    model_variant: str = "fl2va",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        backend="sglang",
+        enable_breakable_cuda_graph=False,
+        enable_cfg_parallel=False,
+        enable_torch_compile=enable_torch_compile,
+        enable_vae_torch_compile=enable_vae_torch_compile,
+        is_arg_explicitly_set=lambda _name: False,
+        model_path="/fake/MiniMax-H3",
+        model_subfolder=None,
+        model_variant=model_variant,
+        pipeline_class_name="MiniMaxH3Pipeline",
+        pipeline_config=MiniMaxH3PipelineConfig(),
+        warmup_steps=1,
+    )
+
+
 class TestWarmupReqCfgParallel(unittest.TestCase):
     """Warmup request construction and req-based warmup guards."""
 
@@ -121,6 +147,172 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             )[0]
         self.assertIs(req.do_classifier_free_guidance, True)
         self.assertEqual(req.negative_prompt, sampling_defaults.negative_prompt)
+
+    def _build_h3_warmup_reqs(
+        self,
+        *,
+        vae_compile: bool | None,
+        dit_compile: bool = False,
+        server_based_warmup: bool = True,
+    ) -> list[Req]:
+        server_args = _make_h3_warmup_server_args(
+            enable_vae_torch_compile=vae_compile,
+            enable_torch_compile=dit_compile,
+        )
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.warmup_request_builder."
+                "get_model_sampling_defaults",
+                return_value=MiniMaxH3SamplingParams(),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                "model_specific_stages.minimax_h3.prequeue."
+                "minimax_h3_prepare_prompt_admission",
+                return_value={},
+            ),
+        ):
+            return build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                server_based_warmup=server_based_warmup,
+            )
+
+    def test_minimax_h3_without_vae_compile_only_warms_five_seconds(self):
+        reqs = self._build_h3_warmup_reqs(vae_compile=False)
+
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(reqs[0].num_frames, 124)
+        plan = reqs[0].extra["minimax_h3_resolved_plan"]
+        self.assertEqual(plan.shape["video_latent_t"], 37)
+        self.assertTrue(reqs[0].is_warmup)
+        self.assertTrue(reqs[0].extra["server_based_warmup"])
+
+    def test_minimax_h3_vae_only_compile_warms_short_then_long_temporal_shapes(self):
+        reqs = self._build_h3_warmup_reqs(vae_compile=True)
+
+        self.assertEqual(len(reqs), 2)
+        self.assertEqual(
+            [req.sampling_params.target["duration_seconds"] for req in reqs],
+            [5.0, 15.0],
+        )
+        self.assertEqual(
+            [(req.width, req.height, req.num_frames) for req in reqs],
+            [(1344, 768, 124), (1344, 768, 362)],
+        )
+        self.assertEqual(
+            [
+                req.extra["minimax_h3_resolved_plan"].shape["video_latent_t"]
+                for req in reqs
+            ],
+            [37, 107],
+        )
+        self.assertTrue(all(req.is_warmup for req in reqs))
+        self.assertTrue(all(req.extra["server_based_warmup"] is True for req in reqs))
+
+    def test_minimax_h3_explicit_vae_compile_off_overrides_dit_compile(self):
+        reqs = self._build_h3_warmup_reqs(
+            vae_compile=False,
+            dit_compile=True,
+        )
+
+        self.assertEqual(len(reqs), 2)
+        self.assertEqual(
+            [req.sampling_params.target["duration_seconds"] for req in reqs],
+            [5.0, 5.0],
+        )
+        self.assertEqual(
+            [
+                req.sampling_params.target["duration_seconds"]
+                for req in reqs
+                if req.is_warmup
+            ],
+            [5.0],
+        )
+
+    def test_minimax_h3_global_compile_inherits_vae_temporal_warmups(self):
+        reqs = self._build_h3_warmup_reqs(
+            vae_compile=None,
+            dit_compile=True,
+        )
+
+        self.assertEqual(len(reqs), 4)
+        self.assertEqual(
+            [req.sampling_params.target["duration_seconds"] for req in reqs],
+            [5.0, 5.0, 15.0, 15.0],
+        )
+        self.assertEqual(
+            [
+                req.sampling_params.target["duration_seconds"]
+                for req in reqs
+                if req.is_warmup
+            ],
+            [5.0, 15.0],
+        )
+
+    def test_minimax_h3_request_based_warmup_does_not_add_long_shape(self):
+        reqs = self._build_h3_warmup_reqs(
+            vae_compile=True,
+            server_based_warmup=False,
+        )
+
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(reqs[0].sampling_params.target["duration_seconds"], 5.0)
+        self.assertNotIn("server_based_warmup", reqs[0].extra)
+
+    def test_minimax_h3_ref2va_warmup_keeps_reference_image_conditions(self):
+        class FakeHooks:
+            @staticmethod
+            def prepare_for_queue_sync(_req):
+                return None
+
+        for vae_compile, expected_durations in (
+            (False, [5.0]),
+            (True, [5.0, 15.0]),
+        ):
+            with self.subTest(vae_compile=vae_compile):
+                server_args = _make_h3_warmup_server_args(
+                    enable_vae_torch_compile=vae_compile,
+                    model_variant="ref2va",
+                )
+                with (
+                    patch(
+                        "sglang.multimodal_gen.runtime.warmup_request_builder."
+                        "get_model_sampling_defaults",
+                        return_value=MiniMaxH3SamplingParams(),
+                    ),
+                    patch.object(
+                        MiniMaxH3SamplingParams,
+                        "_video_hooks",
+                        return_value=FakeHooks(),
+                    ),
+                ):
+                    reqs = build_warmup_reqs(
+                        server_args,
+                        warmup_resolutions=None,
+                        warmup_input_path="/tmp/reference.png",
+                        server_based_warmup=True,
+                    )
+
+                self.assertEqual(
+                    [req.sampling_params.target["duration_seconds"] for req in reqs],
+                    expected_durations,
+                )
+                for req in reqs:
+                    self.assertEqual(req.sampling_params.task, "ref2va")
+                    self.assertEqual(
+                        req.sampling_params.conditions,
+                        [
+                            {
+                                "type": "image",
+                                "uri": "/tmp/reference.png",
+                                "role": "reference",
+                            }
+                        ],
+                    )
+                    self.assertTrue(req.is_warmup)
+                    self.assertTrue(req.extra["server_based_warmup"])
 
     def test_warmup_req_cfg_parallel_fills_missing_negative_prompt(self):
         server_args = _make_bare_scheduler(enable_cfg_parallel=True).server_args

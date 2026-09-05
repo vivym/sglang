@@ -2,6 +2,7 @@
 import math
 import os
 from collections.abc import Mapping
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -133,6 +134,35 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
         return expand_request_outputs(req)
 
+    def synthetic_warmup_sampling_params(
+        self, server_args: Any, *, server_based_warmup: bool
+    ) -> tuple[SamplingParams, ...]:
+        """Warm the temporal endpoints needed by the compiled Video VAE.
+
+        The first 5-second request preserves the existing startup path. A
+        15-second request then generalizes the compiled temporal graph; the
+        measured 10-second shape reuses that graph without another compile.
+        """
+        from sglang.multimodal_gen.runtime.utils.torch_compile import (
+            is_vae_torch_compile_enabled,
+        )
+
+        durations = (
+            (5.0, 15.0)
+            if server_based_warmup and is_vae_torch_compile_enabled(server_args)
+            else (5.0,)
+        )
+        variants = []
+        for duration_seconds in durations:
+            params = copy(self)
+            params.target = {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "duration_seconds": duration_seconds,
+            }
+            variants.append(params)
+        return tuple(variants)
+
     def prepare_synthetic_warmup_request_for_queue(
         self, req: Any, server_args: Any
     ) -> None:
@@ -175,11 +205,12 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
         self.task = task
         self.conditions = conditions
-        self.target = {
-            "short_edge": 768,
-            "aspect_ratio": "16:9",
-            "duration_seconds": 5.0,
-        }
+        if self.target is None:
+            self.target = {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "duration_seconds": 5.0,
+            }
         selected_seed = req.seed if isinstance(req.seed, int) else int(req.seed[0])
         req.extra.update(self.build_request_extra(_seed_override=int(selected_seed)))
         self._video_hooks().prepare_for_queue_sync(req)
