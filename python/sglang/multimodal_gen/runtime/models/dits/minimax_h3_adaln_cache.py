@@ -465,6 +465,11 @@ class MiniMaxH3AdalnCache(nn.Module):
             if metadata.get("format_version") == "1":
                 self._load_legacy_flat(cache_file, metadata, device)
                 return
+            if self.legacy_provenance is not None:
+                raise ValueError(
+                    "checkpoint-bound quantized MiniMax H3 requires a "
+                    "fingerprinted v1 AdaLN sidecar"
+                )
             if metadata.get("format_version") != self._FORMAT_VERSION:
                 raise ValueError(
                     "MiniMax H3 AdaLN cache has an unsupported or missing format_version"

@@ -1886,11 +1886,20 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
+        cache_requested = adaln_cache_path is not None or adaln_weight_files is not None
+        checkpoint_bound_legacy_cache = (
+            adaln_cache_path is not None
+            and adaln_weight_files is None
+            and adaln_cache_provenance is not None
+        )
         if (
-            adaln_cache_path is not None or adaln_weight_files is not None
-        ) and quant_config is not None:
+            cache_requested
+            and quant_config is not None
+            and not checkpoint_bound_legacy_cache
+        ):
             raise ValueError(
-                "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
+                "MiniMax H3 quantized weights require a fingerprinted v1 AdaLN "
+                "sidecar declared by the checkpoint"
             )
         if arch.adaln_curve_grid is not None and (
             adaln_cache_path is not None or adaln_weight_files is not None
@@ -1898,9 +1907,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             raise ValueError(
                 "MiniMax H3 pruned curve checkpoints cannot use a separate AdaLN cache"
             )
-        self._adaln_precomputed = (
-            adaln_cache_path is not None or adaln_weight_files is not None
-        )
+        self._adaln_precomputed = cache_requested
         self.arch = arch
         if arch.checkpoint_uses_diffusers_layout:
             self.preprocess_loaded_state_dict = _diffusers_h3_checkpoint

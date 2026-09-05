@@ -866,6 +866,72 @@ def _meta_h3(quant_config) -> MiniMaxH3DiTModel:
         )
 
 
+def test_int8_fingerprinted_v1_adaln_sidecar_is_allowed():
+    _ensure_single_process_parallel_runtime()
+    provenance = {
+        "format_version": "1",
+        "table_layout": "full",
+        "source_fingerprint": "sha256:test",
+    }
+    quant_config = Int8Config.from_config(
+        {
+            "quant_method": "int8",
+            "convrot": True,
+            "ignored_layers": ["condition_proj", "token_refiner"],
+            "minimax_h3_adaln_table": provenance,
+        }
+    )
+
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=quant_config,
+            adaln_cache_path="/unused/fingerprinted-v1.safetensors",
+            adaln_cache_provenance=provenance,
+        )
+
+    assert model.adaln_cache is not None
+    assert model.blocks[0].adaln_proj is None
+    assert model.final_layer.adaln_proj is None
+    assert isinstance(model.condition_proj.quant_method, UnquantizedLinearMethod)
+    assert all(
+        isinstance(layer.quant_method, UnquantizedLinearMethod)
+        for block in model.token_refiner.blocks
+        for layer in (
+            block.attn.qkv_proj,
+            block.attn.out_proj,
+            block.mlp.fc1,
+            block.mlp.fc2,
+        )
+    )
+    assert not any(
+        name.endswith("weight_scale")
+        for name, _ in model.named_parameters()
+        if name.startswith(("condition_proj.", "token_refiner."))
+    )
+
+
+@pytest.mark.parametrize(
+    "cache_kwargs",
+    (
+        {"adaln_cache_path": "/unused/unbound.safetensors"},
+        {"adaln_weight_files": ["/unused/model.safetensors"]},
+    ),
+)
+def test_int8_rejects_unbound_or_online_adaln_cache(cache_kwargs):
+    _ensure_single_process_parallel_runtime()
+    quant_config = Int8Config.from_config({"quant_method": "int8", "convrot": True})
+
+    with torch.device("meta"), pytest.raises(ValueError, match="fingerprinted v1"):
+        MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=quant_config,
+            **cache_kwargs,
+        )
+
+
 def test_offline_block_fp8_checkpoint_layout_and_cpu_load():
     quant_config = _block_fp8_quant_config(
         ignored_layers=[

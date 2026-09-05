@@ -273,6 +273,35 @@ def test_legacy_sidecar_requires_matching_checkpoint_fingerprint(tmp_path):
         cache.load(torch.device("cpu"))
 
 
+def test_checkpoint_bound_cache_rejects_v2_sidecar(tmp_path):
+    path = tmp_path / "v2.safetensors"
+    save_file(
+        {
+            "plan_timesteps": torch.tensor([[1.0]], dtype=torch.float32),
+            "plan_lengths": torch.tensor([1], dtype=torch.int64),
+            "block_params": torch.zeros(
+                (1, 1, _ARCH.num_layers, _BLOCK_WIDTH), dtype=torch.bfloat16
+            ),
+            "final_params": torch.zeros((1, 1, _FINAL_WIDTH), dtype=torch.bfloat16),
+        },
+        path,
+        metadata={"format_version": "2", "model_variant": "fl2va"},
+    )
+    cache = MiniMaxH3AdalnCache(
+        _ARCH,
+        path=str(path),
+        model_variant="fl2va",
+        legacy_provenance={
+            "format_version": "1",
+            "table_layout": "full",
+            "source_fingerprint": "sha256:test",
+        },
+    )
+
+    with pytest.raises(ValueError, match="fingerprinted v1"):
+        cache.load(torch.device("cpu"))
+
+
 def test_online_cache_resolve_slots_after_build(tmp_path):
     cache = _online_cache(tmp_path, max_plan_width=2)
     plan_a = torch.tensor([1.0])
