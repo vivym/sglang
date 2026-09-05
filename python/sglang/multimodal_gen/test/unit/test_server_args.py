@@ -393,6 +393,58 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertTrue(args.layerwise_offload_components)
         self.assertEqual(args.layerwise_offload_components, ["dit"])
 
+    def test_layerwise_offload_prefetch_size_from_kwargs(self):
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+        ):
+            args = ServerArgs.from_kwargs(
+                model_path="/data/my-model",
+                performance_mode="manual",
+                layerwise_offload_prefetch_size=2.0,
+                layerwise_prefetch_size="vae=3",
+            )
+
+        self.assertEqual(args.layerwise_offload_prefetch_size, 2.0)
+        self.assertEqual(
+            args.layerwise_tuning_for("text_encoder", dit_group=False)[0], 2.0
+        )
+        self.assertEqual(args.layerwise_tuning_for("vae", dit_group=False)[0], 3.0)
+
+    def test_layerwise_offload_prefetch_size_cli(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args, unknown_args = parser.parse_known_args(
+            [
+                "--model-path",
+                "/data/my-model",
+                "--layerwise-offload-prefetch-size",
+                "2",
+            ]
+        )
+
+        self.assertFalse(unknown_args)
+        self.assertEqual(args.layerwise_offload_prefetch_size, 2.0)
+
+    def test_layerwise_offload_prefetch_size_validation(self):
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "performance_mode": "manual",
+                    "layerwise_offload_prefetch_size": -1.0,
+                }
+            )
+
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "performance_mode": "manual",
+                "layerwise_offload_prefetch_size": 2.5,
+            }
+        )
+        self.assertEqual(args.layerwise_offload_prefetch_size, 2)
+
     def test_layerwise_offload_components_normalize_commas(self):
         args = self._from_dict_without_model_resolution(
             {

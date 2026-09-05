@@ -384,6 +384,8 @@ class ServerArgs(DisaggServerArgsMixin):
     # if true, select the DiT layerwise group
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
+    # Default prefetch window for non-DiT layerwise-offloaded components.
+    layerwise_offload_prefetch_size: float = 0.0
     dit_offload_prefetch_size: float = 0.0
     # If set, keep this many DiT layers resident on GPU
     dit_layerwise_resident_layers: float = 0.0
@@ -2474,6 +2476,15 @@ class ServerArgs(DisaggServerArgsMixin):
             "--layerwise-offload-components text_encoder image_encoder vae.",
         )
         parser.add_argument(
+            "--layerwise-offload-prefetch-size",
+            type=float,
+            default=ServerArgs.layerwise_offload_prefetch_size,
+            help="The default prefetch window for non-DiT layerwise-offloaded "
+            "components. Between 0.0 and 1.0 is a ratio of total layers; >= 1 "
+            "is an absolute layer count. 0.0 means one layer (lowest memory). "
+            "Per-component --layerwise-prefetch-size entries take precedence.",
+        )
+        parser.add_argument(
             "--dit-offload-prefetch-size",
             type=float,
             default=ServerArgs.dit_offload_prefetch_size,
@@ -3468,6 +3479,20 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _validate_offload(self):
+        if self.layerwise_offload_prefetch_size < 0.0:
+            raise ValueError("layerwise_offload_prefetch_size must be non-negative")
+        if self.layerwise_offload_prefetch_size > 1 and (
+            isinstance(self.layerwise_offload_prefetch_size, float)
+            and not self.layerwise_offload_prefetch_size.is_integer()
+        ):
+            self.layerwise_offload_prefetch_size = int(
+                math.floor(self.layerwise_offload_prefetch_size)
+            )
+            logger.info(
+                "Invalid --layerwise-offload-prefetch-size value passed, "
+                f"truncated to: {self.layerwise_offload_prefetch_size}"
+            )
+
         if (
             self.component_residency is not None
             and self.pipeline_config.task_type.is_action_gen()
