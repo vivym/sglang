@@ -245,8 +245,7 @@ class ViT3DDecoder(ViTBase):
 
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
-                "MiniMax H3 decoder autocast weights require fp16 or bf16, "
-                f"got {dtype}"
+                f"MiniMax H3 decoder autocast weights require fp16 or bf16, got {dtype}"
             )
         if self._autocast_linear_dtype == dtype:
             return 0
@@ -268,6 +267,57 @@ class ViT3DDecoder(ViTBase):
                 block.ff.prepare_fp16_w2_output_bound()
         self._autocast_linear_dtype = dtype
         return converted
+
+    @torch.no_grad()
+    def prepare_rotary_pos_emb_cache(
+        self,
+        *,
+        batch_size: int,
+        latent_size: tuple[int, int, int],
+        device: torch.device,
+        input_dtype: torch.dtype,
+        rotary_dtype: torch.dtype,
+    ) -> bool:
+        """Build the inference RoPE cache outside a compiled decode trace."""
+        if self.training or self.mask_enabled:
+            raise RuntimeError(
+                "MiniMax H3 VAE compile cache preparation requires inference "
+                "without decoder masking"
+            )
+        latent_t, latent_h, latent_w = (int(value) for value in latent_size)
+        if min(batch_size, latent_t, latent_h, latent_w) <= 0:
+            raise ValueError(
+                "MiniMax H3 VAE decoder cache dimensions must be positive, got "
+                f"batch={batch_size}, latent_size={latent_size}"
+            )
+
+        num_suffix = 1 + self.num_register_tokens
+        cache_key = (
+            int(batch_size),
+            latent_t,
+            latent_h,
+            latent_w,
+            num_suffix,
+            device,
+            input_dtype,
+            rotary_dtype,
+        )
+        cache_record = self._rotary_pos_emb_cache
+        if cache_record is not None and cache_record[0] == cache_key:
+            return False
+
+        img_ids = create_token_ids(latent_size, device, input_dtype).expand(
+            batch_size, -1, -1
+        )
+        suffix_ids = torch.zeros(
+            (batch_size, num_suffix, 3), device=device, dtype=img_ids.dtype
+        )
+        img_ids = torch.cat([img_ids, suffix_ids], dim=1)
+        rotary_pos_emb = prepare_rotary_pos_emb(
+            self.pos_embed(img_ids), dtype=rotary_dtype
+        )
+        self._rotary_pos_emb_cache = (cache_key, img_ids, rotary_pos_emb)
+        return True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, latent_T, latent_H, latent_W = x.shape

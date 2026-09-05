@@ -107,6 +107,145 @@ def test_audio_vae_decode_warms_once_per_module():
     assert torch.count_nonzero(calls[1]) == 0
 
 
+@pytest.mark.parametrize("latent_t", [37, 72, 107])
+def test_video_vae_compile_cache_plan_matches_serving_shapes(latent_t):
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
+        AutoencoderKL,
+    )
+
+    class FakeDecoder:
+        training = False
+        proj_out = SimpleNamespace(weight=torch.empty((), dtype=torch.float32))
+
+        def __init__(self):
+            self.calls = []
+
+        def prepare_rotary_pos_emb_cache(self, **kwargs):
+            self.calls.append(kwargs)
+            return len(self.calls) == 1
+
+    class FakeVAE:
+        training = False
+        vae_ratio = 16
+        vae_ratio_t = 4
+        token_drop = 3
+        tokens_chunk_size = 5
+        token_overlap = 2
+        frame_overlap = 5
+        frame_pre_padding = 3
+        isolated_first_frame = False
+        isolated_last_frame = False
+        decoder_tiling = True
+        decoder_tile_size = 256
+        decoder_tile_overlap_min = 64
+        stack_tiling = False
+        post_quant_conv = SimpleNamespace(weight=torch.empty((), dtype=torch.float16))
+        split_tiles = AutoencoderKL.split_tiles
+        _local_tile_indices = AutoencoderKL._local_tile_indices
+        _decode_temporal_plan = AutoencoderKL._decode_temporal_plan
+        _decode_temporal_cache_lengths = AutoencoderKL._decode_temporal_cache_lengths
+        prepare_decode_caches = AutoencoderKL.prepare_decode_caches
+
+        def __init__(self):
+            self.decoder = FakeDecoder()
+            self._blend_weight_cache = {}
+
+    vae = FakeVAE()
+    report = vae.prepare_decode_caches(torch.empty(1, 24, latent_t, 48, 84))
+
+    assert report == {
+        "decoder_shape": (1, 7, 16, 16),
+        "decoder_dtype": "torch.float16",
+        "blend_dtype": "torch.float32",
+        "temporal_chunks": {37: 7, 72: 14, 107: 21}[latent_t],
+        "rotary_created": True,
+        "blend_extents": (5, 64, 80, 96),
+        "blend_created": 4,
+    }
+    assert vae.decoder.calls == [
+        {
+            "batch_size": 1,
+            "latent_size": (7, 16, 16),
+            "device": torch.device("cpu"),
+            "input_dtype": torch.float16,
+            "rotary_dtype": torch.float16,
+        }
+    ]
+    assert sorted(key[0] for key in vae._blend_weight_cache) == [5, 64, 80, 96]
+    assert {key[2] for key in vae._blend_weight_cache} == {torch.float32}
+    second = vae.prepare_decode_caches(torch.empty(1, 24, latent_t, 48, 84))
+    assert second["blend_created"] == 0
+
+
+def test_video_vae_compile_cache_plan_skips_unused_temporal_blend():
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
+        AutoencoderKL,
+    )
+
+    class FakeDecoder:
+        training = False
+        proj_out = SimpleNamespace(weight=torch.empty((), dtype=torch.float32))
+
+        @staticmethod
+        def prepare_rotary_pos_emb_cache(**_kwargs):
+            return True
+
+    class FakeVAE:
+        training = False
+        vae_ratio = 16
+        token_drop = 3
+        tokens_chunk_size = 5
+        token_overlap = 2
+        frame_overlap = 5
+        frame_pre_padding = 3
+        isolated_first_frame = False
+        isolated_last_frame = False
+        decoder_tiling = True
+        decoder_tile_size = 256
+        decoder_tile_overlap_min = 64
+        stack_tiling = False
+        post_quant_conv = SimpleNamespace(weight=torch.empty((), dtype=torch.float32))
+        split_tiles = AutoencoderKL.split_tiles
+        _local_tile_indices = AutoencoderKL._local_tile_indices
+        _decode_temporal_plan = AutoencoderKL._decode_temporal_plan
+        _decode_temporal_cache_lengths = AutoencoderKL._decode_temporal_cache_lengths
+        prepare_decode_caches = AutoencoderKL.prepare_decode_caches
+
+        def __init__(self):
+            self.decoder = FakeDecoder()
+            self._blend_weight_cache = {}
+
+    vae = FakeVAE()
+    report = vae.prepare_decode_caches(torch.empty(1, 24, 7, 16, 16))
+
+    assert report["temporal_chunks"] == 1
+    assert report["blend_extents"] == ()
+    assert report["blend_created"] == 0
+    assert vae._blend_weight_cache == {}
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_video_vae_compile_cache_preseed_follows_compile_control(monkeypatch, enabled):
+    class FakeVideoVAE:
+        def __init__(self):
+            self.inputs = []
+
+        def prepare_decode_caches(self, latent):
+            self.inputs.append(latent)
+            return {"prepared": True}
+
+    vae = FakeVideoVAE()
+    latent = torch.empty(1, 24, 37, 48, 84)
+    monkeypatch.setattr(decoding, "is_vae_torch_compile_enabled", lambda _: enabled)
+
+    report = MiniMaxH3DecodingStage._prepare_video_vae_compile_caches(
+        vae, latent, SimpleNamespace()
+    )
+
+    assert vae.inputs == ([latent] if enabled else [])
+    assert report == ({"prepared": True} if enabled else None)
+
+
 def test_ffprobe_falls_back_when_stream_side_data_is_unknown(monkeypatch):
     material_io._ffprobe_entries = None
     calls = []

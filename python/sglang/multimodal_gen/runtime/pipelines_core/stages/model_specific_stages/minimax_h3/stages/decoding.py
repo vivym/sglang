@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 )
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
+    is_vae_torch_compile_enabled,
 )
 
 
@@ -261,6 +262,22 @@ class MiniMaxH3DecodingStage(DecodingStage):
         audio_decode(torch.zeros_like(audio_decode_latent[..., :warmup_length]))
         self._warmed_audio_vae_target_id = target_id
 
+    @staticmethod
+    def _prepare_video_vae_compile_caches(
+        video_vae,
+        visual_decode_latent: torch.Tensor,
+        server_args: ServerArgs,
+    ) -> dict[str, object] | None:
+        if not is_vae_torch_compile_enabled(server_args):
+            return None
+        prepare = getattr(video_vae, "prepare_decode_caches", None)
+        if not callable(prepare):
+            raise RuntimeError(
+                "MiniMax H3 video VAE torch.compile requires deterministic "
+                "decode-cache preparation"
+            )
+        return prepare(visual_decode_latent)
+
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DECODER
@@ -404,6 +421,11 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     reset_vae_ffn_probe,
                 )
 
+                self._prepare_video_vae_compile_caches(
+                    selected_video_vae,
+                    visual_decode_latent,
+                    server_args,
+                )
                 video_decode = self._get_vae_decode_fn(
                     selected_video_vae,
                     server_args,

@@ -281,6 +281,152 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         else:
             return blended
 
+    def _decode_temporal_plan(self, total_tokens: int) -> tuple[int, int, int]:
+        isolated_head = self.isolated_first_frame and self.frame_pre_padding == 0
+        isolated_tail = self.isolated_last_frame
+        isolated_tokens = int(isolated_head) + int(isolated_tail)
+        pseudo_total_tokens = int(total_tokens) - isolated_tokens + self.token_drop
+        remainder = pseudo_total_tokens % self.tokens_chunk_size
+        if remainder and self.training:
+            raise ValueError(f"Temporal token length {total_tokens} is wrong!")
+        pad_tokens = (self.tokens_chunk_size - remainder) % self.tokens_chunk_size
+        pseudo_total_tokens += pad_tokens
+        num_chunks = pseudo_total_tokens // self.tokens_chunk_size - int(
+            self.token_drop > 0
+        )
+        if num_chunks <= 0:
+            raise ValueError(
+                "MiniMax H3 VAE decode planned no temporal "
+                f"chunks for latent length {int(total_tokens)}"
+            )
+        return isolated_tokens, pad_tokens, num_chunks
+
+    def _decode_temporal_cache_lengths(self, z: torch.Tensor) -> tuple[set[int], int]:
+        isolated_head = self.isolated_first_frame and self.frame_pre_padding == 0
+        isolated_tail = self.isolated_last_frame
+        isolated_tokens, pad_tokens, num_chunks = self._decode_temporal_plan(
+            int(z.shape[2])
+        )
+
+        body_tokens = int(z.shape[2]) - isolated_tokens + pad_tokens
+        lengths = set()
+        for index in range(num_chunks):
+            start = index * self.tokens_chunk_size
+            end = start + self.tokens_chunk_size + self.token_overlap
+            length = max(0, min(end, body_tokens) - min(start, body_tokens))
+            if index == 0 and isolated_head:
+                length += 1
+            if index == num_chunks - 1 and isolated_tail:
+                length += 1
+            lengths.add(length)
+        return lengths, num_chunks
+
+    @torch.no_grad()
+    def prepare_decode_caches(self, z: torch.Tensor) -> dict[str, object]:
+        """Preseed shape-only decoder caches before torch.compile traces them."""
+        if z.ndim != 5:
+            raise ValueError(
+                "MiniMax H3 VAE compile cache preparation requires "
+                f"[B,C,T,H,W] latents, got {tuple(z.shape)}"
+            )
+        if self.training:
+            raise RuntimeError(
+                "MiniMax H3 VAE compile cache preparation requires eval mode"
+            )
+
+        temporal_lengths, num_temporal_chunks = self._decode_temporal_cache_lengths(z)
+        height = int(z.shape[-2]) * self.vae_ratio
+        width = int(z.shape[-1]) * self.vae_ratio
+        if self.decoder_tiling:
+            y_idx, y_len, y_overlap = self.split_tiles(height, True)
+            x_idx, x_len, x_overlap = self.split_tiles(width, True)
+            spatial_sizes = {
+                (tile_h // self.vae_ratio, tile_w // self.vae_ratio)
+                for tile_h in y_len
+                for tile_w in x_len
+            }
+            num_tiles = len(y_idx) * len(x_idx)
+        else:
+            y_overlap = []
+            x_overlap = []
+            spatial_sizes = {(int(z.shape[-2]), int(z.shape[-1]))}
+            num_tiles = 1
+
+        batch_size = int(z.shape[0])
+        if self.stack_tiling:
+            if self.parallel_tiling:
+                tile_rank, tile_world_size = get_tile_parallel_state()
+            else:
+                tile_rank, tile_world_size = 0, 1
+            if tile_world_size > num_tiles:
+                tile_rank, tile_world_size = 0, 1
+            local_tiles = len(
+                self._local_tile_indices(num_tiles, tile_rank, tile_world_size)
+            )
+            if local_tiles <= 0:
+                raise RuntimeError(
+                    "MiniMax H3 VAE compile cache preparation found no local tiles"
+                )
+            batch_size *= local_tiles
+
+        decoder_shapes = {
+            (batch_size, temporal, latent_h, latent_w)
+            for temporal in temporal_lengths
+            for latent_h, latent_w in spatial_sizes
+        }
+        if len(decoder_shapes) != 1:
+            raise RuntimeError(
+                "MiniMax H3 VAE torch.compile requires one decoder cache shape per "
+                f"request, got {sorted(decoder_shapes)}"
+            )
+        decoder_batch, latent_t, latent_h, latent_w = next(iter(decoder_shapes))
+
+        device_type = z.device.type
+        autocast_enabled = torch.is_autocast_enabled(device_type)
+        decoder_dtype = (
+            torch.get_autocast_dtype(device_type)
+            if autocast_enabled
+            else self.post_quant_conv.weight.dtype
+        )
+        rotary_created = self.decoder.prepare_rotary_pos_emb_cache(
+            batch_size=decoder_batch,
+            latent_size=(latent_t, latent_h, latent_w),
+            device=z.device,
+            input_dtype=decoder_dtype,
+            rotary_dtype=decoder_dtype,
+        )
+
+        temporal_cat_dtype = _resolve_temporal_cat_dtype()
+        blend_dtype = (
+            temporal_cat_dtype
+            if temporal_cat_dtype is not None
+            else self.decoder.proj_out.weight.dtype
+        )
+        blend_extents = set(y_overlap) | set(x_overlap)
+        if num_temporal_chunks > 1 and self.frame_overlap > 0:
+            blend_extents.add(self.frame_overlap)
+        blend_created = 0
+        for blend_extent in sorted(blend_extents):
+            cache_key = (blend_extent, z.device, blend_dtype)
+            if cache_key in self._blend_weight_cache:
+                continue
+            positions = torch.arange(blend_extent, device=z.device, dtype=blend_dtype)
+            self._blend_weight_cache[cache_key] = (
+                1 - positions / blend_extent,
+                positions / blend_extent,
+            )
+            blend_created += 1
+
+        return {
+            "decoder_shape": decoder_shapes.pop(),
+            "decoder_dtype": str(decoder_dtype),
+            "blend_dtype": str(blend_dtype),
+            "temporal_chunks": num_temporal_chunks,
+            "rotary_created": rotary_created,
+            "blend_extents": tuple(sorted(blend_extents)),
+            "blend_created": blend_created,
+        }
+
     def _assemble_tiles(self, rows, y_overlap, x_overlap):
         output_height = sum(
             row[0].shape[-2] - (y_overlap[i] if i < len(rows) - 1 else 0)
@@ -767,26 +913,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
     def decode_temporal(self, z):
         chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
-
-        isolated_token_num = 0
-        if self.isolated_first_frame and self.frame_pre_padding == 0:
-            isolated_token_num = isolated_token_num + 1
-        if self.isolated_last_frame:
-            isolated_token_num = isolated_token_num + 1
-
-        pseudo_total_tokens = z.shape[2] - isolated_token_num + self.token_drop
-
-        pad_tokens = 0
-        remainder = pseudo_total_tokens % self.tokens_chunk_size
-        if remainder != 0:
-            if self.training:
-                raise ValueError(f"Temporal token length {z.shape[2]} is wrong!")
-            else:
-                pad_tokens = self.tokens_chunk_size - remainder
-                pseudo_total_tokens = pseudo_total_tokens + pad_tokens
-
-        pseudo_num_chunks = pseudo_total_tokens // self.tokens_chunk_size
-        num_chunks = pseudo_num_chunks - int(self.token_drop > 0)
+        _, pad_tokens, num_chunks = self._decode_temporal_plan(int(z.shape[2]))
 
         z_head = None
         if self.isolated_first_frame and self.frame_pre_padding == 0:
