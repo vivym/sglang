@@ -259,6 +259,18 @@ def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
         minimax_h3_prompt_admission = minimax_h3_prompt_admission_runtime_info(
             server_args
         )
+    sage_sm80_variant = os.environ.get("SGLANG_H3_SAGE_SM80_VARIANT", "").strip()
+    sageattention_sm80 = (
+        {
+            "variant": sage_sm80_variant,
+            "root": os.environ.get("SGLANG_H3_SAGE_SM80_ROOT", "").strip(),
+            "qattn_sha256": os.environ.get(
+                "SGLANG_H3_SAGE_SM80_QATTN_SHA256", ""
+            ).strip(),
+        }
+        if sage_sm80_variant
+        else None
+    )
     return {
         "backend": backend,
         "model_variant": server_args.model_variant,
@@ -268,6 +280,7 @@ def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
         "component_attention_backends": dict(
             server_args.component_attention_backends or {}
         ),
+        "sageattention_sm80": sageattention_sm80,
         "performance_mode": server_args.performance_mode,
         "dit_cpu_offload": server_args.dit_cpu_offload,
         "text_encoder_cpu_offload": server_args.text_encoder_cpu_offload,

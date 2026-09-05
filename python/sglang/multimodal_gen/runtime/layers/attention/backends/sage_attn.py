@@ -35,6 +35,7 @@ SAGE_SM80_RESEARCH_VARIANTS = frozenset(
         "cuda_per_warp_fp32",
         "cuda_per_warp_fp32_precombined_skip_noop",
         "cuda_fp16",
+        "cuda_per_thread_fp16",
         "cuda_fp16_row_pipeline_precombined_scale",
     }
 )
@@ -169,7 +170,6 @@ def _trailing_padding_used_len(
 
 
 class SageAttentionBackend(AttentionBackend):
-
     @classmethod
     def supports_ring_rotation(cls) -> bool:
         return True
@@ -190,7 +190,6 @@ class SageAttentionBackend(AttentionBackend):
 
 
 class SageAttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,
@@ -228,7 +227,9 @@ class SageAttentionImpl(AttentionImpl):
             )
         else:
             if self.causal:
-                raise RuntimeError("H3 SageAttention SM80 research mode is non-causal only")
+                raise RuntimeError(
+                    "H3 SageAttention SM80 research mode is non-causal only"
+                )
             if return_softmax_lse:
                 raise RuntimeError(
                     "H3 SageAttention SM80 research mode does not expose softmax LSE"

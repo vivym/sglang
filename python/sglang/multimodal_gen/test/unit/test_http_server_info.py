@@ -31,6 +31,9 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
     monkeypatch.setenv("SGLANG_CACHE_DIT_SCM_COMPUTE_BINS", "8,3,3,2,2")
     monkeypatch.setenv("SGLANG_CACHE_DIT_SCM_CACHE_BINS", "1,2,2,2,3")
     monkeypatch.setenv("SGLANG_CACHE_DIT_SCM_POLICY", "dynamic")
+    monkeypatch.setenv("SGLANG_H3_SAGE_SM80_VARIANT", "cuda_fp16")
+    monkeypatch.setenv("SGLANG_H3_SAGE_SM80_ROOT", "/opt/venv/site-packages")
+    monkeypatch.setenv("SGLANG_H3_SAGE_SM80_QATTN_SHA256", "a" * 64)
     server_args = SimpleNamespace(
         backend=SimpleNamespace(value="sglang"),
         model_variant="fl2va",
@@ -57,6 +60,7 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
         master_port=30502,
         scheduler_port=30503,
         scheduler_ports=[30503],
+        pipeline_config=None,
     )
 
     assert _runtime_config_for_server_info(server_args) == {
@@ -66,6 +70,11 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
         "component_paths": {"text_encoder": "/models/encoder-int8"},
         "attention_backend": "fa",
         "component_attention_backends": {"transformer": "fa"},
+        "sageattention_sm80": {
+            "variant": "cuda_fp16",
+            "root": "/opt/venv/site-packages",
+            "qattn_sha256": "a" * 64,
+        },
         "performance_mode": "memory",
         "dit_cpu_offload": False,
         "text_encoder_cpu_offload": False,
@@ -106,6 +115,7 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
             "memory_profile": "1",
             "memory_profile_release_encoder": "1",
             "cuda_launch_blocking": "1",
+            "prompt_admission": None,
         },
         "ports": {
             "http": 30500,
@@ -141,6 +151,9 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
         "SGLANG_CACHE_DIT_SCM_COMPUTE_BINS",
         "SGLANG_CACHE_DIT_SCM_CACHE_BINS",
         "SGLANG_CACHE_DIT_SCM_POLICY",
+        "SGLANG_H3_SAGE_SM80_VARIANT",
+        "SGLANG_H3_SAGE_SM80_ROOT",
+        "SGLANG_H3_SAGE_SM80_QATTN_SHA256",
     ):
         monkeypatch.delenv(name, raising=False)
     server_args = SimpleNamespace(
@@ -169,12 +182,14 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
         master_port=30005,
         scheduler_port=5555,
         scheduler_ports=None,
+        pipeline_config=None,
     )
 
     config = _runtime_config_for_server_info(server_args)
 
     assert config["component_paths"] == {}
     assert config["component_attention_backends"] == {}
+    assert config["sageattention_sm80"] is None
     assert config["layerwise_offload_components"] == []
     assert config["batching_mode"] == "dynamic"
     assert config["batching_max_size"] == 1
@@ -209,5 +224,6 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
         "memory_profile": "0",
         "memory_profile_release_encoder": "0",
         "cuda_launch_blocking": "0",
+        "prompt_admission": None,
     }
     assert config["ports"]["schedulers"] == [5555]

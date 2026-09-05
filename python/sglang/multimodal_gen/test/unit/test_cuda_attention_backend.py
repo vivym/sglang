@@ -1,3 +1,4 @@
+import os
 import sys
 import types
 import unittest
@@ -141,6 +142,20 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
                 _SageAttentionBackendResolver.resolve(FakeCudaPlatform),
                 AttentionBackendEnum.FA,
             )
+
+    def test_explicit_sm80_sage_attention_never_falls_back_when_missing(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"SGLANG_H3_SAGE_SM80_VARIANT": "cuda_fp16"},
+            ),
+            patch.dict(sys.modules, {"sageattention": None}),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "explicitly requested.*package is unavailable",
+            ),
+        ):
+            _SageAttentionBackendResolver.resolve(FakeCudaPlatform)
 
     def test_explicit_backend_rejected_by_a_model_fails_closed(self):
         with self.assertRaisesRegex(

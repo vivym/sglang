@@ -27,6 +27,8 @@ from sglang.multimodal_gen.utils import import_pynvml
 
 logger = init_logger(__name__)
 
+_H3_SAGE_SM80_VARIANT_ENV = "SGLANG_H3_SAGE_SM80_VARIANT"
+
 _SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 )
@@ -165,9 +167,15 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
 
     @classmethod
     def resolve(cls, platform) -> str | AttentionBackendEnum:
+        sage_sm80_required = bool(os.environ.get(_H3_SAGE_SM80_VARIANT_ENV, "").strip())
         try:
             from sageattention import sageattn  # noqa: F401
         except ImportError as e:
+            if sage_sm80_required:
+                raise RuntimeError(
+                    "SageAttention SM80 was explicitly requested but the "
+                    "sageattention package is unavailable"
+                ) from e
             logger.info(e)
             logger.info(
                 "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
@@ -193,6 +201,11 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
         except ImportError as e:
+            if sage_sm80_required:
+                raise RuntimeError(
+                    "SageAttention SM80 was explicitly requested but its SGLang "
+                    "backend failed to import"
+                ) from e
             logger.info(e)
             logger.info(
                 "Sage Attention backend failed to import. Falling back to Flash Attention."
