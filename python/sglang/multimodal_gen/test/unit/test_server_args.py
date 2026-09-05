@@ -140,6 +140,42 @@ def _from_dict_without_model_resolution(
         return ServerArgs.from_dict(kwargs)
 
 
+class TestAsyncOutputPersistence(unittest.TestCase):
+    def test_default_is_disabled(self):
+        args = ServerArgs(model_path="/fake")
+
+        self.assertFalse(args.async_output_persistence)
+
+    def test_cli_supports_explicit_enable_and_disable(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        enabled = parser.parse_args(
+            ["--model-path", "/fake", "--async-output-persistence"]
+        )
+        disabled = parser.parse_args(
+            ["--model-path", "/fake", "--async-output-persistence", "false"]
+        )
+
+        self.assertTrue(enabled.async_output_persistence)
+        self.assertFalse(disabled.async_output_persistence)
+
+    def test_from_kwargs_preserves_explicit_enable(self):
+        args = _from_dict_without_model_resolution(
+            {"model_path": "/fake", "async_output_persistence": True}
+        )
+
+        self.assertTrue(args.async_output_persistence)
+
+    def test_multi_node_is_rejected(self):
+        args = ServerArgs(model_path="/fake")
+        args.async_output_persistence = True
+        args.nnodes = 2
+
+        with self.assertRaisesRegex(ValueError, "currently requires nnodes=1"):
+            args._validate_batching()
+
+
 class TestServerArgsPathExpansion(unittest.TestCase):
     def _from_dict_without_model_resolution(self, kwargs):
         return _from_dict_without_model_resolution(kwargs)

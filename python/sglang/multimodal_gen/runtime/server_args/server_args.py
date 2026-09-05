@@ -495,6 +495,7 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     enable_batching_metrics: bool = False
+    async_output_persistence: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -2737,6 +2738,15 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
+            "--async-output-persistence",
+            action=StoreBoolean,
+            default=ServerArgs.async_output_persistence,
+            help=(
+                "Stage completed video frames to host memory, then overlap CPU "
+                "encoding and atomic output persistence with subsequent GPU requests."
+            ),
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -3754,6 +3764,11 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.async_output_persistence and self.nnodes != 1:
+            raise ValueError(
+                "async_output_persistence currently requires nnodes=1 because "
+                "completion references use the local filesystem"
+            )
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
