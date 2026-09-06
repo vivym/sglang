@@ -1,0 +1,258 @@
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
+    DiffusionServer,
+    _TransferRequestState,
+)
+from sglang.multimodal_gen.runtime.disaggregation.request_state import RequestState
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
+    TransferMsgType,
+    decode_transfer_msg,
+)
+
+
+class _RecordingSocket:
+    def __init__(self):
+        self.messages = []
+
+    def send_multipart(self, frames, *args, **kwargs):
+        del args, kwargs
+        self.messages.append(frames)
+
+
+@pytest.fixture
+def server():
+    instance = DiffusionServer(
+        frontend_endpoint="inproc://frontend",
+        encoder_work_endpoints=["inproc://encoder"],
+        denoiser_work_endpoints=["inproc://denoiser"],
+        decoder_work_endpoints=["inproc://decoder"],
+        encoder_result_endpoint="inproc://encoder-result",
+        denoiser_result_endpoint="inproc://denoiser-result",
+        decoder_result_endpoint="inproc://decoder-result",
+        encoder_capacity=1,
+        denoiser_capacity_per_worker=1,
+        decoder_capacity=1,
+    )
+    instance._encoder_pushes = [_RecordingSocket()]
+    instance._denoiser_pushes = [_RecordingSocket()]
+    instance._decoder_pushes = [_RecordingSocket()]
+    instance._frontend = _RecordingSocket()
+    try:
+        yield instance
+    finally:
+        instance._context.term()
+
+
+def _track_to_denoising(server: DiffusionServer, request_id: str) -> None:
+    server.tracker.submit(request_id)
+    server.tracker.transition(
+        request_id, RequestState.ENCODER_RUNNING, encoder_instance=0
+    )
+    server.tracker.transition(request_id, RequestState.ENCODER_DONE)
+    server.tracker.transition(request_id, RequestState.DENOISING_WAITING)
+    server.tracker.transition(
+        request_id, RequestState.DENOISING_RUNNING, denoiser_instance=0
+    )
+
+
+def _encoder_to_denoiser_state(transfer_id: str) -> _TransferRequestState:
+    return _TransferRequestState(
+        transfer_id=transfer_id,
+        source_role=RoleType.ENCODER,
+        destination_role=RoleType.DENOISER,
+        sender_transfer_backend="tcp",
+        data_size=1024,
+        manifest={"value": [{"offset": 0, "shape": [1024], "dtype": "uint8"}]},
+        sender_instance=0,
+        receiver_instance=0,
+    )
+
+
+def _transfer_messages(socket: _RecordingSocket) -> list[dict]:
+    return [decode_transfer_msg(frames) for frames in socket.messages]
+
+
+def test_push_failure_releases_each_capacity_once_and_never_sends_ready(server):
+    request_id = "push-failure"
+    transfer_id = "edge-attempt-1"
+    _track_to_denoising(server, request_id)
+    state = _encoder_to_denoiser_state(transfer_id)
+    server._transfer_state[request_id] = state
+    server._encoder_free_slots[0] = 0
+    server._denoiser_free_slots[0] = 0
+
+    failed = {
+        "request_id": request_id,
+        "transfer_id": transfer_id,
+        "error": "checksum mismatch",
+    }
+    server._handle_transfer_pushed(failed, RoleType.ENCODER)
+    server._handle_transfer_pushed(failed, RoleType.ENCODER)
+
+    assert server._encoder_free_slots == [1]
+    assert server._denoiser_free_slots == [1]
+    assert request_id not in server._transfer_state
+    assert all(
+        msg["msg_type"] == TransferMsgType.ABORT
+        for msg in _transfer_messages(server._denoiser_pushes[0])
+    )
+
+
+def test_duplicate_pushed_and_done_messages_do_not_inflate_capacity(server):
+    request_id = "duplicate-control"
+    transfer_id = "edge-attempt-2"
+    _track_to_denoising(server, request_id)
+    state = _encoder_to_denoiser_state(transfer_id)
+    server._transfer_state[request_id] = state
+    server._encoder_free_slots[0] = 0
+    server._denoiser_free_slots[0] = 0
+
+    pushed = {"request_id": request_id, "transfer_id": transfer_id}
+    server._handle_transfer_pushed(pushed, RoleType.ENCODER)
+    server._handle_transfer_pushed(pushed, RoleType.ENCODER)
+
+    ready = [
+        msg
+        for msg in _transfer_messages(server._denoiser_pushes[0])
+        if msg["msg_type"] == TransferMsgType.READY
+    ]
+    assert len(ready) == 1
+    assert server._encoder_free_slots == [1]
+    assert server._denoiser_free_slots == [0]
+
+    done = {
+        "request_id": request_id,
+        "completed_transfer_id": transfer_id,
+        "staged_for_decoder": False,
+    }
+    server._handle_transfer_done(done, RoleType.DENOISER)
+    server._handle_transfer_done(done, RoleType.DENOISER)
+
+    assert server._denoiser_free_slots == [1]
+    assert request_id not in server._transfer_state
+
+
+def test_preallocated_slot_is_recycled_once_after_failure(server):
+    request_id = "prealloc-failure"
+    transfer_id = "edge-attempt-3"
+    _track_to_denoising(server, request_id)
+    state = _encoder_to_denoiser_state(transfer_id)
+    state.receiver_pool_ptr = 1000
+    state.receiver_slot_offset = 128
+    state.receiver_slot_size = 4096
+    state.prealloc_slot_id = 7
+    server._transfer_state[request_id] = state
+    server._denoiser_peers[0] = {"free_preallocated_slots": []}
+    server._encoder_free_slots[0] = 0
+    server._denoiser_free_slots[0] = 0
+
+    server._fail_active_transfer(request_id, state, "failed")
+    server._fail_active_transfer(request_id, state, "failed again")
+
+    free_slots = server._denoiser_peers[0]["free_preallocated_slots"]
+    assert free_slots == [{"offset": 128, "size": 4096, "slot_id": 7, "addr": 1128}]
+
+
+def test_backend_mismatch_fails_before_receiver_allocation(server):
+    request_id = "backend-mismatch"
+    transfer_id = "edge-attempt-4"
+    _track_to_denoising(server, request_id)
+    state = _encoder_to_denoiser_state(transfer_id)
+    server._transfer_state[request_id] = state
+    server._encoder_free_slots[0] = 0
+    server._denoiser_free_slots[0] = 1
+    server._denoiser_peers[0] = {
+        "transfer_backend": "mooncake",
+        "free_preallocated_slots": [],
+    }
+
+    server._transfer_dispatch_to_denoiser(request_id, state, 0)
+
+    assert server._encoder_free_slots == [1]
+    assert server._denoiser_free_slots == [1]
+    assert request_id not in server._transfer_state
+    assert server._denoiser_pushes[0].messages == []
+
+
+def test_timeout_after_ready_quarantines_receiver_until_matching_done(server):
+    request_id = "ready-timeout"
+    transfer_id = "edge-attempt-5"
+    _track_to_denoising(server, request_id)
+    record = server.tracker.get(request_id)
+    assert record is not None
+    record.submit_time = time.monotonic() - 10
+    state = _encoder_to_denoiser_state(transfer_id)
+    state.push_completed = True
+    state.ready_sent = True
+    state.sender_capacity_released = True
+    server._transfer_state[request_id] = state
+    server._encoder_free_slots[0] = 1
+    server._denoiser_free_slots[0] = 0
+    server._timeout_s = 1
+
+    server._handle_timeouts()
+
+    assert state.client_completed
+    assert request_id in server._transfer_state
+    assert server._denoiser_free_slots == [0]
+
+    server._handle_transfer_done(
+        {"request_id": request_id, "completed_transfer_id": transfer_id},
+        RoleType.DENOISER,
+    )
+    server._handle_transfer_done(
+        {"request_id": request_id, "completed_transfer_id": transfer_id},
+        RoleType.DENOISER,
+    )
+
+    assert server._denoiser_free_slots == [1]
+    assert request_id not in server._transfer_state
+
+
+def test_timeout_during_encoder_compute_keeps_capacity_until_late_stage(server):
+    request_id = "encoder-timeout"
+    transfer_id = "edge-attempt-6"
+    server.tracker.submit(request_id)
+    server.tracker.transition(
+        request_id, RequestState.ENCODER_RUNNING, encoder_instance=0
+    )
+    record = server.tracker.get(request_id)
+    assert record is not None
+    record.submit_time = time.monotonic() - 10
+    server._encoder_free_slots[0] = 0
+    server._timeout_s = 1
+
+    server._handle_timeouts()
+
+    assert server._encoder_free_slots == [0]
+    assert server._orphaned_compute_slots[request_id] == (RoleType.ENCODER, 0)
+
+    server._handle_transfer_staged(
+        {
+            "request_id": request_id,
+            "transfer_id": transfer_id,
+            "data_size": 1024,
+        },
+        RoleType.ENCODER,
+    )
+    server._handle_transfer_staged(
+        {
+            "request_id": request_id,
+            "transfer_id": transfer_id,
+            "data_size": 1024,
+        },
+        RoleType.ENCODER,
+    )
+
+    assert server._encoder_free_slots == [1]
+    assert request_id not in server._orphaned_compute_slots
+    aborts = _transfer_messages(server._encoder_pushes[0])
+    assert len(aborts) == 1
+    assert aborts[0]["msg_type"] == TransferMsgType.ABORT
+    assert aborts[0]["transfer_id"] == transfer_id

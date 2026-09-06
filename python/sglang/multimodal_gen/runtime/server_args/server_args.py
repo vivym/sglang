@@ -537,8 +537,11 @@ class ServerArgs(DisaggServerArgsMixin):
     disagg_max_slots_per_instance: int = 8
     disagg_transfer_redundancy: float = 1.25
     disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
-    disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
+    disagg_transfer_backend: Literal["auto", "mock", "mooncake", "tcp"] = "auto"
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
+    disagg_transfer_max_payload_size: int = 256 * 1024 * 1024
+    disagg_transfer_timeout: float = 60.0
+    disagg_transfer_retries: int = 1
     disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
     disagg_p2p_hostname: str = "127.0.0.1"
     disagg_ib_device: str | None = None
@@ -626,6 +629,7 @@ class ServerArgs(DisaggServerArgsMixin):
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
         self._validate_scheduler_rpc_timeout()
+        self._validate_disagg_transport()
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
@@ -638,6 +642,34 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_disagg_transport(self) -> None:
+        positive_integer_fields = (
+            "disagg_transfer_pool_size",
+            "disagg_transfer_max_payload_size",
+        )
+        for name in positive_integer_fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.disagg_transfer_max_payload_size > self.disagg_transfer_pool_size:
+            raise ValueError(
+                "disagg_transfer_max_payload_size must not exceed "
+                "disagg_transfer_pool_size"
+            )
+        if (
+            isinstance(self.disagg_transfer_timeout, bool)
+            or not isinstance(self.disagg_transfer_timeout, (int, float))
+            or not math.isfinite(self.disagg_transfer_timeout)
+            or self.disagg_transfer_timeout <= 0
+        ):
+            raise ValueError("disagg_transfer_timeout must be a positive finite number")
+        if (
+            isinstance(self.disagg_transfer_retries, bool)
+            or not isinstance(self.disagg_transfer_retries, int)
+            or self.disagg_transfer_retries < 0
+        ):
+            raise ValueError("disagg_transfer_retries must be a non-negative integer")
 
     def _validate_minimax_h3_adaln(self) -> None:
         # Warn, not raise: config-file and from_kwargs construction mark every

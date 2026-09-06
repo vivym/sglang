@@ -146,14 +146,35 @@ class DisaggServerArgsMixin:
             "--disagg-transfer-backend",
             type=str,
             default=cls.disagg_transfer_backend,
-            choices=["auto", "mock", "mooncake"],
-            help="Transfer backend for multimodal diffusion disaggregation.",
+            choices=["auto", "mock", "mooncake", "tcp"],
+            help=(
+                "Transfer backend for multimodal diffusion disaggregation. "
+                "'tcp' uses bounded checksummed ZMQ over ordinary Ethernet."
+            ),
         )
         parser.add_argument(
             "--disagg-transfer-pool-size",
             type=int,
             default=cls.disagg_transfer_pool_size,
             help="Size of the P2P transfer buffer pool in bytes.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-max-payload-size",
+            type=int,
+            default=cls.disagg_transfer_max_payload_size,
+            help="Maximum bytes accepted by one disaggregated tensor transfer.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-timeout",
+            type=float,
+            default=cls.disagg_transfer_timeout,
+            help="Per-attempt tensor transfer timeout in seconds.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-retries",
+            type=int,
+            default=cls.disagg_transfer_retries,
+            help="Retry count after the first TCP tensor transfer attempt.",
         )
         parser.add_argument(
             "--disagg-transfer-pin-memory",

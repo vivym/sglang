@@ -489,6 +489,7 @@ def launch_pool_disagg_server(
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        max_transfer_payload_bytes=server_args.disagg_transfer_max_payload_size,
     )
     diffusion_server.start()
 
@@ -640,6 +641,7 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        max_transfer_payload_bytes=server_args.disagg_transfer_max_payload_size,
         server_args=server_args,
         glm_distributed_mode_enabled=glm_distributed_mode_enabled,
         **denoiser_options,

@@ -574,6 +574,7 @@ class SchedulerDisaggMixin:
             self._preallocated_slots = {}
             register_msg = TransferRegisterMsg(
                 role=self._disagg_role.value,
+                transfer_backend="relay",
                 work_endpoint=_advertised_pool_work_endpoint(sa),
             )
             self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
@@ -602,6 +603,12 @@ class SchedulerDisaggMixin:
             hostname=hostname,
             gpu_id=physical_gpu_id,
             ib_device=ib_device,
+            backend=getattr(sa, "disagg_transfer_backend", "auto"),
+            timeout_s=getattr(sa, "disagg_transfer_timeout", 60.0),
+            max_payload_bytes=getattr(
+                sa, "disagg_transfer_max_payload_size", 256 * 1024 * 1024
+            ),
+            max_retries=getattr(sa, "disagg_transfer_retries", 1),
         )
 
         # Use GPU buffer when engine supports GPUDirect RDMA, CPU pinned otherwise
@@ -648,6 +655,7 @@ class SchedulerDisaggMixin:
         # --encoder/denoiser/decoder-urls ordering).
         register_msg = TransferRegisterMsg(
             role=self._disagg_role.value,
+            transfer_backend=engine.backend_name,
             session_id=self._transfer_manager.session_id,
             pool_ptr=self._transfer_manager.pool_data_ptr,
             pool_size=self._transfer_manager.pool_size,
@@ -656,8 +664,10 @@ class SchedulerDisaggMixin:
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
         logger.info(
-            "Transfer %s: registered with DS (session=%s, pool=%d bytes, prealloc=%d)",
+            "Transfer %s: registered with DS (backend=%s, session=%s, "
+            "pool=%d bytes, prealloc=%d)",
             self._disagg_role.value.upper(),
+            engine.backend_name,
             self._transfer_manager.session_id,
             pool_size,
             len(preallocated_slot_info),
@@ -714,27 +724,39 @@ class SchedulerDisaggMixin:
             item = self._rdma_push_queue.get()
             if item is None:
                 break  # Shutdown signal
-            request_id, dest_session_id, dest_addr, transfer_size = item
+            request_id, transfer_id, dest_session_id, dest_addr, transfer_size = item
+            error = None
             try:
                 success = self._transfer_manager.push_to_peer(
                     request_id=request_id,
                     dest_session_id=dest_session_id,
                     dest_addr=dest_addr,
                     transfer_size=transfer_size,
+                    transfer_id=transfer_id,
                 )
-                if success:
-                    self._transfer_manager.free_staged(request_id)
-
-                pushed_msg = TransferPushedMsg(request_id=request_id)
+                if not success:
+                    error = self._transfer_manager.last_error or "transfer push failed"
+            except Exception as exc:
+                success = False
+                error = str(exc)
+                logger.exception(
+                    "Transfer %s: push thread error for %s", role_name, request_id
+                )
+            finally:
+                self._transfer_manager.free_staged(request_id, transfer_id)
+                pushed_msg = TransferPushedMsg(
+                    request_id=request_id,
+                    transfer_id=transfer_id,
+                    error=error,
+                )
                 self._rdma_push_zmq.send_multipart(encode_transfer_msg(pushed_msg))
 
-                if not success:
-                    logger.error(
-                        "Transfer %s: RDMA push failed for %s", role_name, request_id
-                    )
-            except Exception:
-                logger.exception(
-                    "Transfer %s: RDMA push thread error for %s", role_name, request_id
+            if not success:
+                logger.error(
+                    "Transfer %s: push failed for %s: %s",
+                    role_name,
+                    request_id,
+                    error,
                 )
 
     def _recv_prefetch_loop(self: Scheduler):
@@ -789,11 +811,13 @@ class SchedulerDisaggMixin:
         Called from the recv prefetch thread. Loads on _transfer_stream
         and builds the Req, so the main thread can start compute immediately.
 
-        Returns (req, load_event, request_id, prealloc_slot_id).
+        Returns (req, load_event, request_id, transfer_id, prealloc_slot_id).
         """
         request_id = msg["request_id"]
+        transfer_id = msg.get("transfer_id", "")
         manifest = msg.get("manifest", {})
         scalar_fields = msg.get("scalar_fields", {})
+        data_size = msg.get("data_size", 0)
 
         if self._disagg_metrics:
             self._disagg_metrics.record_request_start(request_id)
@@ -805,7 +829,9 @@ class SchedulerDisaggMixin:
             and prealloc_slot_id in self._preallocated_slots
         ):
             slot = self._preallocated_slots[prealloc_slot_id]
-            self._transfer_manager.register_prealloc_as_receive(request_id, slot)
+            self._transfer_manager.register_prealloc_as_receive(
+                request_id, slot, data_size, transfer_id
+            )
 
         # Load tensors on transfer_stream (non-blocking)
         local_device = f"{current_platform.device_type}:{self.worker.local_rank}"
@@ -814,6 +840,7 @@ class SchedulerDisaggMixin:
             manifest,
             device=local_device,
             stream=self._transfer_stream,
+            transfer_id=transfer_id,
         )
 
         # NOTE: Do NOT free the receive slot here. The async load is still
@@ -829,7 +856,7 @@ class SchedulerDisaggMixin:
         # running denoising loop on the main thread. Deferred to main thread
         # in _disagg_prefetch_event_loop, right before compute.
 
-        return req, load_event, request_id, prealloc_slot_id
+        return req, load_event, request_id, transfer_id, prealloc_slot_id
 
     # ------------------------------------------------------------------
     # Broadcast
@@ -1007,20 +1034,20 @@ class SchedulerDisaggMixin:
 
                 if msg_type == "transfer_compute":
                     # Load already done by recv thread
-                    req, load_event, request_id, prealloc_slot_id = data
+                    (
+                        req,
+                        load_event,
+                        request_id,
+                        transfer_id,
+                        prealloc_slot_id,
+                    ) = data
                     # Wait for load to complete on compute stream
                     if load_event is not None:
                         torch.get_device_module().current_stream().wait_event(
                             load_event
                         )
                     # Now safe to free the receive slot
-                    if prealloc_slot_id is not None:
-                        with self._transfer_manager._lock:
-                            self._transfer_manager._pending_receives.pop(
-                                request_id, None
-                            )
-                    else:
-                        self._transfer_manager.free_receive_slot(request_id)
+                    self._transfer_manager.free_receive_slot(request_id, transfer_id)
                     # Broadcast the full Req (scalar + tensor fields) to
                     # non-rank-0 ranks. Tensors ride NCCL on the SP/CFG/TP
                     # groups so downstream REPLICATED stages (e.g. denoising)
@@ -1036,9 +1063,9 @@ class SchedulerDisaggMixin:
                         _init_disagg_request_scheduler(self, req)
                     # Run compute
                     if self._disagg_role == RoleType.DENOISER:
-                        self._disagg_denoiser_compute(req, request_id)
+                        self._disagg_denoiser_compute(req, request_id, transfer_id)
                     elif self._disagg_role == RoleType.DECODER:
-                        self._disagg_decoder_compute(req, request_id)
+                        self._disagg_decoder_compute(req, request_id, transfer_id)
 
                 elif msg_type == "transfer_control":
                     # alloc, push messages — handle on main thread (rank 0 only)
@@ -1269,6 +1296,8 @@ class SchedulerDisaggMixin:
             self._handle_transfer_push(msg)
         elif msg_type == TransferMsgType.READY:
             self._handle_transfer_ready(msg)
+        elif msg_type == TransferMsgType.ABORT:
+            self._handle_transfer_abort(msg)
         else:
             logger.warning(
                 "Transfer %s: unknown message type %s",
@@ -1296,9 +1325,12 @@ class SchedulerDisaggMixin:
     def _handle_transfer_alloc(self: Scheduler, msg: dict) -> None:
         """Handle transfer_alloc: allocate a receive slot and reply with transfer_allocated."""
         request_id = msg["request_id"]
+        transfer_id = msg.get("transfer_id", "")
         data_size = msg.get("data_size", 0)
 
-        pending = self._transfer_manager.allocate_receive_slot(request_id, data_size)
+        pending = self._transfer_manager.allocate_receive_slot(
+            request_id, data_size, transfer_id
+        )
         if pending is None:
             logger.error(
                 "Transfer %s: failed to allocate receive slot for %s (%d bytes)",
@@ -1306,10 +1338,20 @@ class SchedulerDisaggMixin:
                 request_id,
                 data_size,
             )
+            allocated_msg = TransferAllocatedMsg(
+                request_id=request_id,
+                transfer_id=transfer_id,
+                transfer_backend=self._transfer_manager.backend_name,
+                error=self._transfer_manager.last_error
+                or "failed to allocate receive slot",
+            )
+            self._pool_result_push.send_multipart(encode_transfer_msg(allocated_msg))
             return
 
         allocated_msg = TransferAllocatedMsg(
             request_id=request_id,
+            transfer_id=transfer_id,
+            transfer_backend=self._transfer_manager.backend_name,
             session_id=self._transfer_manager.session_id,
             pool_ptr=self._transfer_manager.pool_data_ptr,
             slot_offset=pending.slot.offset,
@@ -1332,20 +1374,31 @@ class SchedulerDisaggMixin:
         Otherwise fall back to blocking push (e.g., during shutdown).
         """
         request_id = msg["request_id"]
+        transfer_id = msg.get("transfer_id", "")
         dest_session_id = msg.get("dest_session_id", "")
         dest_addr = msg.get("dest_addr", 0)
         transfer_size = msg.get("transfer_size", 0)
 
         if self._rdma_push_queue is not None:
             # Non-blocking: enqueue to RDMA push thread
-            self._rdma_push_queue.put(
-                (
-                    request_id,
-                    dest_session_id,
-                    dest_addr,
-                    transfer_size,
+            try:
+                self._rdma_push_queue.put_nowait(
+                    (
+                        request_id,
+                        transfer_id,
+                        dest_session_id,
+                        dest_addr,
+                        transfer_size,
+                    )
                 )
-            )
+            except queue.Full:
+                self._transfer_manager.free_staged(request_id, transfer_id)
+                pushed_msg = TransferPushedMsg(
+                    request_id=request_id,
+                    transfer_id=transfer_id,
+                    error="transfer push queue is full",
+                )
+                self._pool_result_push.send_multipart(encode_transfer_msg(pushed_msg))
             return
 
         # Fallback: blocking push on main thread
@@ -1354,20 +1407,38 @@ class SchedulerDisaggMixin:
             dest_session_id=dest_session_id,
             dest_addr=dest_addr,
             transfer_size=transfer_size,
+            transfer_id=transfer_id,
         )
 
-        if success:
-            self._transfer_manager.free_staged(request_id)
-
-        pushed_msg = TransferPushedMsg(request_id=request_id)
+        self._transfer_manager.free_staged(request_id, transfer_id)
+        error = None if success else self._transfer_manager.last_error
+        pushed_msg = TransferPushedMsg(
+            request_id=request_id,
+            transfer_id=transfer_id,
+            error=error,
+        )
         self._pool_result_push.send_multipart(encode_transfer_msg(pushed_msg))
 
         if not success:
             logger.error(
-                "Transfer %s: RDMA push failed for %s",
+                "Transfer %s: push failed for %s: %s",
                 self._disagg_role.value.upper(),
                 request_id,
+                error,
             )
+
+    def _handle_transfer_abort(self: Scheduler, msg: dict) -> None:
+        """Release a dynamic receive slot after an upstream transfer failure."""
+        request_id = msg.get("request_id", "")
+        transfer_id = msg.get("transfer_id", "")
+        self._transfer_manager.free_staged(request_id, transfer_id)
+        self._transfer_manager.free_receive_slot(request_id, transfer_id)
+        logger.warning(
+            "Transfer %s: aborted receive for %s: %s",
+            self._disagg_role.value.upper(),
+            request_id,
+            msg.get("reason", ""),
+        )
 
     def _handle_transfer_ready(self: Scheduler, msg: dict) -> None:
         """Handle transfer_ready: load tensors from buffer, run compute, send result.
@@ -1382,8 +1453,10 @@ class SchedulerDisaggMixin:
         """
 
         request_id = msg["request_id"]
+        transfer_id = msg.get("transfer_id", "")
         manifest = msg.get("manifest", {})
         scalar_fields = msg.get("scalar_fields", {})
+        data_size = msg.get("data_size", 0)
         if self._disagg_metrics:
             self._disagg_metrics.record_request_start(request_id)
 
@@ -1394,7 +1467,9 @@ class SchedulerDisaggMixin:
             and prealloc_slot_id in self._preallocated_slots
         ):
             slot = self._preallocated_slots[prealloc_slot_id]
-            self._transfer_manager.register_prealloc_as_receive(request_id, slot)
+            self._transfer_manager.register_prealloc_as_receive(
+                request_id, slot, data_size, transfer_id
+            )
 
         # 1. Start load on transfer_stream (non-blocking)
         local_device = f"{current_platform.device_type}:{self.worker.local_rank}"
@@ -1403,6 +1478,7 @@ class SchedulerDisaggMixin:
             manifest,
             device=local_device,
             stream=self._transfer_stream,
+            transfer_id=transfer_id,
         )
 
         # 2. Build Req from scalar fields + tensors (CPU work, overlapped)
@@ -1417,12 +1493,7 @@ class SchedulerDisaggMixin:
             torch.get_device_module().current_stream().wait_event(load_event)
 
         # 5. Free receive slot after load completes (data is on compute GPU)
-        if prealloc_slot_id is not None:
-            # Pre-allocated slot: just remove from pending receives, don't free buffer
-            with self._transfer_manager._lock:
-                self._transfer_manager._pending_receives.pop(request_id, None)
-        else:
-            self._transfer_manager.free_receive_slot(request_id)
+        self._transfer_manager.free_receive_slot(request_id, transfer_id)
 
         # 6. In multi-rank mode, broadcast the fully-loaded Req to the other
         # ranks so REPLICATED stages see identical inputs everywhere. See
@@ -1432,9 +1503,9 @@ class SchedulerDisaggMixin:
 
         # 7. Run compute
         if self._disagg_role == RoleType.DENOISER:
-            self._disagg_denoiser_compute(req, request_id)
+            self._disagg_denoiser_compute(req, request_id, transfer_id)
         elif self._disagg_role == RoleType.DECODER:
-            self._disagg_decoder_compute(req, request_id)
+            self._disagg_decoder_compute(req, request_id, transfer_id)
 
     # ------------------------------------------------------------------
     # Compute
@@ -1572,7 +1643,9 @@ class SchedulerDisaggMixin:
         with trace_slice(ctx, DiffStage.SCHEDULER_DISPATCH, thread_finish_flag=True):
             yield
 
-    def _disagg_denoiser_compute(self: Scheduler, req: Req, request_id: str) -> None:
+    def _disagg_denoiser_compute(
+        self: Scheduler, req: Req, request_id: str, completed_transfer_id: str
+    ) -> None:
         """Run denoiser compute in transfer mode, then stage output for decoder.
 
         Note: Scheduler timestep init is done in _handle_transfer_ready
@@ -1586,7 +1659,11 @@ class SchedulerDisaggMixin:
 
         if not isinstance(result, Req):
             error_msg = getattr(result, "error", "denoiser error")
-            done_msg = TransferDoneMsg(request_id=request_id, error=str(error_msg))
+            done_msg = TransferDoneMsg(
+                request_id=request_id,
+                completed_transfer_id=completed_transfer_id,
+                error=str(error_msg),
+            )
             self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
             if self._disagg_metrics:
                 self._disagg_metrics.record_request_failed(request_id)
@@ -1610,6 +1687,7 @@ class SchedulerDisaggMixin:
         if staged is None:
             done_msg = TransferDoneMsg(
                 request_id=request_id,
+                completed_transfer_id=completed_transfer_id,
                 error="Failed to stage denoiser output for decoder",
             )
             self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
@@ -1621,11 +1699,14 @@ class SchedulerDisaggMixin:
         done_data = {
             "msg_type": "transfer_done",
             "request_id": request_id,
+            "completed_transfer_id": completed_transfer_id,
+            "transfer_id": staged.transfer_id,
             "staged_for_decoder": True,
+            "transfer_backend": self._transfer_manager.backend_name,
             "session_id": self._transfer_manager.session_id,
             "pool_ptr": self._transfer_manager.pool_data_ptr,
             "slot_offset": staged.slot.offset if staged.slot else 0,
-            "data_size": staged.slot.size if staged.slot else 0,
+            "data_size": staged.data_size,
             "manifest": staged.manifest,
             "scalar_fields": staged.scalar_fields,
         }
@@ -1705,7 +1786,9 @@ class SchedulerDisaggMixin:
             time.monotonic() - start_time,
         )
 
-    def _disagg_decoder_compute(self: Scheduler, req: Req, request_id: str) -> None:
+    def _disagg_decoder_compute(
+        self: Scheduler, req: Req, request_id: str, completed_transfer_id: str
+    ) -> None:
         """Run decoder compute in transfer mode, send result to DS.
 
         Decoder result is sent as raw ZMQ multipart frames (same format as
@@ -1739,7 +1822,10 @@ class SchedulerDisaggMixin:
         # DiffusionServer will route it through _handle_decoder_result_frames,
         # the same path as relay mode.
         tensor_fields = {}
-        scalar_fields = {"request_id": request_id}
+        scalar_fields = {
+            "request_id": request_id,
+            "_transfer_id": completed_transfer_id,
+        }
         if output_batch.output is not None:
             tensor_fields["output"] = output_batch.output
         if output_batch.audio is not None:
@@ -1852,7 +1938,9 @@ class SchedulerDisaggMixin:
         # 2. Build transfer metadata while staging runs (CPU work, overlapped)
         staged_msg = TransferStagedMsg(
             request_id=request_id,
-            data_size=staged.slot.size if staged.slot else 0,
+            transfer_id=staged.transfer_id,
+            data_size=staged.data_size,
+            transfer_backend=self._transfer_manager.backend_name,
             manifest=staged.manifest,
             session_id=self._transfer_manager.session_id,
             pool_ptr=self._transfer_manager.pool_data_ptr,

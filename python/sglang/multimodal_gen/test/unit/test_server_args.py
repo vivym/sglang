@@ -3412,11 +3412,30 @@ class TestDisaggTransferBackendArgs(unittest.TestCase):
             "--model-path",
             "/fake",
             "--disagg-transfer-backend",
-            "mock",
+            "tcp",
         ]
 
         args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.disagg_transfer_backend, "mock")
+        self.assertEqual(args.disagg_transfer_backend, "tcp")
+
+    def test_tcp_transfer_limits_are_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--disagg-transfer-max-payload-size",
+            "67108864",
+            "--disagg-transfer-timeout",
+            "12.5",
+            "--disagg-transfer-retries",
+            "2",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.disagg_transfer_max_payload_size, 67108864)
+        self.assertEqual(args.disagg_transfer_timeout, 12.5)
+        self.assertEqual(args.disagg_transfer_retries, 2)
 
 
 class TestNcclNvlsArgs(unittest.TestCase):
