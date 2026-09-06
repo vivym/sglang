@@ -107,6 +107,7 @@ class VideoResponse(BaseModel):
     inference_time_s: Optional[float] = None
     metrics_metadata: Optional[Dict[str, Any]] = None
     action: Optional[Dict[str, Any]] = None
+    media_manifest: Optional[Dict[str, Any]] = None
 
 
 class VideoGenerationsRequest(BaseModel):

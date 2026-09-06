@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 import time
 
 import pytest
@@ -14,6 +15,8 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     TransferMsgType,
     decode_transfer_msg,
 )
+from sglang.multimodal_gen.runtime.disaggregation.transport.codec import pack_tensors
+from sglang.multimodal_gen.runtime.media_encoder.protocol import MediaEncodeManifest
 
 
 class _RecordingSocket:
@@ -76,6 +79,98 @@ def _encoder_to_denoiser_state(transfer_id: str) -> _TransferRequestState:
 
 def _transfer_messages(socket: _RecordingSocket) -> list[dict]:
     return [decode_transfer_msg(frames) for frames in socket.messages]
+
+
+def _media_manifest(request_id: str, attempt_id: str) -> dict:
+    return MediaEncodeManifest(
+        request_id=request_id,
+        attempt_id=attempt_id,
+        uri="https://objects.example/h3-output.mp4",
+        object_key="h3-output.mp4",
+        storage="s3",
+        byte_size=1234,
+        sha256="1" * 64,
+        container="mp4",
+        video_codec="h264",
+        pixel_format="yuv420p",
+        audio_codec="aac",
+        width=1344,
+        height=768,
+        frame_count=362,
+        fps=24,
+        duration_seconds=362 / 24,
+        audio_sample_rate=32_000,
+        audio_channels=2,
+        source_payload_sha256="2" * 64,
+        model_identity={"partition": "fl2va"},
+    ).to_dict()
+
+
+def _track_to_decoder(
+    server: DiffusionServer, request_id: str, transfer_id: str
+) -> None:
+    _track_to_denoising(server, request_id)
+    server.tracker.transition(request_id, RequestState.DENOISING_DONE)
+    server.tracker.transition(request_id, RequestState.DECODER_WAITING)
+    server.tracker.transition(
+        request_id, RequestState.DECODER_RUNNING, decoder_instance=0
+    )
+    server._pending[request_id] = b"client"
+    server._transfer_state[request_id] = _TransferRequestState(
+        transfer_id=transfer_id,
+        source_role=RoleType.DENOISER,
+        destination_role=RoleType.DECODER,
+        sender_transfer_backend="tcp",
+        data_size=1024,
+        manifest={"value": [{"offset": 0, "shape": [1024], "dtype": "uint8"}]},
+        sender_instance=0,
+        receiver_instance=0,
+    )
+    server._decoder_free_slots[0] = 0
+
+
+def test_decoder_manifest_is_validated_and_returned_without_tensors(server):
+    request_id = "manifest-result"
+    transfer_id = "manifest-attempt"
+    _track_to_decoder(server, request_id, transfer_id)
+    metadata, _buffers = pack_tensors(
+        {},
+        {
+            "request_id": request_id,
+            "_transfer_id": transfer_id,
+            "media_manifest": _media_manifest(request_id, transfer_id),
+        },
+    )
+
+    server._handle_decoder_result_frames([metadata])
+
+    assert server._decoder_free_slots == [1]
+    assert request_id not in server._pending
+    returned = pickle.loads(server._frontend.messages[-1][-1])
+    assert returned.error is None
+    assert returned.output is None
+    assert returned.audio is None
+    assert returned.media_manifest["uri"].endswith("h3-output.mp4")
+
+
+def test_decoder_manifest_rejects_transfer_identity_mismatch(server):
+    request_id = "manifest-mismatch"
+    transfer_id = "expected-attempt"
+    _track_to_decoder(server, request_id, transfer_id)
+    metadata, _buffers = pack_tensors(
+        {},
+        {
+            "request_id": request_id,
+            "_transfer_id": transfer_id,
+            "media_manifest": _media_manifest(request_id, "stale-attempt"),
+        },
+    )
+
+    server._handle_decoder_result_frames([metadata])
+
+    returned = pickle.loads(server._frontend.messages[-1][-1])
+    assert returned.media_manifest is None
+    assert "identity does not match" in returned.error
 
 
 def test_push_failure_releases_each_capacity_once_and_never_sends_ready(server):

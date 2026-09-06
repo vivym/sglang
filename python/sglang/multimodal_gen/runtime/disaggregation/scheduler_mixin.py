@@ -54,7 +54,17 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    _normalize_audio_to_numpy,
+    attach_audio_to_video_sample,
+    expand_request_outputs,
+    materialize_output_sample,
+)
+from sglang.multimodal_gen.runtime.media_encoder import (
+    MediaEncoderClient,
+    SharedMemoryMediaStager,
+    StagedMediaPayload,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
@@ -81,6 +91,14 @@ _DOWNSTREAM_ROLE = {
     RoleType.ENCODER: RoleType.DENOISER,
     RoleType.DENOISER: RoleType.DECODER,
 }
+
+
+@dataclasses.dataclass
+class _MediaEncodeQueueItem:
+    staged: StagedMediaPayload
+    completed_transfer_id: str
+    decoder_compute_s: float
+    staging_s: float
 
 
 def _advertised_pool_work_endpoint(server_args) -> str:
@@ -514,13 +532,65 @@ class SchedulerDisaggMixin:
         self._rdma_push_zmq = None
         self._compute_ready_queue = None
         self._recv_prefetch_thread = None
+        self._media_stager = None
+        self._media_encode_queue = None
+        self._media_encode_thread = None
 
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
             device = torch.device(f"{current_platform.device_type}:{local_rank}")
             self._transfer_stream = torch.get_device_module().Stream(device=device)
             self._init_disagg_sockets()
+            self._init_media_encoder_handoff()
             self._init_disagg_transfer_manager()
+
+    def _init_media_encoder_handoff(self: Scheduler) -> None:
+        endpoint = getattr(self.server_args, "disagg_media_encoder_endpoint", None)
+        if (
+            self.gpu_id != 0
+            or self._disagg_role != RoleType.DECODER
+            or endpoint is None
+        ):
+            return
+        probe = MediaEncoderClient(
+            endpoint,
+            timeout_s=1.0,
+            retries=0,
+            context=self.context,
+        )
+        startup_deadline = (
+            time.monotonic() + self.server_args.disagg_media_startup_timeout
+        )
+        while True:
+            remaining = startup_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "co-located CPU media encoder did not become ready at "
+                    f"{endpoint} within "
+                    f"{self.server_args.disagg_media_startup_timeout:g}s"
+                )
+            if probe.health(timeout_s=min(1.0, remaining)):
+                break
+            time.sleep(min(0.25, remaining))
+        slot_count = self.server_args.disagg_media_staging_slots
+        self._media_stager = SharedMemoryMediaStager(
+            self.server_args.disagg_media_shared_memory_root,
+            max_payload_bytes=self.server_args.disagg_media_max_payload_size,
+            max_slots=slot_count,
+        )
+        self._media_encode_queue = queue.Queue(maxsize=slot_count)
+        self._media_encode_thread = threading.Thread(
+            target=self._media_encode_loop,
+            daemon=True,
+            name="h3-media-encode",
+        )
+        self._media_encode_thread.start()
+        logger.info(
+            "Decoder media handoff enabled: endpoint=%s root=%s slots=%d",
+            endpoint,
+            self._media_stager.root,
+            slot_count,
+        )
 
     def _init_disagg_sockets(self: Scheduler):
         """Initialize ZMQ sockets for disaggregated mode (DiffusionServer-mediated).
@@ -758,6 +828,72 @@ class SchedulerDisaggMixin:
                     request_id,
                     error,
                 )
+
+    def _media_encode_loop(self: Scheduler) -> None:
+        """Encode staged CPU media without blocking the decoder GPU loop."""
+        client = MediaEncoderClient(
+            self.server_args.disagg_media_encoder_endpoint,
+            timeout_s=self.server_args.disagg_media_timeout,
+            retries=self.server_args.disagg_media_retries,
+            context=self.context,
+        )
+        result_socket, _ = get_zmq_socket(
+            self.context,
+            zmq.PUSH,
+            self.server_args.pool_result_endpoint,
+            bind=False,
+        )
+        try:
+            while True:
+                item = self._media_encode_queue.get()
+                if item is None:
+                    return
+                request_id = item.staged.request_id
+                media_started = time.monotonic()
+                scalar_fields = {
+                    "request_id": request_id,
+                    "_transfer_id": item.completed_transfer_id,
+                }
+                error = None
+                try:
+                    request = item.staged.request
+                    manifest = client.encode(request)
+                    scalar_fields["media_manifest"] = manifest.to_dict()
+                except Exception as exc:
+                    error = str(exc)
+                    scalar_fields["error"] = error
+                finally:
+                    item.staged.release()
+                    self._media_encode_queue.task_done()
+
+                try:
+                    send_tensors(result_socket, {}, scalar_fields)
+                except Exception:
+                    logger.exception(
+                        "Failed to return media completion for %s",
+                        request_id,
+                    )
+                    error = error or "failed to return media completion"
+
+                if self._disagg_metrics:
+                    if error:
+                        self._disagg_metrics.record_request_failed(request_id)
+                    else:
+                        self._disagg_metrics.record_request_complete(request_id)
+                    self._disagg_metrics.update_queue_depth(
+                        self._media_encode_queue.qsize()
+                    )
+                logger.info(
+                    "Decoder media completion for %s: compute=%.3fs staging=%.3fs "
+                    "encode_rpc=%.3fs status=%s",
+                    request_id,
+                    item.decoder_compute_s,
+                    item.staging_s,
+                    time.monotonic() - media_started,
+                    "error" if error else "ok",
+                )
+        finally:
+            result_socket.close(linger=0)
 
     def _recv_prefetch_loop(self: Scheduler):
         """Background thread: recv transfer messages and prefetch tensor loads.
@@ -1261,6 +1397,21 @@ class SchedulerDisaggMixin:
         # Recv prefetch thread stops when self._running = False
         if self._recv_prefetch_thread is not None:
             self._recv_prefetch_thread.join(timeout=5)
+        # Drain media completions before closing the result endpoint and the
+        # shared ZMQ context. Each pending RPC remains bounded by its timeout.
+        if self._media_encode_queue is not None:
+            self._media_encode_queue.put(None)
+        if self._media_encode_thread is not None:
+            media_join_timeout = (
+                self.server_args.disagg_media_timeout
+                * (self.server_args.disagg_media_retries + 1)
+                + 5
+            )
+            self._media_encode_thread.join(timeout=media_join_timeout)
+            if self._media_encode_thread.is_alive():
+                logger.error("Timed out while draining decoder media handoff")
+        self._media_encode_queue = None
+        self._media_encode_thread = None
         if self._transfer_manager is not None:
             self._transfer_manager.cleanup()
         if self._pool_work_pull is not None:
@@ -1789,12 +1940,7 @@ class SchedulerDisaggMixin:
     def _disagg_decoder_compute(
         self: Scheduler, req: Req, request_id: str, completed_transfer_id: str
     ) -> None:
-        """Run decoder compute in transfer mode, send result to DS.
-
-        Decoder result is sent as raw ZMQ multipart frames (same format as
-        relay mode) so DiffusionServer handles it via _handle_decoder_result_frames
-        without hex/JSON overhead.
-        """
+        """Run decoder compute and return media completion to the head."""
 
         # Check for upstream error
         disagg_error = getattr(req, "_disagg_error", None)
@@ -1805,9 +1951,31 @@ class SchedulerDisaggMixin:
                     {},
                     {
                         "request_id": request_id,
+                        "_transfer_id": completed_transfer_id,
                         "error": f"Upstream error: {disagg_error}",
                     },
                 )
+            return
+
+        pipeline = getattr(self.worker, "pipeline", None)
+        is_minimax_h3 = getattr(pipeline, "pipeline_name", None) == "MiniMaxH3Pipeline"
+        if is_minimax_h3 and self._media_encode_queue is None:
+            error = (
+                "MiniMax H3 disaggregated decoder requires a co-located CPU "
+                "media encoder; raw frame return is forbidden"
+            )
+            if self._pool_result_push is not None:
+                send_tensors(
+                    self._pool_result_push,
+                    {},
+                    {
+                        "request_id": request_id,
+                        "_transfer_id": completed_transfer_id,
+                        "error": error,
+                    },
+                )
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_failed(request_id)
             return
 
         req.save_output = False
@@ -1818,17 +1986,83 @@ class SchedulerDisaggMixin:
             output_batch = self.worker.execute_forward([req])
         duration_s = time.monotonic() - start_time
 
-        # Send result as raw ZMQ frames (no TRANSFER_MAGIC prefix).
-        # DiffusionServer will route it through _handle_decoder_result_frames,
-        # the same path as relay mode.
+        if self._media_encode_queue is not None and output_batch.error is None:
+            if not completed_transfer_id:
+                output_batch.error = "decoder media handoff requires a transfer ID"
+            elif output_batch.output is None or len(output_batch.output) != 1:
+                output_batch.error = (
+                    "decoder media handoff requires exactly one video output"
+                )
+            elif output_batch.audio is None or output_batch.audio_sample_rate is None:
+                output_batch.error = (
+                    "decoder media handoff requires audio and sample rate"
+                )
+            else:
+                staging_started = time.monotonic()
+                staged = None
+                try:
+                    sample = attach_audio_to_video_sample(
+                        output_batch.output[0], output_batch.audio, 0
+                    )
+                    materialized = materialize_output_sample(
+                        sample,
+                        req.data_type,
+                        req.fps,
+                    )
+                    audio = _normalize_audio_to_numpy(materialized.audio)
+                    if audio is None:
+                        raise ValueError("decoder audio could not be materialized")
+                    staged = self._media_stager.stage(
+                        request_id=request_id,
+                        attempt_id=completed_transfer_id,
+                        frames=materialized.frames,
+                        audio=np.ascontiguousarray(audio, dtype=np.float32),
+                        fps=req.fps,
+                        audio_sample_rate=output_batch.audio_sample_rate,
+                        output_compression=req.output_compression,
+                        model_identity=getattr(
+                            self.worker.pipeline, "disagg_release_identity", None
+                        ),
+                    )
+                    staging_s = time.monotonic() - staging_started
+                    output_batch.output = None
+                    output_batch.audio = None
+                    materialized.sample = None
+                    materialized.frames.clear()
+                    materialized.audio = None
+                    self._media_encode_queue.put_nowait(
+                        _MediaEncodeQueueItem(
+                            staged=staged,
+                            completed_transfer_id=completed_transfer_id,
+                            decoder_compute_s=duration_s,
+                            staging_s=staging_s,
+                        )
+                    )
+                    if self._disagg_metrics:
+                        self._disagg_metrics.update_queue_depth(
+                            self._media_encode_queue.qsize()
+                        )
+                    logger.info(
+                        "Decoder staged %s for CPU media encoding in %.3fs",
+                        request_id,
+                        staging_s,
+                    )
+                    return
+                except Exception as exc:
+                    if staged is not None:
+                        staged.release()
+                    output_batch.error = f"decoder media staging failed: {exc}"
+
+        # Generic models retain the historical raw result path. MiniMax H3
+        # reaches this block only to report a decoder or staging error.
         tensor_fields = {}
         scalar_fields = {
             "request_id": request_id,
             "_transfer_id": completed_transfer_id,
         }
-        if output_batch.output is not None:
+        if output_batch.output is not None and not is_minimax_h3:
             tensor_fields["output"] = output_batch.output
-        if output_batch.audio is not None:
+        if output_batch.audio is not None and not is_minimax_h3:
             tensor_fields["audio"] = output_batch.audio
         if output_batch.audio_sample_rate is not None:
             scalar_fields["audio_sample_rate"] = output_batch.audio_sample_rate

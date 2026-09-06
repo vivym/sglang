@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
+from sglang.multimodal_gen.runtime.media_encoder.protocol import MediaEncodeManifest
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -890,11 +891,43 @@ class DiffusionServer:
         if p2p is None and record and record.decoder_instance is not None:
             self._decoder_free_slots[record.decoder_instance] += 1
 
+        error = scalar_fields.get("error")
+        media_manifest = None
+        raw_manifest = scalar_fields.get("media_manifest")
+        if raw_manifest is not None:
+            try:
+                if error:
+                    raise ValueError(
+                        "decoder completion cannot contain both manifest and error"
+                    )
+                parsed_manifest = MediaEncodeManifest.from_dict(raw_manifest)
+                if (
+                    parsed_manifest.request_id != request_id
+                    or parsed_manifest.attempt_id != completed_transfer_id
+                ):
+                    raise ValueError(
+                        "media manifest identity does not match decoder completion"
+                    )
+                if tensor_fields:
+                    raise ValueError(
+                        "decoder completion cannot contain both media manifest and tensors"
+                    )
+                media_manifest = parsed_manifest.to_dict()
+            except ValueError as exc:
+                error = f"invalid decoder media manifest: {exc}"
+                media_manifest = None
+
+        if error:
+            tensor_fields = {}
+        elif media_manifest is None and not tensor_fields:
+            error = "decoder completion contains neither tensors nor media manifest"
+
         output_batch = OutputBatch(
             output=tensor_fields.get("output"),
             audio=tensor_fields.get("audio"),
             audio_sample_rate=scalar_fields.get("audio_sample_rate"),
-            error=scalar_fields.get("error"),
+            media_manifest=media_manifest,
+            error=error,
         )
 
         try:

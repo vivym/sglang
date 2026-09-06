@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.disaggregation import (
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
+from sglang.multimodal_gen.runtime.disaggregation.transport.codec import unpack_tensors
 from sglang.multimodal_gen.runtime.pipelines import minimax_h3_pipeline as h3_pipeline
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
@@ -135,6 +136,38 @@ def _round_trip(req: Req, *, source: RoleType, destination: RoleType) -> Req:
     return SchedulerDisaggMixin._build_disagg_req(
         receiver, dict(scalars), dict(tensors)
     )
+
+
+def test_h3_decoder_without_media_service_fails_before_vae_compute():
+    sent = []
+
+    class _Socket:
+        def send_multipart(self, frames, **_kwargs):
+            sent.append(frames)
+
+    class _Worker:
+        pipeline = _pipeline()
+
+        def execute_forward(self, _reqs):
+            raise AssertionError("VAE compute must not run without media service")
+
+    scheduler = SimpleNamespace(
+        worker=_Worker(),
+        _media_encode_queue=None,
+        _pool_result_push=_Socket(),
+        _disagg_metrics=None,
+    )
+    SchedulerDisaggMixin._disagg_decoder_compute(
+        scheduler,
+        _t2va_req(),
+        "h3-no-media",
+        "decoder-attempt",
+    )
+
+    tensors, scalars = unpack_tensors(sent[0])
+    assert tensors == {}
+    assert scalars["_transfer_id"] == "decoder-attempt"
+    assert "raw frame return is forbidden" in scalars["error"]
 
 
 def test_h3_encoder_to_denoiser_boundary_round_trip():

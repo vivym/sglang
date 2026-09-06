@@ -439,9 +439,17 @@ async def forward_to_scheduler(
     """Forwards request to scheduler and processes the result."""
     try:
         response = await async_scheduler_client.forward(req_obj)
-        if response.output is None and response.output_file_paths is None:
+        if (
+            response.output is None
+            and response.output_file_paths is None
+            and response.media_manifest is None
+        ):
             raise RuntimeError("Model generation returned no output.")
 
+        if response.media_manifest is not None:
+            data = dict(vars(response))
+            data["output"] = None
+            return make_serializable(data)
         if response.output_file_paths:
             output_file_path = response.output_file_paths[0]
         else:

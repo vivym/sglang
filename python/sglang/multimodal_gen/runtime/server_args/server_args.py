@@ -543,6 +543,15 @@ class ServerArgs(DisaggServerArgsMixin):
     disagg_transfer_timeout: float = 60.0
     disagg_transfer_retries: int = 1
     disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
+    # Decoder-to-CPU media handoff. The endpoint must be a same-host Unix
+    # domain socket; bulk RGB24/PCM stays in the bounded shared-memory root.
+    disagg_media_encoder_endpoint: str | None = None
+    disagg_media_shared_memory_root: str = "/dev/shm/sglang-h3-media"
+    disagg_media_max_payload_size: int = 1536 * 1024**2
+    disagg_media_staging_slots: int = 2
+    disagg_media_timeout: float = 300.0
+    disagg_media_retries: int = 1
+    disagg_media_startup_timeout: float = 30.0
     disagg_p2p_hostname: str = "127.0.0.1"
     disagg_ib_device: str | None = None
     disagg_server_addr: str | None = None
@@ -647,6 +656,8 @@ class ServerArgs(DisaggServerArgsMixin):
         positive_integer_fields = (
             "disagg_transfer_pool_size",
             "disagg_transfer_max_payload_size",
+            "disagg_media_max_payload_size",
+            "disagg_media_staging_slots",
         )
         for name in positive_integer_fields:
             value = getattr(self, name)
@@ -670,6 +681,43 @@ class ServerArgs(DisaggServerArgsMixin):
             or self.disagg_transfer_retries < 0
         ):
             raise ValueError("disagg_transfer_retries must be a non-negative integer")
+        if (
+            isinstance(self.disagg_media_timeout, bool)
+            or not isinstance(self.disagg_media_timeout, (int, float))
+            or not math.isfinite(self.disagg_media_timeout)
+            or self.disagg_media_timeout <= 0
+        ):
+            raise ValueError("disagg_media_timeout must be a positive finite number")
+        if (
+            isinstance(self.disagg_media_startup_timeout, bool)
+            or not isinstance(self.disagg_media_startup_timeout, (int, float))
+            or not math.isfinite(self.disagg_media_startup_timeout)
+            or self.disagg_media_startup_timeout <= 0
+        ):
+            raise ValueError(
+                "disagg_media_startup_timeout must be a positive finite number"
+            )
+        if (
+            isinstance(self.disagg_media_retries, bool)
+            or not isinstance(self.disagg_media_retries, int)
+            or self.disagg_media_retries < 0
+        ):
+            raise ValueError("disagg_media_retries must be a non-negative integer")
+        if self.disagg_media_encoder_endpoint is not None:
+            from sglang.multimodal_gen.runtime.media_encoder.client import (
+                validate_ipc_endpoint,
+            )
+
+            validate_ipc_endpoint(self.disagg_media_encoder_endpoint)
+            if self.disagg_role != RoleType.DECODER:
+                raise ValueError(
+                    "disagg_media_encoder_endpoint is only valid for the decoder role"
+                )
+            media_root = os.path.expanduser(self.disagg_media_shared_memory_root)
+            if not os.path.isabs(media_root):
+                raise ValueError(
+                    "disagg_media_shared_memory_root must be an absolute path"
+                )
 
     def _validate_minimax_h3_adaln(self) -> None:
         # Warn, not raise: config-file and from_kwargs construction mark every

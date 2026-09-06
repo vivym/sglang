@@ -3437,6 +3437,52 @@ class TestDisaggTransferBackendArgs(unittest.TestCase):
         self.assertEqual(args.disagg_transfer_timeout, 12.5)
         self.assertEqual(args.disagg_transfer_retries, 2)
 
+    def test_decoder_media_handoff_args_are_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--disagg-role",
+            "decoder",
+            "--disagg-media-encoder-endpoint",
+            "ipc:///run/sglang/h3-media.sock",
+            "--disagg-media-shared-memory-root",
+            "/dev/shm/h3-media",
+            "--disagg-media-max-payload-size",
+            "2147483648",
+            "--disagg-media-staging-slots",
+            "3",
+            "--disagg-media-timeout",
+            "120.5",
+            "--disagg-media-retries",
+            "2",
+            "--disagg-media-startup-timeout",
+            "15",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(
+            args.disagg_media_encoder_endpoint,
+            "ipc:///run/sglang/h3-media.sock",
+        )
+        self.assertEqual(args.disagg_media_shared_memory_root, "/dev/shm/h3-media")
+        self.assertEqual(args.disagg_media_max_payload_size, 2147483648)
+        self.assertEqual(args.disagg_media_staging_slots, 3)
+        self.assertEqual(args.disagg_media_timeout, 120.5)
+        self.assertEqual(args.disagg_media_retries, 2)
+        self.assertEqual(args.disagg_media_startup_timeout, 15.0)
+
+    def test_media_handoff_rejects_non_decoder_role(self):
+        with self.assertRaisesRegex(ValueError, "only valid for the decoder role"):
+            _from_dict_without_model_resolution(
+                {
+                    "model_path": "/fake",
+                    "disagg_role": "encoder",
+                    "disagg_media_encoder_endpoint": "ipc:///tmp/h3-media.sock",
+                }
+            )
+
 
 class TestNcclNvlsArgs(unittest.TestCase):
     def test_enable_nccl_nvls_cli_arg(self):

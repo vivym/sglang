@@ -388,6 +388,34 @@ async def _dispatch_job_async(
             batch,
             scheduler_batches=scheduler_batches,
         )
+        if result.media_manifest is not None:
+            from sglang.multimodal_gen.runtime.media_encoder.protocol import (
+                MediaEncodeManifest,
+            )
+
+            manifest = MediaEncodeManifest.from_dict(result.media_manifest)
+            if manifest.request_id != job_id:
+                raise RuntimeError(
+                    "media manifest request identity does not match the video job"
+                )
+            update_fields = {
+                "status": "completed",
+                "progress": 100,
+                "completed_at": int(time.time()),
+                "url": manifest.uri,
+                "file_path": None,
+                "file_paths": None,
+                "num_outputs": 1,
+                "size": f"{manifest.width}x{manifest.height}",
+                "seconds": f"{manifest.duration_seconds:g}",
+                "media_manifest": manifest.to_dict(),
+            }
+            update_fields = add_common_data_to_response(
+                update_fields, request_id=job_id, result=result
+            )
+            await VIDEO_STORE.update_fields(job_id, update_fields)
+            return
+
         save_file_path = save_file_path_list[0]
         try:
             final_media_fields = await asyncio.to_thread(

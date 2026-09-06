@@ -24,6 +24,11 @@ def main():
         help="Run inference on a multimodal model.",
         add_help=False,
     )
+    subparsers.add_parser(
+        "media-encoder",
+        help="Run the co-located diffusion CPU media encoder.",
+        add_help=False,
+    )
 
     # simple commands
     version_parser = subparsers.add_parser(
@@ -42,5 +47,9 @@ def main():
         from sglang.cli.generate import generate
 
         generate(args, extra_argv)
+    elif args.subcommand == "media-encoder":
+        from sglang.cli.media_encoder import media_encoder
+
+        media_encoder(args, extra_argv)
     elif args.subcommand == "version":
         version(args, extra_argv)
