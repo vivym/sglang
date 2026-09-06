@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _build_video_sampling_params,
     _dispatch_job_async,
+    _video_job_from_sampling,
     _video_request_model_kwargs,
     create_video,
 )
@@ -151,6 +152,48 @@ def test_video_response_exposes_request_metrics_metadata():
             "cached_steps": [15],
         }
     }
+
+
+def test_disaggregated_video_job_does_not_publish_head_local_path():
+    request = VideoGenerationsRequest(prompt="a lighthouse at dusk")
+    sampling = SimpleNamespace(
+        width=1344,
+        height=768,
+        num_frames=243,
+        fps=24,
+        output_file_path=lambda: "/head-only/output.mp4",
+    )
+
+    job = _video_job_from_sampling(
+        "disagg-job",
+        request,
+        sampling,
+        "MiniMax-H3",
+        publish_local_file_path=False,
+    )
+
+    assert job["status"] == "queued"
+    assert job["file_path"] is None
+
+
+def test_monolithic_video_job_keeps_expected_local_path():
+    request = VideoGenerationsRequest(prompt="a lighthouse at dusk")
+    sampling = SimpleNamespace(
+        width=1344,
+        height=768,
+        num_frames=243,
+        fps=24,
+        output_file_path=lambda: "/local/output.mp4",
+    )
+
+    job = _video_job_from_sampling(
+        "monolithic-job",
+        request,
+        sampling,
+        "MiniMax-H3",
+    )
+
+    assert job["file_path"] == "/local/output.mp4"
 
 
 def test_openai_video_job_completes_from_media_manifest():

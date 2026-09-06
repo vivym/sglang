@@ -27,6 +27,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
     VideoListResponse,
@@ -333,6 +334,8 @@ def _video_job_from_sampling(
     req: VideoGenerationsRequest,
     sampling: SamplingParams,
     served_model_name: str,
+    *,
+    publish_local_file_path: bool = True,
 ) -> Dict[str, Any]:
     size_str = f"{sampling.width}x{sampling.height}"
     seconds = int(round((sampling.num_frames or 0) / float(sampling.fps or 24)))
@@ -346,7 +349,11 @@ def _video_job_from_sampling(
         "size": size_str,
         "seconds": str(seconds),
         "quality": "standard",
-        "file_path": os.path.abspath(sampling.output_file_path()),
+        "file_path": (
+            os.path.abspath(sampling.output_file_path())
+            if publish_local_file_path
+            else None
+        ),
     }
 
 
@@ -794,6 +801,7 @@ async def create_video(
             req,
             sampling_params,
             server_args.served_model_name,
+            publish_local_file_path=(server_args.disagg_role == RoleType.MONOLITHIC),
         )
         job.update(sampling_params.project_video_queued_job_fields(batch))
         await VIDEO_STORE.upsert(request_id, job)
