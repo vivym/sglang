@@ -101,12 +101,12 @@ def _run_http_server_process(server_args: ServerArgs) -> None:
     launch_http_server_only(server_args)
 
 
-def _run_scheduler_process(*args) -> None:
+def _run_scheduler_process(*args, **kwargs) -> None:
     # The launcher owns terminal interrupts and asks workers to stop through
     # ShutdownReq. Letting every process handle Ctrl-C races that request and
     # leaves noisy KeyboardInterrupt tracebacks from worker event loops.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    _run_scheduler_process_entrypoint(*args)
+    _run_scheduler_process_entrypoint(*args, **kwargs)
 
 
 def _request_monolithic_scheduler_shutdown(server_args: ServerArgs) -> None:
