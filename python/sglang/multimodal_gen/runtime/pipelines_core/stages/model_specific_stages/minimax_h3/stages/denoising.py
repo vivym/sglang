@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.debug_tensor_dump import (
+    write_minimax_h3_debug_tensor_dump,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
 )
@@ -473,6 +476,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         self._minimax_h3_quality = "lossless"
         self._minimax_h3_cache_mode: str | None = None
 
+    def _pipeline_for_debug_dump(self):
+        return self.pipeline() if self.pipeline is not None else None
+
     def _owns_compile_warmup_lifecycle(self) -> bool:
         return True
 
@@ -876,6 +882,24 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             video_rows=video_rows,
             audio_rows=audio_rows,
         )
+        debug_dump_path = write_minimax_h3_debug_tensor_dump(
+            batch=batch,
+            tensors={
+                "latents": batch.latents,
+                "audio_latents": batch.audio_latents,
+                "initial_video_rows": ctx.state["initial_video_rows"],
+                "initial_audio_rows": ctx.state["initial_audio_rows"],
+                "text_hidden_states": ctx.embeddings["positive"]["hidden_states"],
+                "refined_prompt_embeds": positive.static_kwargs["prompt_embeds"],
+            },
+            server_args=server_args,
+            pipeline=self._pipeline_for_debug_dump(),
+        )
+        if debug_dump_path is not None:
+            logger.info(
+                "Saved identity-bound MiniMax H3 debug tensors to %s",
+                debug_dump_path,
+            )
 
     def _record_cache_dit_metrics(self, model: Any, batch: Req) -> None:
         if not self._cache_dit_enabled or batch.metrics is None:

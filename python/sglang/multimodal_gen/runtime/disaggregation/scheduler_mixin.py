@@ -25,6 +25,7 @@ import zmq
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.boundary import (
+    DISAGG_ATTEMPT_ID_EXTRA_KEY,
     partition_boundary_fields,
     validate_boundary_fields,
 )
@@ -1922,6 +1923,11 @@ class SchedulerDisaggMixin:
         Note: Scheduler timestep init is done in _handle_transfer_ready
         to overlap with tensor loading.
         """
+        # Bind opt-in model diagnostics to the concrete inbound transfer. This
+        # request-local field is removed by explicit boundary filters before
+        # the request is sent downstream.
+        req.extra[DISAGG_ATTEMPT_ID_EXTRA_KEY] = completed_transfer_id
+
         # Run denoising
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):

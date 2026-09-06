@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import shutil
 import time
 
@@ -123,6 +124,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 f"--model-variant {model_variant!r}"
             )
         self.disagg_release_identity = None
+        self.debug_release_identity = None
         if self._disagg_role != RoleType.MONOLITHIC:
             self.disagg_release_identity = verify_minimax_h3_disagg_artifacts(
                 manifest_path=getattr(
@@ -136,6 +138,33 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 role=self._disagg_role,
                 server_args=self.server_args,
             )
+            self.debug_release_identity = self.disagg_release_identity
+        elif os.environ.get("MINIMAX_H3_DEBUG_TENSOR_DUMP_ROOT", "").strip():
+            identities = [
+                verify_minimax_h3_disagg_artifacts(
+                    manifest_path=getattr(
+                        self.server_args, "minimax_h3_disagg_manifest_path", None
+                    ),
+                    artifact_root=getattr(
+                        self.server_args, "minimax_h3_disagg_artifact_root", None
+                    ),
+                    model_path=self.model_path,
+                    partition=self.release_metadata.partition,
+                    role=role,
+                    server_args=self.server_args,
+                )
+                for role in (
+                    RoleType.ENCODER,
+                    RoleType.DENOISER,
+                    RoleType.DECODER,
+                )
+            ]
+            if any(identity != identities[0] for identity in identities[1:]):
+                raise ValueError(
+                    "MiniMax H3 debug artifact verification produced inconsistent "
+                    "release identities"
+                )
+            self.debug_release_identity = identities[0]
         return model_index
 
     def validate_disagg_role(self, role: RoleType) -> None:

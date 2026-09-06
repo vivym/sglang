@@ -8,6 +8,7 @@ from typing import Any
 
 
 DISAGG_BOUNDARY_FIELD_PREFIX = "_disagg_boundary_"
+DISAGG_ATTEMPT_ID_EXTRA_KEY = "_sglang_disagg_attempt_id"
 
 
 def validate_boundary_fields(fields: Mapping[str, Any], *, kind: str) -> None:
@@ -39,6 +40,7 @@ def partition_boundary_fields(fields: Mapping[str, Any]) -> tuple[dict, dict]:
 
 
 __all__ = [
+    "DISAGG_ATTEMPT_ID_EXTRA_KEY",
     "DISAGG_BOUNDARY_FIELD_PREFIX",
     "partition_boundary_fields",
     "validate_boundary_fields",

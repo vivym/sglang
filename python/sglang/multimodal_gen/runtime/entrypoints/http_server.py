@@ -321,6 +321,9 @@ def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
             "force_vae_resident": os.environ.get("MINIMAX_H3_FORCE_VAE_RESIDENT", "1"),
             "convrot_assertion": os.environ.get("MINIMAX_H3_CONVROT"),
             "latent_dump_path_template": os.environ.get("MINIMAX_H3_DUMP_LATENTS_PATH"),
+            "debug_tensor_dump_root": os.environ.get(
+                "MINIMAX_H3_DEBUG_TENSOR_DUMP_ROOT"
+            ),
             "reuse_text_embeddings": os.environ.get(
                 "MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS", "0"
             ),

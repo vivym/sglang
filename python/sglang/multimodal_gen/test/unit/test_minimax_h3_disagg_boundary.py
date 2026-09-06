@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import weakref
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -48,6 +50,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.latent_preparation import (
     MiniMaxH3LatentPreparationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    MiniMaxH3DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.timestep_preparation import (
     MiniMaxH3TimestepPreparationStage,
@@ -334,6 +339,68 @@ def test_h3_pipeline_enables_only_compute_roles():
         MiniMaxH3Pipeline.validate_disagg_role(None, role)
     with pytest.raises(ValueError, match="not supported"):
         MiniMaxH3Pipeline.validate_disagg_role(None, RoleType.SERVER)
+
+
+def test_debug_monolithic_startup_verifies_every_owned_component(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINIMAX_H3_DEBUG_TENSOR_DUMP_ROOT", str(tmp_path))
+    model_index = {
+        "_minimax_h3": {
+            "schema_version": 1,
+            "partition": "fl2va",
+            "tasks": ["t2va", "fl2va"],
+            "task_aliases": {},
+            "sigma_shift_scales": {"video": 1.0, "audio": 1.0},
+        }
+    }
+    identity = {
+        "schema": "minimax-h3.disagg-release/v1",
+        "manifest_content_sha256": "sha256:" + "1" * 64,
+        "partition": "fl2va",
+    }
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline._disagg_role = RoleType.MONOLITHIC
+    pipeline.model_path = "/models/MiniMax-H3"
+    pipeline.server_args = SimpleNamespace(
+        model_variant=None,
+        minimax_h3_disagg_manifest_path="/models/manifest.json",
+        minimax_h3_disagg_artifact_root="/models",
+    )
+    roles = []
+
+    def verify(**kwargs):
+        roles.append(kwargs["role"])
+        return dict(identity)
+
+    with (
+        patch.object(
+            h3_pipeline.ComposedPipelineBase,
+            "_load_config",
+            return_value=model_index,
+        ),
+        patch.object(
+            h3_pipeline,
+            "verify_minimax_h3_disagg_artifacts",
+            side_effect=verify,
+        ),
+    ):
+        assert pipeline._load_config() == model_index
+
+    assert roles == [RoleType.ENCODER, RoleType.DENOISER, RoleType.DECODER]
+    assert pipeline.disagg_release_identity is None
+    assert pipeline.debug_release_identity == identity
+
+
+def test_h3_debug_dump_resolves_the_pipeline_weak_reference():
+    class Pipeline:
+        pass
+
+    pipeline = Pipeline()
+    stage = object.__new__(MiniMaxH3DenoisingStage)
+    stage.pipeline = weakref.ref(pipeline)
+
+    assert stage._pipeline_for_debug_dump() is pipeline
+    stage.pipeline = None
+    assert stage._pipeline_for_debug_dump() is None
 
 
 def test_h3_preparation_stages_belong_to_denoiser_role():
