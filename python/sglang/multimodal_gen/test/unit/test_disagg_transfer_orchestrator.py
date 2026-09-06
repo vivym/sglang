@@ -29,6 +29,16 @@ class _RecordingSocket:
         self.messages.append(frames)
 
 
+class _RequestSocket(_RecordingSocket):
+    def __init__(self, request):
+        super().__init__()
+        self.request = request
+
+    def recv_multipart(self, *args, **kwargs):
+        del args, kwargs
+        return [b"client", b"", pickle.dumps(self.request)]
+
+
 @pytest.fixture
 def server():
     instance = DiffusionServer(
@@ -94,6 +104,46 @@ def test_event_loop_starts_with_bounded_socket_options():
             assert socket.getsockopt(zmq.IMMEDIATE) == 1
     finally:
         instance.stop()
+
+
+def test_registration_readiness_requires_every_configured_role(server):
+    assert server.registration_readiness() == {
+        "status": "not_ready",
+        "ready": False,
+        "roles": {
+            "encoder": {"configured": 1, "registered": 0},
+            "denoiser": {"configured": 1, "registered": 0},
+            "decoder": {"configured": 1, "registered": 0},
+        },
+    }
+
+    for role, endpoint in (
+        ("encoder", "inproc://encoder"),
+        ("denoiser", "inproc://denoiser"),
+        ("decoder", "inproc://decoder"),
+    ):
+        server._handle_transfer_register(
+            {
+                "role": role,
+                "work_endpoint": endpoint,
+                "transfer_backend": "tcp",
+                "session_id": f"zmq+tcp://127.0.0.1:{32000 + len(role)}",
+                "pool_ptr": 1,
+                "pool_size": 1024,
+                "preallocated_slots": [],
+            }
+        )
+
+    assert server.registration_readiness()["ready"] is True
+    assert server.registration_readiness()["status"] == "ok"
+
+
+def test_registration_readiness_is_available_over_head_control_rpc(server):
+    frontend = _RequestSocket({"method": "disagg_registration_readiness"})
+
+    server._handle_client_request(frontend)
+
+    assert pickle.loads(frontend.messages[-1][-1]) == server.registration_readiness()
 
 
 def _encoder_to_denoiser_state(transfer_id: str) -> _TransferRequestState:

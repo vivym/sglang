@@ -296,6 +296,31 @@ class DiffusionServer:
         """Block until the event loop has bound all sockets, or *timeout* elapses."""
         return self._ready.wait(timeout=timeout)
 
+    def registration_readiness(self) -> dict:
+        """Return whether every configured role endpoint has registered."""
+        roles = {
+            "encoder": {
+                "configured": self._num_encoders,
+                "registered": len(self._encoder_peers),
+            },
+            "denoiser": {
+                "configured": self._num_denoisers,
+                "registered": len(self._denoiser_peers),
+            },
+            "decoder": {
+                "configured": self._num_decoders,
+                "registered": len(self._decoder_peers),
+            },
+        }
+        ready = all(
+            counts["registered"] == counts["configured"] for counts in roles.values()
+        )
+        return {
+            "status": "ok" if ready else "not_ready",
+            "ready": ready,
+            "roles": roles,
+        }
+
     def stop(self) -> None:
         self._running = False
         if self._thread is not None:
@@ -538,15 +563,24 @@ class DiffusionServer:
             return
         req = reqs[0]
 
-        if isinstance(req, dict) or not hasattr(req, "request_id"):
-            # Send empty reply so REQ socket doesn't hang
+        if isinstance(req, dict):
+            if req.get("method") == "disagg_registration_readiness":
+                response = self.registration_readiness()
+            elif req.get("method") == "ping":
+                response = {"status": "ok"}
+            else:
+                response = {"status": "ignored"}
             try:
                 frontend.send_multipart(
-                    [client_identity, b"", pickle.dumps({"status": "ignored"})],
+                    [client_identity, b"", pickle.dumps(response)],
                     zmq.NOBLOCK,
                 )
             except zmq.Again:
                 pass
+            return
+
+        if not hasattr(req, "request_id"):
+            self._send_rejection(frontend, client_identity, "unsupported request type")
             return
 
         request_id = getattr(req, "request_id", None)

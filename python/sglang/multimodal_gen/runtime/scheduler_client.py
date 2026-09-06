@@ -332,6 +332,27 @@ class AsyncSchedulerClient:
                 ping_socket.close()
         return True
 
+    async def disagg_registration_ready(self, timeout_ms: int = 2000) -> bool:
+        """Check that every configured role endpoint registered with the head."""
+        if self.context is None or self.context.closed:
+            return False
+        endpoints = self.server_args.scheduler_endpoints
+        if len(endpoints) != 1:
+            return False
+        try:
+            response = await self._forward_one(
+                endpoints[0],
+                {"method": "disagg_registration_readiness"},
+                timeout_ms,
+            )
+        except (RuntimeError, TimeoutError, zmq.ZMQError):
+            return False
+        return (
+            isinstance(response, dict)
+            and response.get("status") == "ok"
+            and response.get("ready") is True
+        )
+
     def close(self):
         """Closes the socket and terminates the context."""
         if self.context:

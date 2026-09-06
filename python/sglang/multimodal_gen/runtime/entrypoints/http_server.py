@@ -187,6 +187,17 @@ async def health(request: Request):
     """Report readiness for normal inference traffic."""
     if not request.app.state.server_warmup_done.is_set():
         return Response(status_code=503)
+    server_args = getattr(request.app.state, "server_args", None)
+    if server_args is not None:
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        if server_args.disagg_role == RoleType.SERVER:
+            from sglang.multimodal_gen.runtime.scheduler_client import (
+                async_scheduler_client,
+            )
+
+            if not await async_scheduler_client.disagg_registration_ready():
+                return Response(status_code=503)
     return {"status": "ok"}
 
 

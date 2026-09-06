@@ -164,6 +164,49 @@ def test_async_scheduler_client_honors_explicit_deadline():
     asyncio.run(run_test())
 
 
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"status": "ok", "ready": True}, True),
+        ({"status": "not_ready", "ready": False}, False),
+        ({"status": "ok", "ready": "yes"}, False),
+        (None, False),
+    ],
+)
+def test_async_scheduler_client_validates_disagg_registration_readiness(
+    response, expected
+):
+    async def run_test():
+        client = AsyncSchedulerClient()
+        client.context = SimpleNamespace(closed=False)
+        client.server_args = SimpleNamespace(scheduler_endpoints=["tcp://head:30000"])
+        client._forward_one = AsyncMock(return_value=response)
+
+        assert await client.disagg_registration_ready() is expected
+        client._forward_one.assert_awaited_once_with(
+            "tcp://head:30000",
+            {"method": "disagg_registration_readiness"},
+            2000,
+        )
+
+    asyncio.run(run_test())
+
+
+def test_async_scheduler_client_rejects_ambiguous_disagg_head():
+    async def run_test():
+        client = AsyncSchedulerClient()
+        client.context = SimpleNamespace(closed=False)
+        client.server_args = SimpleNamespace(
+            scheduler_endpoints=["tcp://head-a:30000", "tcp://head-b:30000"]
+        )
+        client._forward_one = AsyncMock()
+
+        assert not await client.disagg_registration_ready()
+        client._forward_one.assert_not_awaited()
+
+    asyncio.run(run_test())
+
+
 def test_async_scheduler_client_closes_socket_when_cancelled():
     async def run_test():
         socket = MagicMock()
