@@ -4,6 +4,7 @@ import pickle
 import time
 
 import pytest
+import zmq
 
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,
@@ -62,6 +63,37 @@ def _track_to_denoising(server: DiffusionServer, request_id: str) -> None:
     server.tracker.transition(
         request_id, RequestState.DENOISING_RUNNING, denoiser_instance=0
     )
+
+
+def test_event_loop_starts_with_bounded_socket_options():
+    instance = DiffusionServer(
+        frontend_endpoint="inproc://event-loop-frontend",
+        encoder_work_endpoints=["inproc://event-loop-encoder"],
+        denoiser_work_endpoints=["inproc://event-loop-denoiser"],
+        decoder_work_endpoints=["inproc://event-loop-decoder"],
+        encoder_result_endpoint="inproc://event-loop-encoder-result",
+        denoiser_result_endpoint="inproc://event-loop-denoiser-result",
+        decoder_result_endpoint="inproc://event-loop-decoder-result",
+        max_pending_requests=3,
+        control_queue_size=5,
+    )
+    instance.start()
+    try:
+        assert instance.wait_ready(timeout=2.0)
+        assert instance._thread is not None and instance._thread.is_alive()
+        assert instance._frontend.getsockopt(zmq.SNDHWM) == 5
+        assert instance._frontend.getsockopt(zmq.RCVHWM) == 3
+        for socket in (
+            *instance._encoder_pushes,
+            *instance._denoiser_pushes,
+            *instance._decoder_pushes,
+        ):
+            assert socket.getsockopt(zmq.SNDHWM) == 5
+            assert socket.getsockopt(zmq.SNDTIMEO) == 0
+            assert socket.getsockopt(zmq.LINGER) == 0
+            assert socket.getsockopt(zmq.IMMEDIATE) == 1
+    finally:
+        instance.stop()
 
 
 def _encoder_to_denoiser_state(transfer_id: str) -> _TransferRequestState:
