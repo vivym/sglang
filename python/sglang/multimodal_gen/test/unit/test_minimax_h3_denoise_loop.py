@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
     MiniMaxH3DenoisingStage,
     _build_cube_attn_metadata,
+    _materialize_text_token_tags,
     _minimax_h3_nsys_capture,
     _precompute_refined_prompt_embeds,
     _resolve_debug_latent_dump_path,
@@ -41,6 +42,24 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
     minimax_h3_time_shift_sigmas,
 )
+
+
+def test_text_token_tags_are_materialized_on_worker_device():
+    packed = {
+        "token_tags": torch.full((8,), -1, dtype=torch.long),
+        "text_pos": torch.arange(3, dtype=torch.long),
+    }
+    embeddings = {"text_token_tags": torch.tensor([1, 1, 0], dtype=torch.long)}
+
+    tags = _materialize_text_token_tags(
+        packed,
+        embeddings,
+        device=torch.device("cpu"),
+    )
+
+    assert tags.device == torch.device("cpu")
+    assert packed["text_pos"].device == torch.device("cpu")
+    assert tags.tolist() == [1, 1, 0, -1, -1, -1, -1, -1]
 
 
 def _branch(

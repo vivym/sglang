@@ -745,10 +745,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             emb,
             include_video_pos=subblock_enabled,
         )
-        tags = packed["token_tags"]
-        tags[packed["text_pos"].view(-1)] = (
-            emb["text_token_tags"].view(-1).to(torch.long)
-        )
+        tags = _materialize_text_token_tags(packed, emb, device=device)
         video_query_indices = None
         if subblock_enabled:
             text_video_token_mask = emb.get("text_video_token_mask")
@@ -1220,6 +1217,35 @@ def _build_packed_layout(
             include_video_pos=include_video_pos,
         )
     return packed
+
+
+def _materialize_text_token_tags(
+    packed: dict[str, torch.Tensor],
+    embeddings: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Apply encoder-provided text tags using one worker-local device.
+
+    Packed structural tensors can be created under either the process default
+    device or CPU, while the explicit encoder boundary tensors are restored
+    from the transport buffer.  Normalize both the index and source values
+    before the in-place assignment so a disaggregated DiT does not depend on
+    those unrelated device choices.
+    """
+    tags = packed["token_tags"].view(-1).to(device=device, dtype=torch.long)
+    text_pos = packed["text_pos"].view(-1).to(device=device, dtype=torch.long)
+    text_tags = (
+        embeddings["text_token_tags"].view(-1).to(device=device, dtype=torch.long)
+    )
+    if text_pos.numel() != text_tags.numel():
+        raise ValueError(
+            "MiniMax H3 text token tag length does not match packed text positions"
+        )
+    tags[text_pos] = text_tags
+    packed["token_tags"] = tags
+    packed["text_pos"] = text_pos
+    return tags
 
 
 def _condition_audio_lengths(ctx: _FullLoopContext) -> list[int]:
