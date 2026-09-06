@@ -24,6 +24,10 @@ import torch
 import zmq
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.disaggregation.boundary import (
+    partition_boundary_fields,
+    validate_boundary_fields,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferTensorBuffer,
@@ -66,6 +70,17 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
 logger = init_logger(__name__)
+
+
+_UPSTREAM_ROLE = {
+    RoleType.DENOISER: RoleType.ENCODER,
+    RoleType.DECODER: RoleType.DENOISER,
+}
+
+_DOWNSTREAM_ROLE = {
+    RoleType.ENCODER: RoleType.DENOISER,
+    RoleType.DENOISER: RoleType.DECODER,
+}
 
 
 def _advertised_pool_work_endpoint(server_args) -> str:
@@ -428,6 +443,50 @@ class SchedulerDisaggMixin:
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
+
+    def _extract_disagg_transfer_fields(
+        self: Scheduler,
+        req: Req,
+        *,
+        source_role: RoleType,
+        destination_role: RoleType,
+    ) -> tuple[dict, dict]:
+        """Combine generic ``Req`` fields with an explicit model boundary."""
+        if _DOWNSTREAM_ROLE.get(source_role) is not destination_role:
+            raise ValueError(
+                "invalid diffusion disaggregation role edge: "
+                f"{source_role.value!r} -> {destination_role.value!r}"
+            )
+        tensor_fields, scalar_fields = extract_transfer_fields(req)
+        pipeline = getattr(getattr(self, "worker", None), "pipeline", None)
+        hook = getattr(pipeline, "export_disagg_boundary", None)
+        if hook is None:
+            return tensor_fields, scalar_fields
+
+        boundary_tensors, boundary_scalars = hook(
+            req,
+            source_role=source_role,
+            destination_role=destination_role,
+        )
+        validate_boundary_fields(boundary_tensors, kind="tensor")
+        validate_boundary_fields(boundary_scalars, kind="scalar")
+        duplicate_names = set(boundary_tensors) & set(boundary_scalars)
+        if duplicate_names:
+            raise ValueError(
+                "disaggregation boundary fields cannot be both tensor and scalar: "
+                f"{sorted(duplicate_names)!r}"
+            )
+        collisions = (set(boundary_tensors) & set(tensor_fields)) | (
+            set(boundary_scalars) & set(scalar_fields)
+        )
+        if collisions:
+            raise ValueError(
+                "disaggregation boundary fields collide with generic request fields: "
+                f"{sorted(collisions)!r}"
+            )
+        tensor_fields.update(boundary_tensors)
+        scalar_fields.update(boundary_scalars)
+        return tensor_fields, scalar_fields
 
     def _init_disagg_state(self: Scheduler, server_args, local_rank: int) -> None:
         """Initialize all disaggregation state, sockets, and transfer infrastructure."""
@@ -846,7 +905,17 @@ class SchedulerDisaggMixin:
 
         if is_rank0:
             assert req is not None, "rank 0 must pass a loaded Req"
-            tensor_fields, scalar_fields = extract_transfer_fields(req)
+            role = self._disagg_role
+            source_role = _UPSTREAM_ROLE.get(role)
+            if source_role is None:
+                raise ValueError(
+                    f"cannot broadcast a rebuilt request for role {role.value!r}"
+                )
+            tensor_fields, scalar_fields = self._extract_disagg_transfer_fields(
+                req,
+                source_role=source_role,
+                destination_role=role,
+            )
             packed_tensors = _pack_tensor_fields_for_broadcast(tensor_fields)
         else:
             scalar_fields = None
@@ -1400,6 +1469,8 @@ class SchedulerDisaggMixin:
         """
         # Pop _trace_state before the generic setattr loop so it doesn't land
         # on the Req as a stray attribute.
+        scalar_fields, boundary_scalars = partition_boundary_fields(scalar_fields)
+        tensors, boundary_tensors = partition_boundary_fields(tensors)
         trace_state = scalar_fields.pop("_trace_state", None)
 
         req = object.__new__(Req)
@@ -1430,6 +1501,28 @@ class SchedulerDisaggMixin:
                 ]
             else:
                 req.generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        pipeline = getattr(getattr(self, "worker", None), "pipeline", None)
+        restore_hook = getattr(pipeline, "restore_disagg_boundary", None)
+        if restore_hook is not None:
+            destination_role = self._disagg_role
+            source_role = _UPSTREAM_ROLE.get(destination_role)
+            if source_role is None:
+                raise ValueError(
+                    "cannot restore a disaggregation boundary for role "
+                    f"{destination_role.value!r}"
+                )
+            restore_hook(
+                req,
+                source_role=source_role,
+                destination_role=destination_role,
+                tensor_fields=boundary_tensors,
+                scalar_fields=boundary_scalars,
+            )
+        elif boundary_tensors or boundary_scalars:
+            raise ValueError(
+                "received model-specific disaggregation boundary fields without "
+                "a pipeline restore hook"
+            )
         # Rebuild trace_ctx from the propagated __getstate__ dict so this role's
         # spans nest under the sender's trace (same mechanism SRT uses via pickle).
         if trace_state and trace_state.get("tracing_enable"):
@@ -1488,7 +1581,11 @@ class SchedulerDisaggMixin:
             return
 
         # Stage denoiser output for decoder transfer (async staging)
-        tensor_fields, scalar_fields = extract_transfer_fields(result)
+        tensor_fields, scalar_fields = self._extract_disagg_transfer_fields(
+            result,
+            source_role=RoleType.DENOISER,
+            destination_role=RoleType.DECODER,
+        )
 
         # 1. Stage tensors on transfer_stream (non-blocking)
         staged, stage_event = self._transfer_manager.stage_tensors_async(
@@ -1689,7 +1786,11 @@ class SchedulerDisaggMixin:
             return
 
         # Pack and send encoder output (rank 0 only sends)
-        tensor_fields, scalar_fields = extract_transfer_fields(req_result)
+        tensor_fields, scalar_fields = self._extract_disagg_transfer_fields(
+            req_result,
+            source_role=RoleType.ENCODER,
+            destination_role=RoleType.DENOISER,
+        )
 
         if self._pool_result_push is not None:
             if self._transfer_manager is not None:
