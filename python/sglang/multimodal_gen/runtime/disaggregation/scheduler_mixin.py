@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.manager import (
     DiffusionTransferManager,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
+    DISAGG_REGISTRATION_HEARTBEAT_INTERVAL_S,
     TRANSFER_MAGIC,
     TransferAllocatedMsg,
     TransferDoneMsg,
@@ -531,6 +532,9 @@ class SchedulerDisaggMixin:
         self._disagg_mode = getattr(server_args, "disagg_mode", False)
         self._pool_work_pull = None
         self._pool_result_push = None
+        self._registration_heartbeat_stop = None
+        self._registration_heartbeat_thread = None
+        self._registration_heartbeat_zmq = None
         self._transfer_manager = None
         self._transfer_stream = None
         self._rdma_push_queue = None
@@ -654,6 +658,7 @@ class SchedulerDisaggMixin:
                 work_endpoint=_advertised_pool_work_endpoint(sa),
             )
             self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
+            self._start_disagg_registration_heartbeat(register_msg)
             self._compute_ready_queue = queue.Queue(maxsize=4)
             self._recv_prefetch_thread = threading.Thread(
                 target=self._recv_prefetch_loop,
@@ -740,6 +745,7 @@ class SchedulerDisaggMixin:
             preallocated_slots=preallocated_slot_info,
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
+        self._start_disagg_registration_heartbeat(register_msg)
         logger.info(
             "Transfer %s: registered with DS (backend=%s, session=%s, "
             "pool=%d bytes, prealloc=%d)",
@@ -789,6 +795,62 @@ class SchedulerDisaggMixin:
     # ------------------------------------------------------------------
     # Background threads
     # ------------------------------------------------------------------
+
+    def _start_disagg_registration_heartbeat(
+        self: Scheduler, register_msg: TransferRegisterMsg
+    ) -> None:
+        """Refresh role registration without sharing the main result socket."""
+        self._registration_heartbeat_stop = threading.Event()
+        frames = encode_transfer_msg(register_msg)
+        self._registration_heartbeat_thread = threading.Thread(
+            target=self._disagg_registration_heartbeat_loop,
+            args=(frames,),
+            daemon=True,
+            name=f"disagg-heartbeat-{self._disagg_role.value}",
+        )
+        self._registration_heartbeat_thread.start()
+
+    def _disagg_registration_heartbeat_loop(
+        self: Scheduler, frames: list[bytes]
+    ) -> None:
+        heartbeat_socket = None
+        try:
+            heartbeat_socket, _ = get_zmq_socket(
+                self.context,
+                zmq.PUSH,
+                self.server_args.pool_result_endpoint,
+                bind=False,
+                send_hwm=1,
+                send_timeout_ms=0,
+                linger_ms=0,
+                immediate=True,
+            )
+            self._registration_heartbeat_zmq = heartbeat_socket
+            while not self._registration_heartbeat_stop.wait(
+                DISAGG_REGISTRATION_HEARTBEAT_INTERVAL_S
+            ):
+                try:
+                    heartbeat_socket.send_multipart(frames, zmq.NOBLOCK)
+                except zmq.Again:
+                    logger.debug(
+                        "Disagg %s registration heartbeat dropped while head is unavailable",
+                        self._disagg_role.value.upper(),
+                    )
+        finally:
+            if heartbeat_socket is not None:
+                heartbeat_socket.close()
+            self._registration_heartbeat_zmq = None
+
+    def _stop_disagg_registration_heartbeat(self: Scheduler) -> None:
+        if self._registration_heartbeat_stop is not None:
+            self._registration_heartbeat_stop.set()
+        if self._registration_heartbeat_thread is not None:
+            self._registration_heartbeat_thread.join(timeout=5)
+            if self._registration_heartbeat_thread.is_alive():
+                logger.error("Timed out while stopping disagg registration heartbeat")
+            else:
+                self._registration_heartbeat_thread = None
+        self._registration_heartbeat_stop = None
 
     def _rdma_push_loop(self: Scheduler):
         """Background thread: execute RDMA push + notify DS.
@@ -1473,6 +1535,7 @@ class SchedulerDisaggMixin:
 
     def _cleanup_disagg(self: Scheduler):
         """Clean up all pool mode resources (sockets, threads, transfer manager)."""
+        self._stop_disagg_registration_heartbeat()
         # Shutdown RDMA push thread
         if self._rdma_push_queue is not None:
             self._rdma_push_queue.put(None)

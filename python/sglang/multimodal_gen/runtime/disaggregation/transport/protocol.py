@@ -11,6 +11,11 @@ from typing import Any
 
 TRANSFER_MAGIC = b"__transfer__"
 
+# Role registrations are soft state owned by the head. Periodic refresh lets
+# workers recover after a head restart and lets readiness reject dead workers.
+DISAGG_REGISTRATION_HEARTBEAT_INTERVAL_S = 10.0
+DISAGG_REGISTRATION_STALE_AFTER_S = 30.0
+
 
 class TransferMsgType:
     # Instance → DiffusionServer

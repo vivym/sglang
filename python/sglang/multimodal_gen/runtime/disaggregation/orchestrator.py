@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
     unpack_tensors,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
+    DISAGG_REGISTRATION_STALE_AFTER_S,
     TransferAbortMsg,
     TransferAllocMsg,
     TransferMsgType,
@@ -297,19 +298,28 @@ class DiffusionServer:
         return self._ready.wait(timeout=timeout)
 
     def registration_readiness(self) -> dict:
-        """Return whether every configured role endpoint has registered."""
+        """Return whether every configured role endpoint registered recently."""
+        now = time.monotonic()
+
+        def fresh_count(peers: dict[int, dict]) -> int:
+            return sum(
+                now - peer.get("registered_at", float("-inf"))
+                <= DISAGG_REGISTRATION_STALE_AFTER_S
+                for peer in peers.values()
+            )
+
         roles = {
             "encoder": {
                 "configured": self._num_encoders,
-                "registered": len(self._encoder_peers),
+                "registered": fresh_count(self._encoder_peers),
             },
             "denoiser": {
                 "configured": self._num_denoisers,
-                "registered": len(self._denoiser_peers),
+                "registered": fresh_count(self._denoiser_peers),
             },
             "decoder": {
                 "configured": self._num_decoders,
-                "registered": len(self._decoder_peers),
+                "registered": fresh_count(self._decoder_peers),
             },
         }
         ready = all(
@@ -1249,12 +1259,14 @@ class DiffusionServer:
             )
             return
 
+        registered_at = time.monotonic()
         info = {
             "transfer_backend": msg.get("transfer_backend", ""),
             "session_id": msg.get("session_id", ""),
             "pool_ptr": msg.get("pool_ptr", 0),
             "pool_size": msg.get("pool_size", 0),
             "work_endpoint": work_endpoint,
+            "registered_at": registered_at,
         }
         prealloc = msg.get("preallocated_slots", [])
         if info["transfer_backend"] not in {"mock", "mooncake", "relay", "tcp"}:
@@ -1265,6 +1277,19 @@ class DiffusionServer:
                 info["transfer_backend"],
             )
             return
+        current = peers.get(idx)
+        if current is not None and current.get("session_id") == info["session_id"]:
+            # A heartbeat must not resurrect receive slots currently assigned
+            # to active transfers. All other session state is immutable.
+            current["registered_at"] = registered_at
+            logger.debug(
+                "DiffusionServer transfer: refreshed %s[%d] session=%s",
+                role.value,
+                idx,
+                info["session_id"],
+            )
+            return
+
         info["free_preallocated_slots"] = list(prealloc)
         peers[idx] = info
         if role == RoleType.DENOISER and self._glm_distributed_state is not None:

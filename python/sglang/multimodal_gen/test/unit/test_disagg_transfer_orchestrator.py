@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pickle
 import time
+from types import SimpleNamespace
 
 import pytest
 import zmq
@@ -12,6 +13,10 @@ from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.request_state import RequestState
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
+    SchedulerDisaggMixin,
+)
+from sglang.multimodal_gen.runtime.disaggregation.transport import protocol
 from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     TransferMsgType,
     decode_transfer_msg,
@@ -144,6 +149,112 @@ def test_registration_readiness_is_available_over_head_control_rpc(server):
     server._handle_client_request(frontend)
 
     assert pickle.loads(frontend.messages[-1][-1]) == server.registration_readiness()
+
+
+def test_registration_readiness_rejects_stale_worker(server):
+    for role, endpoint in (
+        ("encoder", "inproc://encoder"),
+        ("denoiser", "inproc://denoiser"),
+        ("decoder", "inproc://decoder"),
+    ):
+        server._handle_transfer_register(
+            {
+                "role": role,
+                "work_endpoint": endpoint,
+                "transfer_backend": "tcp",
+                "session_id": f"session-{role}",
+            }
+        )
+
+    server._denoiser_peers[0]["registered_at"] -= (
+        protocol.DISAGG_REGISTRATION_STALE_AFTER_S + 1
+    )
+
+    readiness = server.registration_readiness()
+    assert readiness["ready"] is False
+    assert readiness["roles"]["encoder"]["registered"] == 1
+    assert readiness["roles"]["denoiser"]["registered"] == 0
+    assert readiness["roles"]["decoder"]["registered"] == 1
+
+
+def test_same_session_heartbeat_preserves_allocated_prealloc_slots(server):
+    registration = {
+        "role": "denoiser",
+        "work_endpoint": "inproc://denoiser",
+        "transfer_backend": "tcp",
+        "session_id": "stable-session",
+        "pool_ptr": 100,
+        "pool_size": 4096,
+        "preallocated_slots": [
+            {"slot_id": 0, "offset": 0, "size": 1024, "addr": 100},
+            {"slot_id": 1, "offset": 1024, "size": 1024, "addr": 1124},
+        ],
+    }
+    server._handle_transfer_register(registration)
+    peer = server._denoiser_peers[0]
+    peer["free_preallocated_slots"].pop()
+    first_registered_at = peer["registered_at"]
+
+    server._handle_transfer_register(registration)
+
+    assert server._denoiser_peers[0] is peer
+    assert peer["free_preallocated_slots"] == registration["preallocated_slots"][:1]
+    assert peer["registered_at"] >= first_registered_at
+
+
+class _HeartbeatScheduler(SchedulerDisaggMixin):
+    pass
+
+
+def test_registration_heartbeat_recovers_after_head_restart(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin."
+        "DISAGG_REGISTRATION_HEARTBEAT_INTERVAL_S",
+        0.01,
+    )
+    context = zmq.Context()
+    first_head = context.socket(zmq.PULL)
+    first_head.setsockopt(zmq.LINGER, 0)
+    first_head.bind("tcp://127.0.0.1:*")
+    endpoint = first_head.getsockopt_string(zmq.LAST_ENDPOINT)
+    scheduler = _HeartbeatScheduler()
+    scheduler.context = context
+    scheduler.server_args = SimpleNamespace(pool_result_endpoint=endpoint)
+    scheduler._disagg_role = RoleType.ENCODER
+    scheduler._registration_heartbeat_stop = None
+    scheduler._registration_heartbeat_thread = None
+    scheduler._registration_heartbeat_zmq = None
+    register_msg = protocol.TransferRegisterMsg(
+        role="encoder",
+        transfer_backend="tcp",
+        session_id="heartbeat-session",
+        work_endpoint="tcp://encoder:31000",
+    )
+
+    scheduler._start_disagg_registration_heartbeat(register_msg)
+    try:
+        assert first_head.poll(1000, zmq.POLLIN)
+        first_registration = decode_transfer_msg(first_head.recv_multipart())
+        assert first_registration["session_id"] == "heartbeat-session"
+
+        first_head.close()
+        replacement_head = context.socket(zmq.PULL)
+        replacement_head.setsockopt(zmq.LINGER, 0)
+        replacement_head.bind(endpoint)
+        try:
+            assert replacement_head.poll(1000, zmq.POLLIN)
+            replacement_registration = decode_transfer_msg(
+                replacement_head.recv_multipart()
+            )
+            assert replacement_registration == first_registration
+        finally:
+            replacement_head.close()
+    finally:
+        scheduler._stop_disagg_registration_heartbeat()
+        context.term()
+
+    assert scheduler._registration_heartbeat_thread is None
+    assert scheduler._registration_heartbeat_zmq is None
 
 
 def _encoder_to_denoiser_state(transfer_id: str) -> _TransferRequestState:
