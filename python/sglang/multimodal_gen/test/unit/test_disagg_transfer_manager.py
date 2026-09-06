@@ -40,6 +40,19 @@ class _HostBuffer:
         return {}
 
 
+class _CopyEvent:
+    def __init__(self, actions, name):
+        self.actions = actions
+        self.name = name
+
+    def synchronize(self):
+        self.actions.append(f"sync:{self.name}")
+
+    def elapsed_time(self, other):
+        assert other.name == "end"
+        return 3.5
+
+
 def test_transfer_manager_sends_manifest_high_water_not_buddy_slot_size():
     sender_engine = MockTransferEngine()
     receiver_engine = MockTransferEngine()
@@ -127,6 +140,34 @@ def test_abort_does_not_return_preallocated_slot_to_buddy_allocator():
         manager.free_receive_slot("request-d")
 
         assert buffer.freed == []
+    finally:
+        manager.cleanup()
+
+
+def test_receive_slot_is_freed_only_after_async_copy_completes():
+    engine = MockTransferEngine()
+    buffer = _HostBuffer()
+    manager = DiffusionTransferManager(engine, buffer)
+    actions = []
+    original_free = buffer.free
+
+    def record_free(slot):
+        actions.append("free")
+        return original_free(slot)
+
+    buffer.free = record_free
+    try:
+        pending = manager.allocate_receive_slot("request-copy", 512, "transfer-copy")
+        assert pending is not None
+        elapsed_s = manager.complete_receive_copy(
+            "request-copy",
+            "transfer-copy",
+            _CopyEvent(actions, "start"),
+            _CopyEvent(actions, "end"),
+        )
+
+        assert elapsed_s == pytest.approx(0.0035)
+        assert actions == ["sync:end", "free"]
     finally:
         manager.cleanup()
 

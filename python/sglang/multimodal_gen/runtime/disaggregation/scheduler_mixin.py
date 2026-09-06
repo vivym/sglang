@@ -29,6 +29,10 @@ from sglang.multimodal_gen.runtime.disaggregation.boundary import (
     validate_boundary_fields,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.disaggregation.telemetry import (
+    cuda_events_elapsed_s,
+    log_disagg_receipt,
+)
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferTensorBuffer,
 )
@@ -98,6 +102,7 @@ class _MediaEncodeQueueItem:
     staged: StagedMediaPayload
     completed_transfer_id: str
     decoder_compute_s: float
+    materialize_s: float
     staging_s: float
 
 
@@ -796,6 +801,7 @@ class SchedulerDisaggMixin:
                 break  # Shutdown signal
             request_id, transfer_id, dest_session_id, dest_addr, transfer_size = item
             error = None
+            push_started = time.monotonic()
             try:
                 success = self._transfer_manager.push_to_peer(
                     request_id=request_id,
@@ -820,6 +826,22 @@ class SchedulerDisaggMixin:
                     error=error,
                 )
                 self._rdma_push_zmq.send_multipart(encode_transfer_msg(pushed_msg))
+
+            log_disagg_receipt(
+                logger,
+                "tensor_wire_push",
+                request_id,
+                transfer_id=transfer_id,
+                role=role_name.lower(),
+                edge=(
+                    f"{self._disagg_role.value}_to_"
+                    f"{_DOWNSTREAM_ROLE[self._disagg_role].value}"
+                ),
+                backend=self._transfer_manager.backend_name,
+                payload_bytes=transfer_size,
+                wall_s=time.monotonic() - push_started,
+                status="ok" if success else "error",
+            )
 
             if not success:
                 logger.error(
@@ -855,13 +877,26 @@ class SchedulerDisaggMixin:
                     "_transfer_id": item.completed_transfer_id,
                 }
                 error = None
+                checksum_s = None
+                rpc_s = None
+                rpc_started = None
+                payload_bytes = None
+                output_bytes = None
                 try:
+                    checksum_started = time.monotonic()
                     request = item.staged.request
+                    payload_bytes = request.payload_nbytes
+                    checksum_s = time.monotonic() - checksum_started
+                    rpc_started = time.monotonic()
                     manifest = client.encode(request)
+                    rpc_s = time.monotonic() - rpc_started
+                    output_bytes = manifest.byte_size
                     scalar_fields["media_manifest"] = manifest.to_dict()
                 except Exception as exc:
                     error = str(exc)
                     scalar_fields["error"] = error
+                    if rpc_started is not None:
+                        rpc_s = time.monotonic() - rpc_started
                 finally:
                     item.staged.release()
                     self._media_encode_queue.task_done()
@@ -884,13 +919,29 @@ class SchedulerDisaggMixin:
                         self._media_encode_queue.qsize()
                     )
                 logger.info(
-                    "Decoder media completion for %s: compute=%.3fs staging=%.3fs "
-                    "encode_rpc=%.3fs status=%s",
+                    "Decoder media completion for %s: compute=%.3fs "
+                    "materialize=%.3fs staging=%.3fs encode_rpc=%.3fs status=%s",
                     request_id,
                     item.decoder_compute_s,
+                    item.materialize_s,
                     item.staging_s,
                     time.monotonic() - media_started,
                     "error" if error else "ok",
+                )
+                log_disagg_receipt(
+                    logger,
+                    "decoder_media_handoff",
+                    request_id,
+                    transfer_id=item.completed_transfer_id,
+                    decoder_compute_s=item.decoder_compute_s,
+                    materialize_s=item.materialize_s,
+                    shared_memory_stage_s=item.staging_s,
+                    checksum_finalize_s=checksum_s,
+                    media_rpc_s=rpc_s,
+                    payload_bytes=payload_bytes,
+                    output_bytes=output_bytes,
+                    total_background_s=time.monotonic() - media_started,
+                    status="error" if error else "ok",
                 )
         finally:
             result_socket.close(linger=0)
@@ -947,7 +998,8 @@ class SchedulerDisaggMixin:
         Called from the recv prefetch thread. Loads on _transfer_stream
         and builds the Req, so the main thread can start compute immediately.
 
-        Returns (req, load_event, request_id, transfer_id, prealloc_slot_id).
+        Returns (req, load_event, load_start_event, load_wall_started,
+        request_id, transfer_id, prealloc_slot_id, data_size).
         """
         request_id = msg["request_id"]
         transfer_id = msg.get("transfer_id", "")
@@ -971,12 +1023,15 @@ class SchedulerDisaggMixin:
 
         # Load tensors on transfer_stream (non-blocking)
         local_device = f"{current_platform.device_type}:{self.worker.local_rank}"
-        tensors, load_event = self._transfer_manager.load_tensors_async(
-            request_id,
-            manifest,
-            device=local_device,
-            stream=self._transfer_stream,
-            transfer_id=transfer_id,
+        load_wall_started = time.monotonic()
+        tensors, load_event, load_start_event = (
+            self._transfer_manager.load_tensors_async(
+                request_id,
+                manifest,
+                device=local_device,
+                stream=self._transfer_stream,
+                transfer_id=transfer_id,
+            )
         )
 
         # NOTE: Do NOT free the receive slot here. The async load is still
@@ -992,7 +1047,16 @@ class SchedulerDisaggMixin:
         # running denoising loop on the main thread. Deferred to main thread
         # in _disagg_prefetch_event_loop, right before compute.
 
-        return req, load_event, request_id, transfer_id, prealloc_slot_id
+        return (
+            req,
+            load_event,
+            load_start_event,
+            load_wall_started,
+            request_id,
+            transfer_id,
+            prealloc_slot_id,
+            data_size,
+        )
 
     # ------------------------------------------------------------------
     # Broadcast
@@ -1173,17 +1237,37 @@ class SchedulerDisaggMixin:
                     (
                         req,
                         load_event,
+                        load_start_event,
+                        load_wall_started,
                         request_id,
                         transfer_id,
                         prealloc_slot_id,
+                        data_size,
                     ) = data
-                    # Wait for load to complete on compute stream
-                    if load_event is not None:
-                        torch.get_device_module().current_stream().wait_event(
-                            load_event
-                        )
-                    # Now safe to free the receive slot
-                    self._transfer_manager.free_receive_slot(request_id, transfer_id)
+                    # The slot cannot be returned to the receive allocator until
+                    # the asynchronous H2D copy has completed; wait_event alone
+                    # would allow a new network receive to overwrite it.
+                    h2d_cuda_s = self._transfer_manager.complete_receive_copy(
+                        request_id,
+                        transfer_id,
+                        load_start_event,
+                        load_event,
+                    )
+                    log_disagg_receipt(
+                        logger,
+                        "tensor_h2d",
+                        request_id,
+                        transfer_id=transfer_id,
+                        role=role_name.lower(),
+                        edge=(
+                            f"{_UPSTREAM_ROLE[self._disagg_role].value}_to_"
+                            f"{self._disagg_role.value}"
+                        ),
+                        payload_bytes=data_size,
+                        cuda_s=h2d_cuda_s,
+                        wall_s=time.monotonic() - load_wall_started,
+                        status="ok",
+                    )
                     # Broadcast the full Req (scalar + tensor fields) to
                     # non-rank-0 ranks. Tensors ride NCCL on the SP/CFG/TP
                     # groups so downstream REPLICATED stages (e.g. denoising)
@@ -1553,6 +1637,7 @@ class SchedulerDisaggMixin:
             return
 
         # Fallback: blocking push on main thread
+        push_started = time.monotonic()
         success = self._transfer_manager.push_to_peer(
             request_id=request_id,
             dest_session_id=dest_session_id,
@@ -1569,6 +1654,22 @@ class SchedulerDisaggMixin:
             error=error,
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(pushed_msg))
+
+        log_disagg_receipt(
+            logger,
+            "tensor_wire_push",
+            request_id,
+            transfer_id=transfer_id,
+            role=self._disagg_role.value,
+            edge=(
+                f"{self._disagg_role.value}_to_"
+                f"{_DOWNSTREAM_ROLE[self._disagg_role].value}"
+            ),
+            backend=self._transfer_manager.backend_name,
+            payload_bytes=transfer_size,
+            wall_s=time.monotonic() - push_started,
+            status="ok" if success else "error",
+        )
 
         if not success:
             logger.error(
@@ -1624,12 +1725,15 @@ class SchedulerDisaggMixin:
 
         # 1. Start load on transfer_stream (non-blocking)
         local_device = f"{current_platform.device_type}:{self.worker.local_rank}"
-        tensors, load_event = self._transfer_manager.load_tensors_async(
-            request_id,
-            manifest,
-            device=local_device,
-            stream=self._transfer_stream,
-            transfer_id=transfer_id,
+        load_wall_started = time.monotonic()
+        tensors, load_event, load_start_event = (
+            self._transfer_manager.load_tensors_async(
+                request_id,
+                manifest,
+                device=local_device,
+                stream=self._transfer_stream,
+                transfer_id=transfer_id,
+            )
         )
 
         # 2. Build Req from scalar fields + tensors (CPU work, overlapped)
@@ -1639,20 +1743,36 @@ class SchedulerDisaggMixin:
         if self._disagg_role == RoleType.DENOISER:
             _init_disagg_request_scheduler(self, req)
 
-        # 4. Wait for load before compute (GPU must see the data)
-        if load_event is not None:
-            torch.get_device_module().current_stream().wait_event(load_event)
+        # 4. Complete H2D before returning its receive slot to the allocator.
+        h2d_cuda_s = self._transfer_manager.complete_receive_copy(
+            request_id,
+            transfer_id,
+            load_start_event,
+            load_event,
+        )
+        log_disagg_receipt(
+            logger,
+            "tensor_h2d",
+            request_id,
+            transfer_id=transfer_id,
+            role=self._disagg_role.value,
+            edge=(
+                f"{_UPSTREAM_ROLE[self._disagg_role].value}_to_"
+                f"{self._disagg_role.value}"
+            ),
+            payload_bytes=data_size,
+            cuda_s=h2d_cuda_s,
+            wall_s=time.monotonic() - load_wall_started,
+            status="ok",
+        )
 
-        # 5. Free receive slot after load completes (data is on compute GPU)
-        self._transfer_manager.free_receive_slot(request_id, transfer_id)
-
-        # 6. In multi-rank mode, broadcast the fully-loaded Req to the other
+        # 5. In multi-rank mode, broadcast the fully-loaded Req to the other
         # ranks so REPLICATED stages see identical inputs everywhere. See
         # the prefetch-loop variant for the matching receiver broadcast.
         if self._is_multi_rank():
             self._broadcast_req_to_all_ranks(req)
 
-        # 7. Run compute
+        # 6. Run compute
         if self._disagg_role == RoleType.DENOISER:
             self._disagg_denoiser_compute(req, request_id, transfer_id)
         elif self._disagg_role == RoleType.DECODER:
@@ -1807,6 +1927,14 @@ class SchedulerDisaggMixin:
         with self._disagg_trace_dispatch(req):
             result = self.worker.execute_forward([req], return_req=True)
         duration_s = time.monotonic() - start_time
+        log_disagg_receipt(
+            logger,
+            "role_compute",
+            request_id,
+            role="denoiser",
+            wall_s=duration_s,
+            status="ok" if isinstance(result, Req) else "error",
+        )
 
         if not isinstance(result, Req):
             error_msg = getattr(result, "error", "denoiser error")
@@ -1828,6 +1956,7 @@ class SchedulerDisaggMixin:
         )
 
         # 1. Stage tensors on transfer_stream (non-blocking)
+        stage_wall_started = time.monotonic()
         staged, stage_event = self._transfer_manager.stage_tensors_async(
             request_id=request_id,
             tensor_fields=tensor_fields,
@@ -1864,8 +1993,20 @@ class SchedulerDisaggMixin:
         msg_bytes = json.dumps(done_data, separators=(",", ":")).encode("utf-8")
 
         # 3. Wait for staging to complete before sending
-        if stage_event is not None:
-            stage_event.synchronize()
+        d2h_cuda_s = cuda_events_elapsed_s(staged.copy_start_event, stage_event)
+
+        log_disagg_receipt(
+            logger,
+            "tensor_d2h",
+            request_id,
+            transfer_id=staged.transfer_id,
+            role="denoiser",
+            edge="denoiser_to_decoder",
+            payload_bytes=staged.data_size,
+            cuda_s=d2h_cuda_s,
+            wall_s=time.monotonic() - stage_wall_started,
+            status="ok",
+        )
 
         # 4. Send transfer_done with staged info
         self._pool_result_push.send_multipart([TRANSFER_MAGIC, msg_bytes])
@@ -1985,6 +2126,14 @@ class SchedulerDisaggMixin:
         with self._disagg_trace_dispatch(req):
             output_batch = self.worker.execute_forward([req])
         duration_s = time.monotonic() - start_time
+        log_disagg_receipt(
+            logger,
+            "role_compute",
+            request_id,
+            role="decoder",
+            wall_s=duration_s,
+            status="ok" if output_batch.error is None else "error",
+        )
 
         if self._media_encode_queue is not None and output_batch.error is None:
             if not completed_transfer_id:
@@ -1998,9 +2147,9 @@ class SchedulerDisaggMixin:
                     "decoder media handoff requires audio and sample rate"
                 )
             else:
-                staging_started = time.monotonic()
                 staged = None
                 try:
+                    materialize_started = time.monotonic()
                     sample = attach_audio_to_video_sample(
                         output_batch.output[0], output_batch.audio, 0
                     )
@@ -2012,11 +2161,14 @@ class SchedulerDisaggMixin:
                     audio = _normalize_audio_to_numpy(materialized.audio)
                     if audio is None:
                         raise ValueError("decoder audio could not be materialized")
+                    audio = np.ascontiguousarray(audio, dtype=np.float32)
+                    materialize_s = time.monotonic() - materialize_started
+                    staging_started = time.monotonic()
                     staged = self._media_stager.stage(
                         request_id=request_id,
                         attempt_id=completed_transfer_id,
                         frames=materialized.frames,
-                        audio=np.ascontiguousarray(audio, dtype=np.float32),
+                        audio=audio,
                         fps=req.fps,
                         audio_sample_rate=output_batch.audio_sample_rate,
                         output_compression=req.output_compression,
@@ -2035,6 +2187,7 @@ class SchedulerDisaggMixin:
                             staged=staged,
                             completed_transfer_id=completed_transfer_id,
                             decoder_compute_s=duration_s,
+                            materialize_s=materialize_s,
                             staging_s=staging_s,
                         )
                     )
@@ -2101,8 +2254,18 @@ class SchedulerDisaggMixin:
             self._disagg_metrics.record_request_start(request_id)
 
         # Run encoder stages
+        compute_started = time.monotonic()
         with self._disagg_trace_dispatch(req):
             req_result = self.worker.execute_forward(reqs, return_req=True)
+        compute_s = time.monotonic() - compute_started
+        log_disagg_receipt(
+            logger,
+            "role_compute",
+            request_id,
+            role="encoder",
+            wall_s=compute_s,
+            status="ok" if isinstance(req_result, Req) else "error",
+        )
 
         if not isinstance(req_result, Req):
             # Error — send error via scalar fields (rank 0 only)
@@ -2151,6 +2314,7 @@ class SchedulerDisaggMixin:
         Overlap staging with metadata JSON serialization.
         """
         # 1. Stage tensors on transfer_stream (non-blocking)
+        stage_wall_started = time.monotonic()
         staged, stage_event = self._transfer_manager.stage_tensors_async(
             request_id=request_id,
             tensor_fields=tensor_fields,
@@ -2183,8 +2347,20 @@ class SchedulerDisaggMixin:
         )
 
         # 3. Wait for staging to complete before sending (buffer must be ready)
-        if stage_event is not None:
-            stage_event.synchronize()
+        d2h_cuda_s = cuda_events_elapsed_s(staged.copy_start_event, stage_event)
+
+        log_disagg_receipt(
+            logger,
+            "tensor_d2h",
+            request_id,
+            transfer_id=staged.transfer_id,
+            role="encoder",
+            edge="encoder_to_denoiser",
+            payload_bytes=staged.data_size,
+            cuda_s=d2h_cuda_s,
+            wall_s=time.monotonic() - stage_wall_started,
+            status="ok",
+        )
 
         # 4. Send transfer staged message
         self._pool_result_push.send_multipart(encode_transfer_msg(staged_msg))

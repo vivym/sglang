@@ -8,6 +8,9 @@ from dataclasses import dataclass, field
 
 import torch
 
+from sglang.multimodal_gen.runtime.disaggregation.telemetry import (
+    cuda_events_elapsed_s,
+)
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     SlotHandle,
     TransferTensorBuffer,
@@ -20,6 +23,14 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 logger = logging.getLogger(__name__)
 
 
+def _new_timing_event():
+    event_factory = torch.get_device_module().Event
+    try:
+        return event_factory(enable_timing=True)
+    except TypeError:
+        return event_factory()
+
+
 @dataclass
 class StagedTransfer:
     request_id: str
@@ -28,6 +39,7 @@ class StagedTransfer:
     data_size: int
     manifest: dict
     scalar_fields: dict = field(default_factory=dict)
+    copy_start_event: torch.Event | None = None
 
 
 @dataclass
@@ -147,6 +159,17 @@ class DiffusionTransferManager:
                 )
                 return None, None
             try:
+                copy_start_event = None
+                if torch.get_device_module().is_available():
+                    copy_stream = (
+                        stream
+                        if stream is not None
+                        else torch.get_device_module().current_stream()
+                    )
+                    if stream is not None:
+                        stream.wait_stream(torch.get_device_module().current_stream())
+                    copy_start_event = _new_timing_event()
+                    copy_start_event.record(copy_stream)
                 manifest = self._buffer.write_tensors_from_gpu(
                     slot, tensor_fields, stream
                 )
@@ -160,15 +183,16 @@ class DiffusionTransferManager:
                 data_size=total_size,
                 manifest=manifest,
                 scalar_fields=scalar_fields or {},
+                copy_start_event=copy_start_event,
             )
             self._staged[request_id] = staged
 
         d2h_event = None
         if stream is not None:
-            d2h_event = torch.get_device_module().Event()
+            d2h_event = _new_timing_event()
             d2h_event.record(stream)
         elif torch.get_device_module().is_available():
-            d2h_event = torch.get_device_module().Event()
+            d2h_event = _new_timing_event()
             d2h_event.record(torch.get_device_module().current_stream())
 
         logger.debug(
@@ -189,6 +213,7 @@ class DiffusionTransferManager:
     ) -> tuple[
         dict[str, torch.Tensor | list[torch.Tensor]],
         torch.get_device_module().Event | None,
+        torch.get_device_module().Event | None,
     ]:
         """Load tensors from receive slot to GPU, returning a CUDA event.
 
@@ -207,6 +232,16 @@ class DiffusionTransferManager:
                 f"{request_id}; expected {pending.transfer_id!r}"
             )
 
+        copy_start_event = None
+        if torch.get_device_module().is_available():
+            copy_stream = (
+                stream
+                if stream is not None
+                else torch.get_device_module().current_stream()
+            )
+            copy_start_event = _new_timing_event()
+            copy_start_event.record(copy_stream)
+
         tensors = self._buffer.read_tensors_from_manifest(
             pending.slot,
             manifest,
@@ -217,10 +252,10 @@ class DiffusionTransferManager:
 
         load_event = None
         if stream is not None:
-            load_event = torch.get_device_module().Event()
+            load_event = _new_timing_event()
             load_event.record(stream)
         elif torch.get_device_module().is_available():
-            load_event = torch.get_device_module().Event()
+            load_event = _new_timing_event()
             load_event.record(torch.get_device_module().current_stream())
 
         logger.debug(
@@ -229,7 +264,7 @@ class DiffusionTransferManager:
             request_id,
             device,
         )
-        return tensors, load_event
+        return tensors, load_event, copy_start_event
 
     def push_to_peer(
         self,
@@ -406,6 +441,21 @@ class DiffusionTransferManager:
             self._buffer.free(pending.slot)
             logger.debug("TransferManager: freed receive slot for %s", request_id)
         return True
+
+    def complete_receive_copy(
+        self,
+        request_id: str,
+        transfer_id: str,
+        copy_start_event,
+        copy_end_event,
+    ) -> float | None:
+        """Wait for H2D completion before making its receive slot reusable."""
+        elapsed_s = cuda_events_elapsed_s(copy_start_event, copy_end_event)
+        if not self.free_receive_slot(request_id, transfer_id):
+            raise RuntimeError(
+                f"receive slot disappeared before copy completion for {request_id!r}"
+            )
+        return elapsed_s
 
     def cleanup(self) -> None:
         try:

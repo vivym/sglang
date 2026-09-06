@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     MaterializedOutput,
     save_materialized_output,
 )
+from sglang.multimodal_gen.runtime.disaggregation.telemetry import (
+    log_disagg_receipt,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.video_adapter import (
     _probe_minimax_h3_output_fields,
 )
@@ -219,6 +222,9 @@ class MediaEncoderServer:
 
     def _encode_owned_payload(self, owned: _OwnedPayload) -> MediaEncodeResponse:
         request = owned.request
+        total_started = time.monotonic()
+        phase_times: dict[str, float] = {}
+        output_bytes = 0
         mapping: mmap.mmap | None = None
         temporary_path: Path | None = None
         materialized: MaterializedOutput | None = None
@@ -233,6 +239,7 @@ class MediaEncoderServer:
             mapping = mmap.mmap(
                 owned.fd, request.payload_nbytes, access=mmap.ACCESS_READ
             )
+            checksum_started = time.monotonic()
             if (
                 _sha256_range(mapping, 0, request.payload_nbytes)
                 != request.payload_sha256
@@ -248,6 +255,7 @@ class MediaEncoderServer:
                 != request.audio.sha256
             ):
                 raise ValueError("audio payload checksum mismatch")
+            phase_times["checksum_s"] = time.monotonic() - checksum_started
 
             video = np.ndarray(
                 request.video.shape,
@@ -273,6 +281,7 @@ class MediaEncoderServer:
             temporary_path = self.output_root / (
                 f".{final_path.stem}.{uuid.uuid4().hex}.tmp.mp4"
             )
+            encode_started = time.monotonic()
             save_materialized_output(
                 materialized,
                 DataType.VIDEO,
@@ -281,16 +290,24 @@ class MediaEncoderServer:
                 audio_sample_rate=request.audio_sample_rate,
                 output_compression=request.output_compression,
             )
+            phase_times["ffmpeg_s"] = time.monotonic() - encode_started
+            probe_started = time.monotonic()
             _probe_minimax_h3_output_fields(
                 str(temporary_path),
                 expected_frame_count=frame_count,
                 expected_size=(width, height),
             )
+            phase_times["ffprobe_s"] = time.monotonic() - probe_started
+            output_hash_started = time.monotonic()
             byte_size = temporary_path.stat().st_size
+            output_bytes = byte_size
             output_sha256 = _sha256_file(temporary_path)
+            phase_times["output_hash_s"] = time.monotonic() - output_hash_started
             os.replace(temporary_path, final_path)
             temporary_path = None
+            publish_started = time.monotonic()
             uri, object_key = self._publish(final_path)
+            phase_times["publish_s"] = time.monotonic() - publish_started
 
             manifest = MediaEncodeManifest(
                 request_id=request.request_id,
@@ -314,17 +331,41 @@ class MediaEncoderServer:
                 source_payload_sha256=request.payload_sha256,
                 model_identity=request.model_identity,
             )
-            return MediaEncodeResponse(
+            response = MediaEncodeResponse(
                 request_id=request.request_id,
                 attempt_id=request.attempt_id,
                 status="ok",
                 manifest=manifest,
             )
+            log_disagg_receipt(
+                logger,
+                "cpu_media_encode",
+                request.request_id,
+                transfer_id=request.attempt_id,
+                payload_bytes=request.payload_nbytes,
+                output_bytes=output_bytes,
+                total_s=time.monotonic() - total_started,
+                status="ok",
+                **phase_times,
+            )
+            return response
         except Exception as error:
             logger.exception(
                 "Media encoding failed for request=%s attempt=%s",
                 request.request_id,
                 request.attempt_id,
+            )
+            log_disagg_receipt(
+                logger,
+                "cpu_media_encode",
+                request.request_id,
+                transfer_id=request.attempt_id,
+                payload_bytes=request.payload_nbytes,
+                output_bytes=output_bytes,
+                total_s=time.monotonic() - total_started,
+                status="error",
+                error_type=type(error).__name__,
+                **phase_times,
             )
             return MediaEncodeResponse(
                 request_id=request.request_id,
