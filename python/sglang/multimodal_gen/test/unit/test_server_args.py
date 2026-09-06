@@ -3426,6 +3426,8 @@ class TestDisaggTransferBackendArgs(unittest.TestCase):
             "/fake",
             "--disagg-transfer-max-payload-size",
             "67108864",
+            "--disagg-transfer-listen-port",
+            "32000",
             "--disagg-transfer-timeout",
             "12.5",
             "--disagg-transfer-retries",
@@ -3434,8 +3436,18 @@ class TestDisaggTransferBackendArgs(unittest.TestCase):
 
         args, _unknown = parser.parse_known_args(argv)
         self.assertEqual(args.disagg_transfer_max_payload_size, 67108864)
+        self.assertEqual(args.disagg_transfer_listen_port, 32000)
         self.assertEqual(args.disagg_transfer_timeout, 12.5)
         self.assertEqual(args.disagg_transfer_retries, 2)
+
+    def test_tcp_transfer_listen_port_is_bounded(self):
+        with self.assertRaisesRegex(ValueError, "integer from 0 to 65535"):
+            _from_dict_without_model_resolution(
+                {
+                    "model_path": "/fake",
+                    "disagg_transfer_listen_port": 65536,
+                }
+            )
 
     def test_decoder_media_handoff_args_are_parsed(self):
         parser = FlexibleArgumentParser()

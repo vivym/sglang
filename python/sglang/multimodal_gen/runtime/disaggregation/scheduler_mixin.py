@@ -680,6 +680,7 @@ class SchedulerDisaggMixin:
             gpu_id=physical_gpu_id,
             ib_device=ib_device,
             backend=getattr(sa, "disagg_transfer_backend", "auto"),
+            listen_port=getattr(sa, "disagg_transfer_listen_port", 0),
             timeout_s=getattr(sa, "disagg_transfer_timeout", 60.0),
             max_payload_bytes=getattr(
                 sa, "disagg_transfer_max_payload_size", 256 * 1024 * 1024

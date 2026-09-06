@@ -540,6 +540,7 @@ class ServerArgs(DisaggServerArgsMixin):
     disagg_transfer_backend: Literal["auto", "mock", "mooncake", "tcp"] = "auto"
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
     disagg_transfer_max_payload_size: int = 256 * 1024 * 1024
+    disagg_transfer_listen_port: int = 0
     disagg_transfer_timeout: float = 60.0
     disagg_transfer_retries: int = 1
     disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
@@ -663,6 +664,14 @@ class ServerArgs(DisaggServerArgsMixin):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if (
+            isinstance(self.disagg_transfer_listen_port, bool)
+            or not isinstance(self.disagg_transfer_listen_port, int)
+            or not 0 <= self.disagg_transfer_listen_port <= 65535
+        ):
+            raise ValueError(
+                "disagg_transfer_listen_port must be an integer from 0 to 65535"
+            )
         if self.disagg_transfer_max_payload_size > self.disagg_transfer_pool_size:
             raise ValueError(
                 "disagg_transfer_max_payload_size must not exceed "

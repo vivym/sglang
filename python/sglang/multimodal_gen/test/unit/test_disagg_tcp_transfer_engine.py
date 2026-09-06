@@ -71,6 +71,19 @@ def test_zmq_tcp_engine_transfers_registered_host_memory():
         receiver.close()
 
 
+def test_zmq_tcp_engine_uses_fixed_listen_port_and_rejects_conflict():
+    receiver = ZmqTcpTransferEngine("127.0.0.1", timeout_s=1, max_retries=0)
+    try:
+        port = int(receiver.session_id.rsplit(":", maxsplit=1)[1])
+        assert receiver.session_id == f"zmq+tcp://127.0.0.1:{port}"
+        with pytest.raises(RuntimeError, match="failed to start TCP transfer receiver"):
+            ZmqTcpTransferEngine(
+                "127.0.0.1", listen_port=port, timeout_s=1, max_retries=0
+            )
+    finally:
+        receiver.close()
+
+
 def test_zmq_tcp_engine_rejects_unregistered_source_and_destination_ranges():
     sender = ZmqTcpTransferEngine("127.0.0.1", timeout_s=1, max_retries=0)
     receiver = ZmqTcpTransferEngine("127.0.0.1", timeout_s=1, max_retries=0)

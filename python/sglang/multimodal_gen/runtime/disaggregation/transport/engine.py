@@ -184,6 +184,7 @@ class ZmqTcpTransferEngine(BaseTransferEngine):
         self,
         hostname: str,
         *,
+        listen_port: int = 0,
         timeout_s: float = 60.0,
         max_payload_bytes: int = 256 * 1024 * 1024,
         max_retries: int = 1,
@@ -197,6 +198,12 @@ class ZmqTcpTransferEngine(BaseTransferEngine):
             )
         if hostname in {"0.0.0.0", "::"}:
             raise ValueError("TCP transfer hostname must be reachable by peer hosts")
+        if (
+            isinstance(listen_port, bool)
+            or not isinstance(listen_port, int)
+            or not 0 <= listen_port <= 65535
+        ):
+            raise ValueError("TCP listen port must be an integer from 0 to 65535")
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
             raise ValueError("TCP transfer timeout must be a positive number")
         if timeout_s <= 0:
@@ -215,6 +222,7 @@ class ZmqTcpTransferEngine(BaseTransferEngine):
             raise ValueError("TCP transfer retries must be a non-negative integer")
 
         self._hostname = hostname
+        self._listen_port = listen_port
         self._timeout_ms = max(1, int(float(timeout_s) * 1000))
         self._max_payload_bytes = max_payload_bytes
         self._max_retries = max_retries
@@ -408,7 +416,11 @@ class ZmqTcpTransferEngine(BaseTransferEngine):
                 zmq.MAXMSGSIZE,
                 max(self._max_payload_bytes, _TCP_HEADER_LIMIT_BYTES),
             )
-            port = socket.bind_to_random_port("tcp://0.0.0.0")
+            if self._listen_port:
+                socket.bind(f"tcp://0.0.0.0:{self._listen_port}")
+                port = self._listen_port
+            else:
+                port = socket.bind_to_random_port("tcp://0.0.0.0")
             host = self._hostname
             if ":" in host and not host.startswith("["):
                 host = f"[{host}]"
@@ -616,6 +628,7 @@ def create_transfer_engine(
     ib_device: str | None = None,
     *,
     backend: str = "auto",
+    listen_port: int = 0,
     timeout_s: float = 60.0,
     max_payload_bytes: int = 256 * 1024 * 1024,
     max_retries: int = 1,
@@ -628,6 +641,7 @@ def create_transfer_engine(
     if backend == "tcp":
         return ZmqTcpTransferEngine(
             hostname,
+            listen_port=listen_port,
             timeout_s=timeout_s,
             max_payload_bytes=max_payload_bytes,
             max_retries=max_retries,
@@ -644,6 +658,7 @@ def create_transfer_engine(
     logger.info("Mooncake is unavailable; using the bounded ZMQ TCP transfer backend")
     return ZmqTcpTransferEngine(
         hostname,
+        listen_port=listen_port,
         timeout_s=timeout_s,
         max_payload_bytes=max_payload_bytes,
         max_retries=max_retries,

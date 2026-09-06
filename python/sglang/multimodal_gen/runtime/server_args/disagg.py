@@ -165,6 +165,16 @@ class DisaggServerArgsMixin:
             help="Maximum bytes accepted by one disaggregated tensor transfer.",
         )
         parser.add_argument(
+            "--disagg-transfer-listen-port",
+            type=int,
+            default=cls.disagg_transfer_listen_port,
+            help=(
+                "TCP tensor receiver port. Zero selects an ephemeral port; set a "
+                "fixed port when the receiver is exposed through a service or "
+                "network policy."
+            ),
+        )
+        parser.add_argument(
             "--disagg-transfer-timeout",
             type=float,
             default=cls.disagg_transfer_timeout,
