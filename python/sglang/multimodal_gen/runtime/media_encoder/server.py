@@ -33,7 +33,10 @@ from sglang.multimodal_gen.runtime.disaggregation.telemetry import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.video_adapter import (
     _probe_minimax_h3_output_fields,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    configure_logger,
+    init_logger,
+)
 
 from .client import validate_ipc_endpoint
 from .protocol import (
@@ -129,6 +132,7 @@ class MediaEncoderServer:
             raise ValueError(
                 "shared-memory and output roots must be separate directory trees"
             )
+        self._prepare_endpoint_parent(self.endpoint)
         self.max_payload_bytes = int(max_payload_bytes)
         self.max_pending = int(max_pending)
         self.workers = int(workers)
@@ -169,6 +173,16 @@ class MediaEncoderServer:
         if raw.is_symlink() or not raw.is_dir():
             raise ValueError(f"media encoder {label} root must be a real directory")
         return raw.resolve(strict=True)
+
+    @staticmethod
+    def _prepare_endpoint_parent(endpoint: str) -> None:
+        socket_path = Path(endpoint.removeprefix("ipc://"))
+        parent = socket_path.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o770)
+        if parent.is_symlink() or not parent.is_dir():
+            raise ValueError(
+                "media encoder ipc endpoint parent must be a real directory"
+            )
 
     def request_stop(self) -> None:
         self._stop_requested.set()
@@ -585,11 +599,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--completed-cache-size", type=int, default=256)
     parser.add_argument("--publish-mode", choices=["local", "s3"], default="local")
+    parser.add_argument(
+        "--log-level",
+        choices=("debug", "info", "warning", "error"),
+        default="info",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    configure_logger(args)
     service = MediaEncoderServer(
         endpoint=args.endpoint,
         shared_memory_root=args.shared_memory_root,

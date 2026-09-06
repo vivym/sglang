@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import sglang.multimodal_gen.runtime.media_encoder.server as media_encoder_server
 from sglang.multimodal_gen.runtime.media_encoder.client import (
     MediaEncoderClient,
     MediaEncoderError,
@@ -86,6 +87,70 @@ def _stop_server(
     socket_path.unlink(missing_ok=True)
     assert not thread.is_alive()
     assert errors == []
+
+
+def test_media_service_creates_missing_ipc_parent(tmp_path):
+    endpoint_parent = Path(f"/tmp/sglang-media-{uuid.uuid4().hex[:12]}")
+    socket_path = endpoint_parent / "media.sock"
+    service = None
+    thread = None
+    errors = []
+    try:
+        service = MediaEncoderServer(
+            endpoint=f"ipc://{socket_path}",
+            shared_memory_root=tmp_path / "shm",
+            output_root=tmp_path / "output",
+            max_payload_bytes=16 * 1024 * 1024,
+            max_pending=1,
+            workers=1,
+        )
+        assert endpoint_parent.is_dir()
+        thread, errors = _start_server(service)
+    finally:
+        if service is not None and thread is not None:
+            _stop_server(service, thread, errors, socket_path)
+        elif service is not None:
+            service._executor.shutdown(wait=True)
+        socket_path.unlink(missing_ok=True)
+        if endpoint_parent.exists():
+            endpoint_parent.rmdir()
+
+
+def test_media_encoder_main_configures_info_logging(monkeypatch):
+    observed = {}
+
+    class _Service:
+        def __init__(self, **kwargs):
+            observed["service_kwargs"] = kwargs
+
+        def request_stop(self):
+            pass
+
+        def serve_forever(self):
+            observed["served"] = True
+
+    monkeypatch.setattr(media_encoder_server, "MediaEncoderServer", _Service)
+    monkeypatch.setattr(
+        media_encoder_server,
+        "configure_logger",
+        lambda args: observed.setdefault("log_level", args.log_level),
+    )
+    monkeypatch.setattr(media_encoder_server.signal, "signal", lambda *_args: None)
+
+    media_encoder_server.main(
+        [
+            "--endpoint",
+            "ipc:///tmp/media.sock",
+            "--shared-memory-root",
+            "/dev/shm/sglang-h3-media",
+            "--output-root",
+            "/tmp/sglang-h3-output",
+        ]
+    )
+
+    assert observed["log_level"] == "info"
+    assert observed["service_kwargs"]["endpoint"] == "ipc:///tmp/media.sock"
+    assert observed["served"] is True
 
 
 def test_media_request_rejects_path_traversal_and_shape_size_mismatch(tmp_path):
