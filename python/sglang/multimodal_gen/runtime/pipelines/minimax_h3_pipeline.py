@@ -23,6 +23,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3TimestepPreparationStage,
     MiniMaxH3VisualEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.artifact_identity import (
+    verify_minimax_h3_disagg_artifacts,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.disagg_boundary import (
+    export_minimax_h3_disagg_boundary,
+    filter_minimax_h3_disagg_transfer_fields,
+    restore_minimax_h3_disagg_boundary,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -114,14 +122,77 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 "MiniMax H3 loaded checkpoint partition does not match "
                 f"--model-variant {model_variant!r}"
             )
+        self.disagg_release_identity = None
+        if self._disagg_role != RoleType.MONOLITHIC:
+            self.disagg_release_identity = verify_minimax_h3_disagg_artifacts(
+                manifest_path=getattr(
+                    self.server_args, "minimax_h3_disagg_manifest_path", None
+                ),
+                artifact_root=getattr(
+                    self.server_args, "minimax_h3_disagg_artifact_root", None
+                ),
+                model_path=self.model_path,
+                partition=self.release_metadata.partition,
+                role=self._disagg_role,
+                server_args=self.server_args,
+            )
         return model_index
 
     def validate_disagg_role(self, role: RoleType) -> None:
-        if role != RoleType.MONOLITHIC:
+        if role not in {
+            RoleType.MONOLITHIC,
+            RoleType.ENCODER,
+            RoleType.DENOISER,
+            RoleType.DECODER,
+        }:
             raise ValueError(
-                "MiniMaxH3Pipeline only supports monolithic deployment; "
-                f"disaggregation role {role.value!r} is not supported"
+                f"MiniMaxH3Pipeline disaggregation role {role.value!r} is not supported"
             )
+
+    def filter_disagg_transfer_fields(
+        self,
+        req,
+        *,
+        source_role,
+        destination_role,
+        tensor_fields,
+        scalar_fields,
+    ) -> None:
+        del self, req
+        filter_minimax_h3_disagg_transfer_fields(
+            source_role=source_role,
+            destination_role=destination_role,
+            tensor_fields=tensor_fields,
+            scalar_fields=scalar_fields,
+        )
+
+    def export_disagg_boundary(
+        self, req, *, source_role, destination_role
+    ) -> tuple[dict, dict]:
+        return export_minimax_h3_disagg_boundary(
+            req,
+            source_role=source_role,
+            destination_role=destination_role,
+            release_identity=self.disagg_release_identity,
+        )
+
+    def restore_disagg_boundary(
+        self,
+        req,
+        *,
+        source_role,
+        destination_role,
+        tensor_fields,
+        scalar_fields,
+    ) -> None:
+        restore_minimax_h3_disagg_boundary(
+            req,
+            source_role=source_role,
+            destination_role=destination_role,
+            tensor_fields=tensor_fields,
+            scalar_fields=scalar_fields,
+            release_identity=self.disagg_release_identity,
+        )
 
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
         transformer = self.get_module("transformer")
@@ -145,46 +216,70 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             if release_metadata is not None
             else None
         )
-        self.add_stage(InputValidationStage())
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            InputValidationStage,
+            InputValidationStage.__name__,
+        )
         if release_metadata is not None:
-            self.add_stage(MiniMaxH3PartitionAdmissionStage(release_metadata))
-        self.add_stage(
-            MiniMaxH3TextEncodingStage(
+            self.add_stage_factory(
+                RoleType.ENCODER,
+                lambda: MiniMaxH3PartitionAdmissionStage(release_metadata),
+                MiniMaxH3PartitionAdmissionStage.__name__,
+            )
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            lambda: MiniMaxH3TextEncodingStage(
                 text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
                 processor=self.get_module("processor"),
-            )
+            ),
+            MiniMaxH3TextEncodingStage.__name__,
         )
-        self.add_stage(
-            MiniMaxH3VisualEncodingStage(
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            lambda: MiniMaxH3VisualEncodingStage(
                 video_vae=self.get_module("video_vae"),
                 vae_arch_config=server_args.pipeline_config.vae_config.arch_config,
-            )
+            ),
+            MiniMaxH3VisualEncodingStage.__name__,
         )
-        self.add_stage(
-            MiniMaxH3AudioEncodingStage(
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            lambda: MiniMaxH3AudioEncodingStage(
                 audio_vae=self.get_module("audio_vae"),
                 vae_arch_config=server_args.pipeline_config.audio_vae_config.arch_config,
-            )
+            ),
+            MiniMaxH3AudioEncodingStage.__name__,
         )
-        self.add_stage(MiniMaxH3LatentPreparationStage())
-        self.add_stage(
-            MiniMaxH3TimestepPreparationStage(
+        self.add_stage_factory(
+            RoleType.DENOISER,
+            MiniMaxH3LatentPreparationStage,
+            MiniMaxH3LatentPreparationStage.__name__,
+        )
+        self.add_stage_factory(
+            RoleType.DENOISER,
+            lambda: MiniMaxH3TimestepPreparationStage(
                 sigma_shift_scales=sigma_shift_scales,
-            )
+            ),
+            MiniMaxH3TimestepPreparationStage.__name__,
         )
-        self.add_stage(
-            MiniMaxH3DenoisingStage(
+        self.add_stage_factory(
+            RoleType.DENOISER,
+            lambda: MiniMaxH3DenoisingStage(
                 transformer=self.get_module("transformer"),
                 pipeline=self,
-            )
+            ),
+            MiniMaxH3DenoisingStage.__name__,
         )
-        self.add_stage(
-            MiniMaxH3DecodingStage(
+        self.add_stage_factory(
+            RoleType.DECODER,
+            lambda: MiniMaxH3DecodingStage(
                 video_vae=self.get_module("video_vae"),
                 audio_vae=self.get_module("audio_vae"),
                 server_args=server_args,
-            )
+            ),
+            MiniMaxH3DecodingStage.__name__,
         )
 
 

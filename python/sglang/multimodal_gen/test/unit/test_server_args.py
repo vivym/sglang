@@ -3339,6 +3339,23 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
 
         self.assertEqual(args.disagg_role, "denoising")
 
+    def test_h3_disagg_manifest_cli_args_are_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, _unknown = parser.parse_known_args(
+            [
+                "--model-path",
+                "/fake",
+                "--minimax-h3-disagg-manifest-path",
+                "/receipts/h3.json",
+                "--minimax-h3-disagg-artifact-root",
+                "/srv/models",
+            ]
+        )
+
+        self.assertEqual(args.minimax_h3_disagg_manifest_path, "/receipts/h3.json")
+        self.assertEqual(args.minimax_h3_disagg_artifact_root, "/srv/models")
+
     def test_disagg_role_alias_normalizes_to_denoiser(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 

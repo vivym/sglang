@@ -90,7 +90,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         return True
 
     def supports_disaggregation(self) -> bool:
-        return False
+        return True
 
     def supports_dynamic_batching(self) -> bool:
         return True

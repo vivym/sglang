@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 
 
@@ -39,6 +41,15 @@ class _BoundaryPipeline:
         assert destination_role is RoleType.DENOISER
         req.extra["restored_tensor"] = tensor_fields[_TENSOR_KEY]
         req.extra["restored_schema"] = scalar_fields[_SCALAR_KEY]
+
+
+@dataclass
+class _ModelSamplingParams(SamplingParams):
+    model_option: str = "default"
+
+
+class _SamplingBoundaryPipeline(_BoundaryPipeline):
+    sampling_params_cls = _ModelSamplingParams
 
 
 def _scheduler(pipeline=None):
@@ -69,6 +80,31 @@ def test_model_boundary_round_trips_without_leaking_wire_fields_to_req():
     assert rebuilt.extra["restored_schema"] == "v1"
     assert not hasattr(rebuilt, _TENSOR_KEY)
     assert not hasattr(rebuilt, _SCALAR_KEY)
+
+
+def test_build_uses_pipeline_sampling_params_class():
+    pipeline = _SamplingBoundaryPipeline()
+    scheduler = _scheduler(pipeline)
+    req = Req(
+        request_id="model-sampling",
+        prompt="test",
+        sampling_params=_ModelSamplingParams(model_option="candidate"),
+    )
+    req.extra["model_tensor"] = torch.ones(1)
+
+    tensors, scalars = SchedulerDisaggMixin._extract_disagg_transfer_fields(
+        scheduler,
+        req,
+        source_role=RoleType.ENCODER,
+        destination_role=RoleType.DENOISER,
+    )
+    rebuilt = SchedulerDisaggMixin._build_disagg_req(
+        scheduler, dict(scalars), dict(tensors)
+    )
+
+    assert isinstance(rebuilt.sampling_params, _ModelSamplingParams)
+    assert rebuilt.sampling_params.model_option == "candidate"
+    assert "model_option" not in rebuilt.__dict__
 
 
 @pytest.mark.parametrize("kind", ["tensor", "scalar"])

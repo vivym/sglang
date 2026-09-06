@@ -459,6 +459,15 @@ class SchedulerDisaggMixin:
             )
         tensor_fields, scalar_fields = extract_transfer_fields(req)
         pipeline = getattr(getattr(self, "worker", None), "pipeline", None)
+        filter_hook = getattr(pipeline, "filter_disagg_transfer_fields", None)
+        if filter_hook is not None:
+            filter_hook(
+                req,
+                source_role=source_role,
+                destination_role=destination_role,
+                tensor_fields=tensor_fields,
+                scalar_fields=scalar_fields,
+            )
         hook = getattr(pipeline, "export_disagg_boundary", None)
         if hook is None:
             return tensor_fields, scalar_fields
@@ -1480,8 +1489,12 @@ class SchedulerDisaggMixin:
                 object.__setattr__(req, f.name, f.default)
             elif f.default_factory is not dataclasses.MISSING:
                 object.__setattr__(req, f.name, f.default_factory())
-        # Ensure sampling_params is not None so __getattr__ delegation works
-        object.__setattr__(req, "sampling_params", SamplingParams())
+        # Preserve model-specific sampling fields on their declared class. A
+        # base SamplingParams would make unknown fields land as dynamic Req
+        # attributes, while model stages read them from req.sampling_params.
+        pipeline = getattr(getattr(self, "worker", None), "pipeline", None)
+        sampling_params_cls = getattr(pipeline, "sampling_params_cls", SamplingParams)
+        object.__setattr__(req, "sampling_params", sampling_params_cls())
         # Restore _extra_* prefixed fields into req.extra dict
         extra_keys = [k for k in scalar_fields if k.startswith("_extra_")]
         for key in extra_keys:
@@ -1501,7 +1514,6 @@ class SchedulerDisaggMixin:
                 ]
             else:
                 req.generator = torch.Generator(device="cpu").manual_seed(int(seed))
-        pipeline = getattr(getattr(self, "worker", None), "pipeline", None)
         restore_hook = getattr(pipeline, "restore_disagg_boundary", None)
         if restore_hook is not None:
             destination_role = self._disagg_role

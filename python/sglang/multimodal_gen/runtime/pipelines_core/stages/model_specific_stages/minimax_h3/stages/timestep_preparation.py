@@ -6,6 +6,7 @@ from collections.abc import Mapping
 
 import torch
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -22,6 +23,10 @@ from ..constants import MINIMAX_H3_SIGMAS_EXTRA_KEY
 class MiniMaxH3TimestepPreparationStage(PipelineStage):
     deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
     deduplicated_extra_tensor_tree_output_keys = (MINIMAX_H3_SIGMAS_EXTRA_KEY,)
+
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
 
     def __init__(self, sigma_shift_scales=None) -> None:
         super().__init__()

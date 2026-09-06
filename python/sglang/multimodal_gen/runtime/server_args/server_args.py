@@ -353,6 +353,10 @@ class ServerArgs(DisaggServerArgsMixin):
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
+    # Content-addressed production manifest used by disaggregated H3 roles.
+    minimax_h3_disagg_manifest_path: str | None = None
+    # Local root corresponding to the manifest's relative artifact paths.
+    minimax_h3_disagg_artifact_root: str | None = None
     # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
     minimax_h3_adaln_online: bool = False
     # Widest timestep plan the rebuild slab is sized for; see
@@ -2017,6 +2021,26 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Path to a precomputed MiniMax H3 AdaLN cache. This only "
                 "supports the matching unquantized H3 checkpoint and rejects "
                 "requests whose timestep embeddings are not present in the cache."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-disagg-manifest-path",
+            type=str,
+            default=ServerArgs.minimax_h3_disagg_manifest_path,
+            help=(
+                "Content-addressed production artifact manifest required by each "
+                "disaggregated MiniMax H3 compute role. The role hashes only its "
+                "owned artifacts and exchanges the global manifest identity at "
+                "role boundaries."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-disagg-artifact-root",
+            type=str,
+            default=ServerArgs.minimax_h3_disagg_artifact_root,
+            help=(
+                "Local root for paths in --minimax-h3-disagg-manifest-path. "
+                "Defaults to source_root recorded by the manifest."
             ),
         )
         parser.add_argument(

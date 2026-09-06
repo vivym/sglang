@@ -266,6 +266,23 @@ class ComposedPipelineBase(ABC):
         del req, source_role, destination_role
         return {}, {}
 
+    def filter_disagg_transfer_fields(
+        self,
+        req: Req,
+        *,
+        source_role: RoleType,
+        destination_role: RoleType,
+        tensor_fields: dict[str, Any],
+        scalar_fields: dict[str, Any],
+    ) -> None:
+        """Optionally remove generic fields before adding a model boundary.
+
+        Existing pipelines retain the complete generic transfer contract. A
+        model with an explicit boundary schema can narrow that contract without
+        teaching the shared scheduler about model-specific field names.
+        """
+        del req, source_role, destination_role, tensor_fields, scalar_fields
+
     def restore_disagg_boundary(
         self,
         req: Req,
