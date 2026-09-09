@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
 import shutil
 import time
+from pathlib import Path
+from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
@@ -32,6 +35,32 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _baked_lora_profile_from_checkpoint(
+    server_args: ServerArgs,
+) -> dict[str, Any] | None:
+    weights_path = getattr(server_args, "transformer_weights_path", None)
+    if not isinstance(weights_path, str) or not weights_path:
+        return None
+    config_path = Path(weights_path) / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"cannot read transformer override config: {config_path}"
+        ) from exc
+    quantization = config.get("quantization_config")
+    if not isinstance(quantization, dict):
+        return None
+    baked_lora = quantization.get("minimax_h3_baked_lora")
+    if baked_lora is None:
+        return None
+    if not isinstance(baked_lora, dict):
+        raise ValueError("transformer baked-LoRA provenance must be an object")
+    return baked_lora
 
 
 class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
@@ -136,6 +165,18 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 time.perf_counter() - started,
             )
 
+    def get_minimax_h3_runtime_lora_identity(self) -> dict[str, Any] | None:
+        identity = self.get_lora_runtime_identity()
+        if identity is None:
+            return None
+        transformer = self.get_module("transformer")
+        cache = getattr(transformer, "adaln_cache", None)
+        return {
+            **identity,
+            "adaln_cache_path": getattr(cache, "path", None),
+            "adaln_cache_sha256": getattr(cache, "artifact_sha256", None),
+        }
+
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         # Per-model sigma override from model_index.json; contract tests
         # construct the pipeline without model_path, hence the guard.
@@ -145,9 +186,18 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             if release_metadata is not None
             else None
         )
+        base_schedule = (
+            release_metadata.base_schedule if release_metadata is not None else None
+        )
         self.add_stage(InputValidationStage())
         if release_metadata is not None:
-            self.add_stage(MiniMaxH3PartitionAdmissionStage(release_metadata))
+            self.add_stage(
+                MiniMaxH3PartitionAdmissionStage(
+                    release_metadata,
+                    baked_lora_profile=_baked_lora_profile_from_checkpoint(server_args),
+                    lora_identity_provider=self.get_minimax_h3_runtime_lora_identity,
+                )
+            )
         self.add_stage(
             MiniMaxH3TextEncodingStage(
                 text_encoder=self.get_module("text_encoder"),
@@ -171,6 +221,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             MiniMaxH3TimestepPreparationStage(
                 sigma_shift_scales=sigma_shift_scales,
+                base_schedule=base_schedule,
             )
         )
         self.add_stage(

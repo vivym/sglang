@@ -443,6 +443,11 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                     "MiniMax H3 AdaLN cache requires --model-variant fl2va or ref2va"
                 )
             init_params["adaln_cache_path"] = adaln_cache_path
+            init_params["adaln_cache_expected_sha256"] = getattr(
+                component_server_args,
+                "minimax_h3_adaln_cache_expected_sha256",
+                None,
+            )
             init_params["adaln_cache_model_variant"] = (
                 component_server_args.model_variant
             )

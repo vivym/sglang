@@ -23,12 +23,13 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
     deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
     deduplicated_extra_tensor_tree_output_keys = (MINIMAX_H3_SIGMAS_EXTRA_KEY,)
 
-    def __init__(self, sigma_shift_scales=None) -> None:
+    def __init__(self, sigma_shift_scales=None, base_schedule=None) -> None:
         super().__init__()
         # Per-model sigma shift override (model_index.json "_minimax_h3" release
         # block, sigma_shift_scales): the schedule constants are a MODEL
         # serving contract — fl2va and ref2va use video 12 / audio 3 by default.
         self.sigma_shift_scales = sigma_shift_scales
+        self.base_schedule = base_schedule
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
@@ -63,6 +64,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             plan.default_flow_shift,
             plan.default_audio_flow_shift,
             self.freeze_for_dedup(self.sigma_shift_scales),
+            self.freeze_for_dedup(self.base_schedule),
         )
 
     @staticmethod
@@ -155,6 +157,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             sigmas[modality] = minimax_h3_time_shift_sigmas(
                 num_steps=requested_num_steps,
                 shift_scale=scales[modality],
+                base_schedule=self.base_schedule,
             )
         batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = sigmas
 

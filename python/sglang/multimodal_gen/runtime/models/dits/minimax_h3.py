@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import os
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any, Callable
 
 import torch
@@ -102,6 +102,15 @@ logger = init_logger(__name__)
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 
 _NON_LORA_DELTA_SUFFIXES = (".diff", ".diff_b", ".set_weight")
+MINIMAX_H3_PDD_FORMAT = "minimax-h3-sglang-pdd-v1"
+MINIMAX_H3_PDD_TENSOR_NAMES = frozenset(
+    {
+        "pdd.video_out.weight",
+        "pdd.video_out.bias",
+        "pdd.audio_out.weight",
+        "pdd.audio_out.bias",
+    }
+)
 
 
 def _reject_non_lora_delta_tensors(adapter: dict[str, torch.Tensor]) -> None:
@@ -866,7 +875,7 @@ class MiniMaxH3Attention(nn.Module):
 
     def _set_attention_backend(self, backend) -> None:
         if (
-            backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
+            backend.get_enum() is not AttentionBackendEnum.FA
             and not self._cube_sparse_capable
         ):
             backend = get_attn_backend(
@@ -1470,6 +1479,269 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
 
 
+class MiniMaxH3PDDHead(nn.Module):
+    """Released PDD interval heads and their fixed blockwise sampling plan."""
+
+    def __init__(
+        self,
+        *,
+        video_weight: torch.Tensor,
+        video_bias: torch.Tensor,
+        audio_weight: torch.Tensor,
+        audio_bias: torch.Tensor,
+        num_steps: int,
+        block_size: int,
+        video_shift: float,
+        audio_shift: float,
+    ) -> None:
+        super().__init__()
+        if block_size <= 0 or num_steps <= 0 or num_steps % block_size:
+            raise ValueError(
+                "MiniMax H3 PDD num_steps must be positive and divisible by block_size"
+            )
+        expected = {
+            "video_weight": (num_steps, 96, _ARCH_DEFAULTS.hidden_size),
+            "video_bias": (num_steps, 96),
+            "audio_weight": (
+                num_steps,
+                _ARCH_DEFAULTS.audio_latents_dim,
+                _ARCH_DEFAULTS.hidden_size,
+            ),
+            "audio_bias": (num_steps, _ARCH_DEFAULTS.audio_latents_dim),
+        }
+        values = {
+            "video_weight": video_weight,
+            "video_bias": video_bias,
+            "audio_weight": audio_weight,
+            "audio_bias": audio_bias,
+        }
+        for name, shape in expected.items():
+            tensor = values[name]
+            if tensor.dtype != _BF16_DTYPE or tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"MiniMax H3 PDD {name} must be BF16 {shape}, got "
+                    f"{tensor.dtype} {tuple(tensor.shape)}"
+                )
+        self.num_steps = num_steps
+        self.block_size = block_size
+        self.nfe = num_steps // block_size
+        self.video_shift = video_shift
+        self.audio_shift = audio_shift
+        self.register_buffer(
+            "video_weight", video_weight.contiguous(), persistent=False
+        )
+        self.register_buffer("video_bias", video_bias.contiguous(), persistent=False)
+        self.register_buffer(
+            "audio_weight", audio_weight.contiguous(), persistent=False
+        )
+        self.register_buffer("audio_bias", audio_bias.contiguous(), persistent=False)
+        self.register_buffer(
+            "video_plans",
+            self._sampling_plans(video_shift, num_steps, block_size),
+            persistent=False,
+        )
+        self.register_buffer(
+            "audio_plans",
+            self._sampling_plans(audio_shift, num_steps, block_size),
+            persistent=False,
+        )
+        self.register_buffer("fused_video_weight", None, persistent=False)
+        self.register_buffer("fused_video_bias", None, persistent=False)
+        self.register_buffer("fused_audio_weight", None, persistent=False)
+        self.register_buffer("fused_audio_bias", None, persistent=False)
+        self._schedule_validated = False
+
+    @staticmethod
+    def _metadata_int(metadata: Mapping[str, str], name: str) -> int:
+        try:
+            value = int(metadata[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MiniMax H3 PDD metadata {name!r} must be an integer"
+            ) from exc
+        if value <= 0:
+            raise ValueError(f"MiniMax H3 PDD metadata {name!r} must be positive")
+        return value
+
+    @staticmethod
+    def _metadata_float(metadata: Mapping[str, str], name: str) -> float:
+        try:
+            value = float(metadata[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MiniMax H3 PDD metadata {name!r} must be numeric"
+            ) from exc
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"MiniMax H3 PDD metadata {name!r} must be positive and finite"
+            )
+        return value
+
+    @classmethod
+    def from_sidecar(
+        cls,
+        *,
+        tensors: Mapping[str, torch.Tensor],
+        metadata: Mapping[str, str],
+    ) -> MiniMaxH3PDDHead:
+        if metadata.get("format") != MINIMAX_H3_PDD_FORMAT:
+            raise ValueError(
+                f"MiniMax H3 PDD sidecar format must be {MINIMAX_H3_PDD_FORMAT!r}"
+            )
+        if metadata.get("pdd_sampler") != "euler":
+            raise ValueError("MiniMax H3 PDD sidecar requires the Euler sampler")
+        if set(tensors) != MINIMAX_H3_PDD_TENSOR_NAMES:
+            raise ValueError(
+                "MiniMax H3 PDD head inventory mismatch: "
+                f"missing={sorted(MINIMAX_H3_PDD_TENSOR_NAMES - set(tensors))}, "
+                f"unexpected={sorted(set(tensors) - MINIMAX_H3_PDD_TENSOR_NAMES)}"
+            )
+        num_steps = cls._metadata_int(metadata, "pdd_num_steps")
+        block_size = cls._metadata_int(metadata, "pdd_block_size")
+        nfe = cls._metadata_int(metadata, "pdd_nfe")
+        if nfe != num_steps // block_size:
+            raise ValueError(
+                "MiniMax H3 PDD metadata nfe does not equal num_steps / block_size"
+            )
+        rank = cls._metadata_int(metadata, "pdd_lora_rank")
+        alpha = cls._metadata_float(metadata, "pdd_lora_alpha")
+        if alpha != rank:
+            raise ValueError("MiniMax H3 PDD requires lora_alpha equal to rank")
+        return cls(
+            video_weight=tensors["pdd.video_out.weight"],
+            video_bias=tensors["pdd.video_out.bias"],
+            audio_weight=tensors["pdd.audio_out.weight"],
+            audio_bias=tensors["pdd.audio_out.bias"],
+            num_steps=num_steps,
+            block_size=block_size,
+            video_shift=cls._metadata_float(metadata, "pdd_video_shift"),
+            audio_shift=cls._metadata_float(metadata, "pdd_audio_shift"),
+        )
+
+    @staticmethod
+    def _shifted_sigmas(shift: float, num_steps: int) -> torch.Tensor:
+        base = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)
+        return shift * base / (1.0 + (shift - 1.0) * base)
+
+    @classmethod
+    def _sampling_plans(
+        cls, shift: float, num_steps: int, block_size: int
+    ) -> torch.Tensor:
+        step_sizes = -cls._shifted_sigmas(shift, num_steps).diff()
+        plans = torch.zeros((num_steps // block_size, num_steps), dtype=torch.float32)
+        for step_index, start in enumerate(range(0, num_steps, block_size)):
+            block = step_sizes[start : start + block_size]
+            plans[step_index, start : start + block_size] = (
+                block / block.sum()
+            ).float()
+        return plans
+
+    @classmethod
+    def _coarse_schedule(
+        cls, shift: float, num_steps: int, block_size: int
+    ) -> list[float]:
+        return [
+            float(value)
+            for value in cls._shifted_sigmas(shift, num_steps)[::block_size].tolist()
+        ]
+
+    def validate_schedule(
+        self,
+        sigmas_video: list[float],
+        sigmas_audio: list[float],
+        *,
+        sampler_mode: str,
+    ) -> None:
+        self._schedule_validated = False
+        if sampler_mode != "euler":
+            raise ValueError("MiniMax H3 PDD requires sampler_mode='euler'")
+        for label, actual, shift in (
+            ("video", sigmas_video, self.video_shift),
+            ("audio", sigmas_audio, self.audio_shift),
+        ):
+            expected = self._coarse_schedule(shift, self.num_steps, self.block_size)
+            if len(actual) != len(expected) or any(
+                not math.isclose(float(got), want, rel_tol=0.0, abs_tol=2e-7)
+                for got, want in zip(actual, expected)
+            ):
+                raise ValueError(
+                    f"MiniMax H3 PDD requires the released {label} schedule "
+                    f"({self.nfe + 1} sigma points, shift={shift})"
+                )
+        self._schedule_validated = True
+
+    @staticmethod
+    def _fuse(
+        plan: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        typed_plan = plan.to(device=weight.device, dtype=weight.dtype)
+        fused_weight = torch.einsum("n,noi->oi", typed_plan, weight)
+        fused_bias = torch.einsum("n,no->o", typed_plan, bias)
+        return fused_weight, fused_bias
+
+    @classmethod
+    def _project(
+        cls,
+        hidden: torch.Tensor,
+        plan: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        fused_weight, fused_bias = cls._fuse(plan, weight, bias)
+        return nn.functional.linear(hidden, fused_weight, fused_bias)
+
+    @torch.inference_mode()
+    def materialize_fused_heads(self) -> None:
+        """Move the exact released einsums out of first-request latency."""
+        if self.fused_video_weight is not None:
+            return
+        video = [
+            self._fuse(plan, self.video_weight, self.video_bias)
+            for plan in self.video_plans
+        ]
+        audio = [
+            self._fuse(plan, self.audio_weight, self.audio_bias)
+            for plan in self.audio_plans
+        ]
+        self.fused_video_weight = torch.stack([entry[0] for entry in video])
+        self.fused_video_bias = torch.stack([entry[1] for entry in video])
+        self.fused_audio_weight = torch.stack([entry[0] for entry in audio])
+        self.fused_audio_bias = torch.stack([entry[1] for entry in audio])
+        self.video_weight = None
+        self.video_bias = None
+        self.audio_weight = None
+        self.audio_bias = None
+
+    def forward(
+        self, hidden: torch.Tensor, step_index: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._schedule_validated:
+            raise RuntimeError(
+                "MiniMax H3 PDD schedule was not validated for this request"
+            )
+        if step_index < 0 or step_index >= self.nfe:
+            raise ValueError(
+                f"MiniMax H3 PDD step index must be in [0, {self.nfe}), got {step_index}"
+            )
+        hidden = hidden.to(_BF16_DTYPE)
+        if self.fused_video_weight is None or self.fused_audio_weight is None:
+            raise RuntimeError("MiniMax H3 PDD fused heads were not materialized")
+        return (
+            nn.functional.linear(
+                hidden,
+                self.fused_video_weight[step_index],
+                self.fused_video_bias[step_index],
+            ),
+            nn.functional.linear(
+                hidden,
+                self.fused_audio_weight[step_index],
+                self.fused_audio_bias[step_index],
+            ),
+        )
+
+
 class MiniMaxH3FinalLayer(nn.Module):
     def __init__(
         self,
@@ -1517,6 +1789,64 @@ class MiniMaxH3FinalLayer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.audio_out",
         )
+        self.pdd_head: MiniMaxH3PDDHead | None = None
+        self._pdd_adapter_digest: str | None = None
+        self._pdd_active = False
+
+    def register_pdd_adapter(
+        self,
+        *,
+        digest: str,
+        tensors: Mapping[str, torch.Tensor],
+        metadata: Mapping[str, str],
+    ) -> None:
+        if get_tp_world_size() != 1:
+            raise ValueError("MiniMax H3 PDD currently requires tensor parallel size 1")
+        if self.pdd_head is not None and digest != self._pdd_adapter_digest:
+            raise ValueError("MiniMax H3 currently supports one loaded PDD adapter")
+        device = self.norm.weight.device
+        pdd_head = MiniMaxH3PDDHead.from_sidecar(
+            tensors=tensors,
+            metadata=metadata,
+        ).to(device=device)
+        pdd_head.materialize_fused_heads()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        self.pdd_head = pdd_head
+        self._pdd_adapter_digest = digest
+        self._pdd_active = False
+
+    def set_pdd_adapter(
+        self, digest: str | None, effective_scale: float | None
+    ) -> None:
+        self._pdd_active = False
+        if digest is None or digest != self._pdd_adapter_digest:
+            return
+        if effective_scale != 1.0:
+            raise ValueError(
+                "MiniMax H3 PDD requires effective LoRA strength 1.0 because its "
+                f"parallel heads are full weights, got {effective_scale!r}"
+            )
+        if self.pdd_head is None:
+            raise RuntimeError("MiniMax H3 PDD adapter identity has no registered head")
+        self._pdd_active = True
+
+    def prepare_pdd_schedule(
+        self,
+        sigmas_video: list[float],
+        sigmas_audio: list[float],
+        *,
+        sampler_mode: str,
+    ) -> bool:
+        if not self._pdd_active:
+            return False
+        assert self.pdd_head is not None
+        self.pdd_head.validate_schedule(
+            sigmas_video,
+            sigmas_audio,
+            sampler_mode=sampler_mode,
+        )
+        return True
 
     def forward(
         self,
@@ -1572,6 +1902,11 @@ class MiniMaxH3FinalLayer(nn.Module):
             return video, audio
         h = self.norm(x)
         h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
+        if self._pdd_active:
+            if self.pdd_head is None:
+                raise RuntimeError("MiniMax H3 PDD is active without a parallel head")
+            step_index = int(get_forward_context().current_timestep)
+            return self.pdd_head(h, step_index)
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
         video, _ = self.video_out(h)
@@ -1652,7 +1987,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         """Project released-checkpoint AdaLN LoRAs onto pruned coordinates."""
         _reject_non_lora_delta_tensors(adapter)
         if self._adaln_precomputed:
-            _reject_adaln_lora(list(adapter))
+            cache = self.adaln_cache
+            assert cache is not None
+            adapter = cache.strip_baked_adaln_tensors(adapter)
         full_width = self.arch.adaln_affine_input_dim
         if full_width is None:
             return adapter
@@ -1708,6 +2045,52 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         return projected
 
+    def set_expected_adaln_adapter_identity(
+        self, digest: str | None, scale: float | None
+    ) -> None:
+        """Bind an adapter-aware sidecar to the selected effective LoRA."""
+        if self.adaln_cache is not None:
+            self.adaln_cache.bind_adapter_identity(digest, scale)
+        self.final_layer.set_pdd_adapter(digest, scale)
+
+    def register_pdd_adapter(
+        self,
+        *,
+        digest: str,
+        tensors: Mapping[str, torch.Tensor],
+        metadata: Mapping[str, str],
+    ) -> None:
+        """Register PDD full heads beside their content-bound LoRA adapter."""
+        self.final_layer.register_pdd_adapter(
+            digest=digest,
+            tensors=tensors,
+            metadata=metadata,
+        )
+        logger.info(
+            "Registered MiniMax H3 PDD parallel heads: grid=%s, block=%s, nfe=%s, digest=%s",
+            metadata.get("pdd_num_steps"),
+            metadata.get("pdd_block_size"),
+            metadata.get("pdd_nfe"),
+            digest,
+        )
+
+    def prepare_pdd_schedule(
+        self,
+        sigmas_video: list[float],
+        sigmas_audio: list[float],
+        *,
+        sampler_mode: str,
+    ) -> bool:
+        """Validate the request schedule before any PDD denoise compute."""
+        return self.final_layer.prepare_pdd_schedule(
+            sigmas_video,
+            sigmas_audio,
+            sampler_mode=sampler_mode,
+        )
+
+    def is_pdd_active(self) -> bool:
+        return self.final_layer._pdd_active
+
     def prepare_adaln_plans(
         self, step_timesteps: list[torch.Tensor]
     ) -> torch.Tensor | None:
@@ -1723,6 +2106,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         cache = self.adaln_cache
         if cache is None:
             return None
+        cache.validate_adapter_binding()
         # Keying costs one D2H sync per plan; compute the keys once and share
         # them between build and resolve.
         keys = [_adaln_plan_key(timesteps) for timesteps in step_timesteps]
@@ -1876,6 +2260,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         hf_config: dict[str, Any],
         quant_config: QuantizationConfig | None = None,
         adaln_cache_path: str | None = None,
+        adaln_cache_expected_sha256: str | None = None,
         adaln_cache_model_variant: str | None = None,
         adaln_cache_provenance: dict[str, str] | None = None,
         adaln_weight_files: list[str] | None = None,
@@ -2020,6 +2405,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             MiniMaxH3AdalnCache(
                 arch,
                 path=adaln_cache_path,
+                expected_sha256=adaln_cache_expected_sha256,
                 model_variant=adaln_cache_model_variant,
                 legacy_provenance=adaln_cache_provenance,
                 weight_files=adaln_weight_files,
@@ -2824,6 +3210,7 @@ __all__ = [
     "MINIMAX_H3_FP32_BUFFER_NAMES",
     "MINIMAX_H3_FP32_PARAM_NAMES",
     "MiniMaxH3DiTModel",
+    "MiniMaxH3PDDHead",
     "_qkv_scale_block_rows",
     "_reorder_grouped_qkv_to_qkv",
 ]

@@ -38,6 +38,7 @@ SAGE_SM80_RESEARCH_VARIANTS = frozenset(
         "cuda_fp16",
         "cuda_per_thread_fp16",
         "cuda_fp16_row_pipeline_precombined_scale",
+        "cuda_fp16_row_pipeline_precombined_scale_interleaved_softmax",
     }
 )
 

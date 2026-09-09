@@ -573,6 +573,13 @@ def minimax_h3_denoise_loop(
         imgvid_cond_noise_aug=float(imgvid_cond_noise_aug_for_inference),
         audio_ref_cond_noise_aug=float(audio_cond_noise_aug_for_inference),
     )
+    prepare_pdd_schedule = getattr(model, "prepare_pdd_schedule", None)
+    if callable(prepare_pdd_schedule):
+        prepare_pdd_schedule(
+            sigmas_video,
+            sigmas_audio,
+            sampler_mode=sampler_mode,
+        )
     # Every step's timesteps are settled by now. Rebuilding AdaLN reads all
     # 24.2 GiB of adaln_proj whatever is missing, so fill the whole request in
     # one pass here instead of topping up step by step inside the loop.

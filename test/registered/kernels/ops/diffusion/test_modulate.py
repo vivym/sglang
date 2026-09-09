@@ -14,12 +14,20 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.diffusion import (
+    can_use_contracted_lora_addmm,
+    can_use_contracted_stacked_lora_baddbmm,
+    can_use_direct_stacked_lora_bmm,
+    can_use_fused_lora_scale_add,
     can_use_modulate_scale_shift_cuda,
     can_use_residual_gate_add_cuda,
     can_use_rmsnorm_scale_shift_per_token,
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
+    contracted_lora_addmm_,
+    contracted_stacked_lora_baddbmm_,
+    direct_stacked_lora_bmm,
+    fused_lora_scale_add_,
     ltx2_ada_values9,
     modulate_scale_shift,
     modulate_scale_shift_cuda,
@@ -47,6 +55,225 @@ def cuda_setup():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     torch.cuda.manual_seed(0)
+
+
+# ---------------------------------------------------------------------------
+# dynamic LoRA: sequential BF16 scale boundaries + residual add
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "scale,post_scale",
+    [(1.0, 1.0), (0.0625, 1.0), (1.0, 0.75), (0.0625, 0.75)],
+)
+@pytest.mark.parametrize("shape", [(3, 17, 65), (1, 1025)])
+def test_lora_scale_add_is_bit_exact_and_in_place(shape, scale, post_scale):
+    output = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
+    delta = torch.randn_like(output)
+    expected = output.clone()
+    expected_delta = delta.clone()
+    if scale != 1.0:
+        expected_delta.mul_(scale)
+    if post_scale != 1.0:
+        expected_delta.mul_(post_scale)
+    expected.add_(expected_delta)
+
+    output_ptr = output.data_ptr()
+    assert can_use_fused_lora_scale_add(output, delta)
+    fused_lora_scale_add_(output, delta, scale, post_scale)
+
+    assert output.data_ptr() == output_ptr
+    assert torch.equal(output, expected)
+
+
+@torch.no_grad()
+def test_lora_scale_add_preserves_special_value_bits():
+    values = torch.tensor(
+        [0.0, -0.0, float("inf"), -float("inf"), float("nan"), 1.5, -2.5],
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    output = values.clone()
+    delta = values.roll(1)
+    expected = output.clone()
+    expected_delta = delta.clone().mul_(0.0625).mul_(0.75)
+    expected.add_(expected_delta)
+
+    fused_lora_scale_add_(output, delta, 0.0625, 0.75)
+    assert torch.equal(output.view(torch.uint16), expected.view(torch.uint16))
+
+
+@torch.no_grad()
+def test_lora_scale_add_torch_compile_fullgraph_mutates_in_place():
+    def apply(output, delta):
+        fused_lora_scale_add_(output, delta, 0.0625, 0.75)
+        return output
+
+    output = torch.randn((3, 17, 65), device=DEVICE, dtype=torch.bfloat16)
+    delta = torch.randn_like(output)
+    expected = output.clone()
+    expected.add_(delta.clone().mul_(0.0625).mul_(0.75))
+
+    output_ptr = output.data_ptr()
+    actual = torch.compile(apply, fullgraph=True)(output, delta)
+
+    assert actual.data_ptr() == output_ptr
+    assert torch.equal(actual, expected)
+
+
+@torch.no_grad()
+def test_lora_scale_add_guards_reject_unsupported_inputs():
+    output = torch.empty((3, 17), device=DEVICE, dtype=torch.bfloat16)
+    delta = torch.empty_like(output)
+    assert can_use_fused_lora_scale_add(output, delta)
+    assert not can_use_fused_lora_scale_add(output.cpu(), delta)
+    assert not can_use_fused_lora_scale_add(output, delta.float())
+    assert not can_use_fused_lora_scale_add(output[:, ::2], delta[:, ::2])
+    assert not can_use_fused_lora_scale_add(output, delta[:, :-1])
+    assert not can_use_fused_lora_scale_add(output[:, :0], delta[:, :0])
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "shape",
+    [(17, 3, 7, 65), (1025, 2, 128, 224)],
+)
+def test_direct_stacked_lora_bmm_is_bit_exact(shape):
+    rows, groups, rank, output_width = shape
+    hidden = torch.randn((rows, groups, rank), device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(
+        (groups, output_width, rank), device=DEVICE, dtype=torch.bfloat16
+    )
+    expected = torch.einsum("mnr,nor->mno", hidden, weight).flatten(start_dim=-2)
+
+    assert can_use_direct_stacked_lora_bmm(hidden, weight)
+    actual = direct_stacked_lora_bmm(hidden, weight)
+
+    assert actual.is_contiguous()
+    assert torch.equal(actual, expected)
+
+
+@torch.no_grad()
+def test_direct_stacked_lora_bmm_torch_compile_fullgraph():
+    hidden = torch.randn((17, 3, 7), device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn((3, 65, 7), device=DEVICE, dtype=torch.bfloat16)
+    expected = torch.einsum("mnr,nor->mno", hidden, weight).flatten(start_dim=-2)
+
+    compiled = torch.compile(direct_stacked_lora_bmm, fullgraph=True)
+    actual = compiled(hidden, weight)
+
+    assert torch.equal(actual, expected)
+
+
+@torch.no_grad()
+def test_direct_stacked_lora_bmm_guards_reject_unsupported_inputs():
+    hidden = torch.empty((17, 3, 7), device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.empty((3, 65, 7), device=DEVICE, dtype=torch.bfloat16)
+    assert can_use_direct_stacked_lora_bmm(hidden, weight)
+    assert not can_use_direct_stacked_lora_bmm(hidden.cpu(), weight)
+    assert not can_use_direct_stacked_lora_bmm(hidden.float(), weight.float())
+    assert not can_use_direct_stacked_lora_bmm(hidden[:, :, ::2], weight[:, :, ::2])
+    assert not can_use_direct_stacked_lora_bmm(hidden[:, :1], weight[:1])
+    assert not can_use_direct_stacked_lora_bmm(hidden, weight[:, :, :-1])
+
+
+@torch.no_grad()
+def test_contracted_lora_addmm_is_in_place_and_matches_addmm_semantics():
+    hidden = torch.randn((17, 7), device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn((65, 7), device=DEVICE, dtype=torch.bfloat16)
+    output = torch.randn((17, 65), device=DEVICE, dtype=torch.bfloat16)
+    expected = torch.addmm(output, hidden, weight.T, beta=1.0, alpha=0.046875)
+
+    output_ptr = output.data_ptr()
+    assert can_use_contracted_lora_addmm(output, hidden, weight)
+    contracted_lora_addmm_(output, hidden, weight, 0.0625, 0.75)
+
+    assert output.data_ptr() == output_ptr
+    assert torch.equal(output, expected)
+
+
+@torch.no_grad()
+def test_contracted_stacked_lora_baddbmm_is_in_place_and_matches_semantics():
+    hidden = torch.randn((17, 3, 7), device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn((3, 65, 7), device=DEVICE, dtype=torch.bfloat16)
+    output = torch.randn((17, 3 * 65), device=DEVICE, dtype=torch.bfloat16)
+    expected = output.clone()
+    expected_grouped = expected.view(17, 3, 65).permute(1, 0, 2)
+    torch.baddbmm(
+        expected_grouped,
+        hidden.permute(1, 0, 2),
+        weight.transpose(1, 2),
+        beta=1.0,
+        alpha=0.046875,
+        out=expected_grouped,
+    )
+
+    output_ptr = output.data_ptr()
+    assert can_use_contracted_stacked_lora_baddbmm(output, hidden, weight)
+    contracted_stacked_lora_baddbmm_(output, hidden, weight, 0.0625, 0.75)
+
+    assert output.data_ptr() == output_ptr
+    assert torch.equal(output, expected)
+
+
+@torch.no_grad()
+def test_contracted_lora_epilogue_guards_reject_unsupported_inputs():
+    hidden = torch.empty((17, 7), device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.empty((65, 7), device=DEVICE, dtype=torch.bfloat16)
+    output = torch.empty((17, 65), device=DEVICE, dtype=torch.bfloat16)
+    assert can_use_contracted_lora_addmm(output, hidden, weight)
+    assert not can_use_contracted_lora_addmm(output.cpu(), hidden, weight)
+    assert not can_use_contracted_lora_addmm(output.float(), hidden, weight)
+    assert not can_use_contracted_lora_addmm(output[:, ::2], hidden, weight)
+    assert not can_use_contracted_lora_addmm(output, hidden[:, ::2], weight[:, ::2])
+    assert not can_use_contracted_lora_addmm(output[:, :-1], hidden, weight)
+
+    stacked_hidden = hidden[:, None, :].expand(-1, 3, -1).contiguous()
+    stacked_weight = weight[None, :, :].expand(3, -1, -1).contiguous()
+    stacked_output = torch.empty((17, 3 * 65), device=DEVICE, dtype=torch.bfloat16)
+    assert can_use_contracted_stacked_lora_baddbmm(
+        stacked_output, stacked_hidden, stacked_weight
+    )
+    assert not can_use_contracted_stacked_lora_baddbmm(
+        stacked_output[:, :-1], stacked_hidden, stacked_weight
+    )
+    assert not can_use_contracted_stacked_lora_baddbmm(
+        stacked_output, stacked_hidden[:, :1], stacked_weight[:1]
+    )
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("stacked", [False, True])
+def test_contracted_lora_epilogue_torch_compile_fullgraph(stacked):
+    if stacked:
+        hidden = torch.randn((17, 3, 7), device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn((3, 65, 7), device=DEVICE, dtype=torch.bfloat16)
+        output = torch.randn((17, 3 * 65), device=DEVICE, dtype=torch.bfloat16)
+
+        def apply(target, activations, weights):
+            contracted_stacked_lora_baddbmm_(target, activations, weights, 0.0625, 0.75)
+            return target
+
+    else:
+        hidden = torch.randn((17, 7), device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn((65, 7), device=DEVICE, dtype=torch.bfloat16)
+        output = torch.randn((17, 65), device=DEVICE, dtype=torch.bfloat16)
+
+        def apply(target, activations, weights):
+            contracted_lora_addmm_(target, activations, weights, 0.0625, 0.75)
+            return target
+
+    expected = output.clone()
+    apply(expected, hidden, weight)
+    actual = output.clone()
+    actual_ptr = actual.data_ptr()
+
+    compiled = torch.compile(apply, fullgraph=True)
+    result = compiled(actual, hidden, weight)
+
+    assert result.data_ptr() == actual_ptr
+    assert torch.equal(result, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -334,9 +561,9 @@ def test_scaled_residual_add_is_bit_exact(dtype):
 @torch.no_grad()
 def test_scaled_residual_add_rejects_unsupported_inputs():
     residual = torch.empty(2, 3, 8, device=DEVICE, dtype=torch.float32)
-    x = torch.empty_like(residual)
+    x = torch.empty_like(residual, dtype=torch.float64)
     scale = torch.empty(8, device=DEVICE, dtype=torch.float32)
-    # A too-small hidden dim and a mismatched scale length both bail out;
+    # Unsupported input dtypes and mismatched scale lengths both bail out;
     # ``try_`` returning None is this helper's documented contract.
     assert try_fused_scaled_residual_add_exact(residual, x, scale) is None
     assert try_fused_scaled_residual_add_exact(residual, x.half(), scale[:-1]) is None

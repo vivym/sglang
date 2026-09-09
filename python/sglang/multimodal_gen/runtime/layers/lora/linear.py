@@ -39,6 +39,7 @@ torch._dynamo.config.recompile_limit = 64
 
 LORA_MERGE_CHUNK_BYTES = 32 * 1024 * 1024
 LORA_DYNAMIC_DELTA_CHUNK_BYTES = 1024 * 1024 * 1024
+LORA_CONTRACTED_GEMM_EPILOGUE_ENV = "SGLANG_LORA_CONTRACTED_GEMM_EPILOGUE"
 LoRAWeightEntry = tuple[
     torch.nn.Parameter,
     torch.nn.Parameter,
@@ -71,6 +72,53 @@ def _compute_lora_delta(
     )
 
 
+def _scale_and_add_lora_delta(
+    output: torch.Tensor,
+    delta: torch.Tensor,
+    scale: float,
+    post_scale: float,
+) -> None:
+    if output.is_cuda:
+        from sglang.kernels.ops.diffusion import (
+            can_use_fused_lora_scale_add,
+            fused_lora_scale_add_,
+        )
+
+        if can_use_fused_lora_scale_add(output, delta):
+            fused_lora_scale_add_(output, delta, scale, post_scale)
+            return
+
+    if scale != 1.0:
+        delta.mul_(scale)
+    if post_scale != 1.0:
+        delta.mul_(post_scale)
+    output.add_(delta)
+
+
+def _compute_stacked_lora_b_delta(
+    hidden: torch.Tensor,
+    lora_B: torch.Tensor,
+) -> torch.Tensor:
+    if hidden.is_cuda:
+        from sglang.kernels.ops.diffusion import (
+            can_use_direct_stacked_lora_bmm,
+            direct_stacked_lora_bmm,
+        )
+
+        if can_use_direct_stacked_lora_bmm(hidden, lora_B):
+            return direct_stacked_lora_bmm(hidden, lora_B)
+    return torch.einsum("mnr,nor->mno", hidden, lora_B).flatten(start_dim=-2)
+
+
+def _contracted_lora_gemm_epilogue_enabled() -> bool:
+    return os.getenv(LORA_CONTRACTED_GEMM_EPILOGUE_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _apply_lora_delta(
     output: torch.Tensor,
     x: torch.Tensor,
@@ -78,36 +126,77 @@ def _apply_lora_delta(
     lora_B: torch.Tensor,
     scale: float,
     *,
+    post_scale: float = 1.0,
     chunk_bytes: int = LORA_DYNAMIC_DELTA_CHUNK_BYTES,
 ) -> torch.Tensor:
     """Add a dynamic LoRA delta without materializing a sequence-wide output."""
+    regular = (
+        lora_A.dim() == lora_B.dim() == 2
+        and lora_A.shape[0] == lora_B.shape[1]
+        and output.shape[-1] == lora_B.shape[0]
+    )
+    stacked = (
+        lora_A.dim() == lora_B.dim() == 3
+        and lora_A.shape[0] == lora_B.shape[0]
+        and lora_A.shape[-2] == lora_B.shape[-1]
+        and output.shape[-1] == lora_B.shape[0] * lora_B.shape[-2]
+    )
     can_chunk = (
-        lora_A.dim() == 2
-        and lora_B.dim() == 2
+        (regular or stacked)
         and output.is_contiguous()
         and output.dtype == lora_A.dtype == lora_B.dtype
         and output.shape[:-1] == x.shape[:-1]
-        and output.shape[-1] == lora_B.shape[0]
-        and x.shape[-1] == lora_A.shape[1]
-        and lora_A.shape[0] == lora_B.shape[1]
+        and x.shape[-1] == lora_A.shape[-1]
     )
     if not can_chunk:
         delta = _compute_lora_delta(x, lora_A, lora_B)
         if scale != 1.0:
-            delta = delta * scale
+            delta.mul_(scale)
+        if post_scale != 1.0:
+            delta.mul_(post_scale)
         return output + delta.to(dtype=output.dtype)
 
     x_2d = x.reshape(-1, x.shape[-1])
     output_2d = output.view(-1, output.shape[-1])
-    hidden = x_2d @ lora_A.T
-    bytes_per_row = lora_B.shape[0] * output.element_size()
+    hidden = x_2d @ lora_A.T if regular else torch.einsum("mi,nri->mnr", x_2d, lora_A)
+    bytes_per_row = output.shape[-1] * output.element_size()
     chunk_rows = max(1, chunk_bytes // bytes_per_row)
+    use_contracted_epilogue = (
+        output.is_cuda and _contracted_lora_gemm_epilogue_enabled()
+    )
+    if use_contracted_epilogue:
+        from sglang.kernels.ops.diffusion import (
+            can_use_contracted_lora_addmm,
+            can_use_contracted_stacked_lora_baddbmm,
+            contracted_lora_addmm_,
+            contracted_stacked_lora_baddbmm_,
+        )
+
     for start in range(0, hidden.shape[0], chunk_rows):
         end = min(start + chunk_rows, hidden.shape[0])
-        delta = hidden[start:end] @ lora_B.T
-        if scale != 1.0:
-            delta.mul_(scale)
-        output_2d[start:end].add_(delta)
+        output_chunk = output_2d[start:end]
+        hidden_chunk = hidden[start:end]
+        if use_contracted_epilogue:
+            if regular and can_use_contracted_lora_addmm(
+                output_chunk, hidden_chunk, lora_B
+            ):
+                contracted_lora_addmm_(
+                    output_chunk, hidden_chunk, lora_B, scale, post_scale
+                )
+                continue
+            if stacked and can_use_contracted_stacked_lora_baddbmm(
+                output_chunk, hidden_chunk, lora_B
+            ):
+                contracted_stacked_lora_baddbmm_(
+                    output_chunk, hidden_chunk, lora_B, scale, post_scale
+                )
+                continue
+        delta = (
+            hidden_chunk @ lora_B.T
+            if regular
+            else _compute_stacked_lora_b_delta(hidden_chunk, lora_B)
+        )
+        _scale_and_add_lora_delta(output_chunk, delta, scale, post_scale)
     return output
 
 
@@ -701,16 +790,14 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             lora_B_sliced = self.slice_lora_b_weights(
                 lora_B.to(device=input_.device, non_blocking=True)
             )
-            delta_parallel = _compute_lora_delta(
-                input_lora, lora_A_sliced, lora_B_sliced
-            )
-            if self.lora_alpha != self.lora_rank:
-                delta_parallel = delta_parallel * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta_parallel = delta_parallel * self.strength
-            output_parallel = output_parallel + delta_parallel.to(
-                dtype=output_parallel.dtype
+            alpha_scale = _lora_scale(1.0, self.lora_alpha, self.lora_rank)
+            output_parallel = _apply_lora_delta(
+                output_parallel,
+                input_lora,
+                lora_A_sliced,
+                lora_B_sliced,
+                alpha_scale,
+                post_scale=self.strength,
             )
         output_parallel = self._add_lora_output_offset(output_parallel)
         if self.base_layer.gather_output:
@@ -842,16 +929,14 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             lora_B_sliced = self.slice_lora_b_weights(
                 lora_B.to(device=input_parallel.device, non_blocking=True)
             )
-            delta_parallel = _compute_lora_delta(
-                input_parallel_lora, lora_A_sliced, lora_B_sliced
-            )
-            if self.lora_alpha != self.lora_rank:
-                delta_parallel = delta_parallel * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta_parallel = delta_parallel * self.strength
-            output_parallel = output_parallel + delta_parallel.to(
-                dtype=output_parallel.dtype
+            alpha_scale = _lora_scale(1.0, self.lora_alpha, self.lora_rank)
+            output_parallel = _apply_lora_delta(
+                output_parallel,
+                input_parallel_lora,
+                lora_A_sliced,
+                lora_B_sliced,
+                alpha_scale,
+                post_scale=self.strength,
             )
 
         if self.base_layer.reduce_results and self.base_layer.tp_size > 1:

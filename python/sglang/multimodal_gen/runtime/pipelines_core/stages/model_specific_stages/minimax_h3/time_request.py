@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
+
 
 def minimax_h3_align_frame_count(frame_count: int) -> int:
     """Snap ``frame_count`` up to the MiniMax H3 17n+5 frame boundary."""
@@ -33,6 +36,7 @@ def minimax_h3_time_shift_sigmas(
     *,
     num_steps: int = 50,
     shift_scale: float = 6.0,
+    base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
     if shift_scale <= 0:
         raise ValueError("MiniMax H3 shift_scale must be > 0")
@@ -41,14 +45,40 @@ def minimax_h3_time_shift_sigmas(
 
     import torch
 
-    # The rectified-flow sigma range is fixed at [1.0, 0.0].
-    base = torch.linspace(
-        1.0,
-        0.0,
-        int(num_steps),
-        device="cpu",
-        dtype=torch.float32,
-    )
+    if base_schedule is None:
+        # The default rectified-flow sigma range is uniform over [1.0, 0.0].
+        base = torch.linspace(
+            1.0,
+            0.0,
+            int(num_steps),
+            device="cpu",
+            dtype=torch.float32,
+        )
+    else:
+        values = tuple(base_schedule)
+        if len(values) != int(num_steps):
+            raise ValueError(
+                "MiniMax H3 base_schedule length must equal num_steps: "
+                f"{len(values)} != {num_steps}"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in values
+        ):
+            raise ValueError("MiniMax H3 base_schedule must contain finite numbers")
+        normalized = tuple(float(value) for value in values)
+        if normalized[0] != 1.0 or normalized[-1] != 0.0:
+            raise ValueError(
+                "MiniMax H3 base_schedule must start at 1.0 and end at 0.0"
+            )
+        if any(
+            current <= following
+            for current, following in zip(normalized, normalized[1:])
+        ):
+            raise ValueError("MiniMax H3 base_schedule must be strictly decreasing")
+        base = torch.tensor(normalized, device="cpu", dtype=torch.float32)
     shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
     shifted, _ = torch.unique_consecutive(shifted, return_counts=True)
     # A one-point request is still exactly one point.  Normal serving uses

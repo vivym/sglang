@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -26,6 +27,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     RESIDENT,
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
+    _baked_lora_profile_from_checkpoint,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
@@ -54,6 +58,99 @@ TARGET = {
     "aspect_ratio": "16:9",
     "duration_seconds": 5.0,
 }
+_TEST_LORA_SHA256 = "sha256:" + "d" * 64
+_TEST_ADALN_SHA256 = "sha256:" + "c" * 64
+_TEST_ADALN_PATH = "/adaln.safetensors"
+
+
+def _runtime_lora_identity(
+    path: str,
+    *,
+    digest: str = _TEST_LORA_SHA256,
+    alpha: int = 8,
+    strength: float = 1.0,
+    merged: bool = False,
+    adaln_path: str = _TEST_ADALN_PATH,
+    adaln_digest: str = _TEST_ADALN_SHA256,
+):
+    return lambda: {
+        "target": "transformer",
+        "nicknames": ("default",),
+        "paths": (path,),
+        "sha256": (digest,),
+        "alphas": (alpha,),
+        "strengths": (strength,),
+        "merged": merged,
+        "adaln_cache_path": adaln_path,
+        "adaln_cache_sha256": adaln_digest,
+    }
+
+
+def _release_metadata(*, base_schedule=None, lora_scale=None):
+    release = {
+        "schema_version": 1,
+        "partition": "fl2va",
+        "tasks": ["t2va", "fl2va"],
+        "task_aliases": {},
+        "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+    }
+    if base_schedule is not None:
+        release["base_schedule"] = base_schedule
+    if lora_scale is not None:
+        release["lora_scale"] = lora_scale
+    return MiniMaxH3ReleaseMetadata.from_model_index({"_minimax_h3": release})
+
+
+def _baked_lora_profile(*, scale=1.0):
+    return {
+        "format_version": "1",
+        "mode": "bf16_lora_merge_then_convrot_int8_requantize",
+        "adapter_sha256": "sha256:" + "a" * 64,
+        "adapter_config_sha256": "none",
+        "adapter_scale": scale,
+        "adapter_alphas": [8.0],
+        "lora_pairs": 208,
+        "source_checkpoint_sha256": "sha256:" + "b" * 64,
+        "converter_revision": "sha256:" + "c" * 64,
+    }
+
+
+def test_release_metadata_accepts_flashgen_base_schedule():
+    metadata = _release_metadata(base_schedule=[1.0, 0.7, 0.4, 0.15, 0.0])
+
+    assert metadata.base_schedule == (1.0, 0.7, 0.4, 0.15, 0.0)
+    assert metadata.lora_scale is None
+
+
+def test_release_metadata_binds_tutu_lora_scale():
+    metadata = _release_metadata(
+        base_schedule=[1.0, 0.85, 0.75, 0.6, 0.5, 0.35, 0.25, 0.1, 0.0],
+        lora_scale=0.8,
+    )
+
+    assert metadata.lora_scale == 0.8
+
+
+@pytest.mark.parametrize("lora_scale", [True, "0.8", 0, -1, float("nan")])
+def test_release_metadata_rejects_invalid_lora_scale(lora_scale):
+    with pytest.raises(ValueError, match="lora_scale"):
+        _release_metadata(lora_scale=lora_scale)
+
+
+@pytest.mark.parametrize(
+    ("base_schedule", "message"),
+    [
+        ("1,0.7,0.4,0.15,0", "must be a list"),
+        ([1.0, 0.7, 0.4, 0.15], "end at 0.0"),
+        ([0.9, 0.7, 0.4, 0.15, 0.0], "start at 1.0"),
+        ([1.0, 0.4, 0.7, 0.15, 0.0], "strictly decreasing"),
+        ([1.0, float("nan"), 0.4, 0.15, 0.0], "finite numbers"),
+        ([1.0, True, 0.4, 0.15, 0.0], "finite numbers"),
+    ],
+)
+def test_release_metadata_rejects_invalid_base_schedule(base_schedule, message):
+    with pytest.raises(ValueError, match=message):
+        _release_metadata(base_schedule=base_schedule)
 
 
 def test_teacache_api_params_are_typed_and_request_scoped(monkeypatch):
@@ -423,6 +520,8 @@ def _quality_server_args():
         enable_torch_compile=False,
         is_dit_layerwise_offload_selected=False,
         minimax_h3_adaln_online=False,
+        minimax_h3_adaln_cache_path=_TEST_ADALN_PATH,
+        minimax_h3_adaln_cache_expected_sha256=_TEST_ADALN_SHA256,
         performance_mode="speed",
         quantization=None,
         transformer_weights_path=None,
@@ -434,7 +533,9 @@ def _quality_server_args():
         use_fsdp_inference=False,
         lora_path=None,
         lora_scale=1.0,
+        lora_alpha=8,
         lora_merge_mode="auto",
+        lora_expected_sha256=_TEST_LORA_SHA256,
     )
 
 
@@ -692,7 +793,10 @@ def test_fast_quality_binds_startup_lora_and_canary_workload():
         num_inference_steps=7,
         is_warmup=False,
     )
-    stage = MiniMaxH3PartitionAdmissionStage(metadata)
+    stage = MiniMaxH3PartitionAdmissionStage(
+        metadata,
+        lora_identity_provider=_runtime_lora_identity("/adapter.safetensors"),
+    )
     server_args = _quality_server_args()
     server_args.pipeline_config = MiniMaxH3PipelineConfig()
 
@@ -708,6 +812,39 @@ def test_fast_quality_binds_startup_lora_and_canary_workload():
         server_args.lora_merge_mode = "dynamic"
         assert stage.forward(batch, server_args) is batch
 
+        server_args.lora_expected_sha256 = None
+        with pytest.raises(ValueError, match="lora-expected-sha256"):
+            stage.forward(batch, server_args)
+        server_args.lora_expected_sha256 = _TEST_LORA_SHA256
+
+        server_args.minimax_h3_adaln_cache_expected_sha256 = None
+        with pytest.raises(ValueError, match="adaln-cache-expected-sha256"):
+            stage.forward(batch, server_args)
+        server_args.minimax_h3_adaln_cache_expected_sha256 = _TEST_ADALN_SHA256
+
+        for identity, mismatch in (
+            (
+                _runtime_lora_identity(
+                    "/adapter.safetensors", digest="sha256:" + "e" * 64
+                ),
+                "sha256",
+            ),
+            (_runtime_lora_identity("/switched.safetensors"), "path"),
+            (_runtime_lora_identity("/adapter.safetensors", alpha=128), "alpha"),
+            (_runtime_lora_identity("/adapter.safetensors", merged=True), "merged"),
+            (
+                _runtime_lora_identity(
+                    "/adapter.safetensors",
+                    adaln_digest="sha256:" + "f" * 64,
+                ),
+                "adaln_cache_sha256",
+            ),
+        ):
+            stage.lora_identity_provider = identity
+            with pytest.raises(ValueError, match=rf"identity mismatch.*{mismatch}"):
+                stage.forward(batch, server_args)
+        stage.lora_identity_provider = _runtime_lora_identity("/adapter.safetensors")
+
         batch.sampling_params.quality = "lossless"
         with pytest.raises(ValueError, match='requires quality="fast"'):
             stage.forward(batch, server_args)
@@ -721,6 +858,178 @@ def test_fast_quality_binds_startup_lora_and_canary_workload():
         server_args.lora_scale = 0.5
         with pytest.raises(ValueError, match="requires lora_scale=1.0"):
             stage.forward(batch, server_args)
+
+
+@pytest.mark.parametrize(
+    ("flow_shift", "accepted_steps"),
+    [(6.0, (5, 9)), (12.0, (5, 9))],
+)
+def test_experimental_lora_workload_requires_opt_in(
+    monkeypatch, flow_shift, accepted_steps
+):
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va", "fl2va"],
+                "task_aliases": {},
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            }
+        }
+    )
+    canonical = minimax_h3_validate_canonical_request(
+        task="t2va",
+        prompt="experimental LoRA",
+        conditions=[],
+        target=TARGET,
+        seed=0,
+        flow_shift=flow_shift,
+        audio_flow_shift=3.0,
+    )
+    plan = minimax_h3_resolve_plan(canonical)
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(task="t2va", quality="fast"),
+        num_inference_steps=5,
+        is_warmup=False,
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(
+        metadata,
+        lora_identity_provider=_runtime_lora_identity("/lightx2v.safetensors"),
+    )
+    server_args = _quality_server_args()
+    server_args.pipeline_config = MiniMaxH3PipelineConfig()
+    server_args.lora_path = "/lightx2v.safetensors"
+    server_args.lora_merge_mode = "dynamic"
+
+    monkeypatch.delenv("SGLANG_H3_EXPERIMENTAL_LORA_WORKLOAD", raising=False)
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+        "minimax_h3.release_metadata.minimax_h3_plan_from_batch",
+        return_value=plan,
+    ):
+        with pytest.raises(ValueError, match="experimental LoRA workload is disabled"):
+            stage.forward(batch, server_args)
+
+        monkeypatch.setenv("SGLANG_H3_EXPERIMENTAL_LORA_WORKLOAD", "1")
+        assert stage.forward(batch, server_args) is batch
+
+        for steps in accepted_steps:
+            batch.num_inference_steps = steps
+            assert stage.forward(batch, server_args) is batch
+
+        batch.num_inference_steps = 8
+        with pytest.raises(ValueError, match="experimental opt-in accepts"):
+            stage.forward(batch, server_args)
+
+
+def test_baked_lora_admission_uses_checkpoint_identity_without_double_apply(
+    monkeypatch,
+):
+    metadata = _release_metadata()
+    canonical = minimax_h3_validate_canonical_request(
+        task="t2va",
+        prompt="baked LightX canary",
+        conditions=[],
+        target=TARGET,
+        seed=0,
+        flow_shift=6.0,
+        audio_flow_shift=3.0,
+    )
+    plan = minimax_h3_resolve_plan(canonical)
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(task="t2va", quality="fast"),
+        num_inference_steps=5,
+        is_warmup=False,
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(
+        metadata, baked_lora_profile=_baked_lora_profile()
+    )
+    server_args = _quality_server_args()
+    server_args.pipeline_config = MiniMaxH3PipelineConfig()
+    monkeypatch.setenv("SGLANG_H3_EXPERIMENTAL_LORA_WORKLOAD", "1")
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+        "minimax_h3.release_metadata.minimax_h3_plan_from_batch",
+        return_value=plan,
+    ):
+        assert stage.forward(batch, server_args) is batch
+
+        server_args.lora_path = "/must-not-double-apply.safetensors"
+        with pytest.raises(ValueError, match="cannot apply a startup LoRA"):
+            stage.forward(batch, server_args)
+
+        server_args.lora_path = None
+        batch.sampling_params.quality = "lossless"
+        with pytest.raises(ValueError, match='requires quality="fast"'):
+            stage.forward(batch, server_args)
+
+    with pytest.raises(ValueError, match="cover all 208"):
+        MiniMaxH3PartitionAdmissionStage(
+            metadata,
+            baked_lora_profile={**_baked_lora_profile(), "lora_pairs": 207},
+        )
+
+
+def test_baked_lora_profile_comes_from_transformer_override(tmp_path):
+    transformer = tmp_path / "transformer"
+    transformer.mkdir()
+    profile = _baked_lora_profile()
+    (transformer / "config.json").write_text(
+        json.dumps({"quantization_config": {"minimax_h3_baked_lora": profile}}),
+        encoding="utf-8",
+    )
+
+    loaded = _baked_lora_profile_from_checkpoint(
+        SimpleNamespace(transformer_weights_path=str(transformer))
+    )
+
+    assert loaded == profile
+
+
+def test_experimental_lora_workload_uses_release_bound_scale(monkeypatch):
+    metadata = _release_metadata(
+        base_schedule=[1.0, 0.85, 0.75, 0.6, 0.5, 0.35, 0.25, 0.1, 0.0],
+        lora_scale=0.8,
+    )
+    canonical = minimax_h3_validate_canonical_request(
+        task="t2va",
+        prompt="Tutu canary",
+        conditions=[],
+        target=TARGET,
+        seed=0,
+        flow_shift=12.0,
+        audio_flow_shift=3.0,
+    )
+    plan = minimax_h3_resolve_plan(canonical)
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(task="t2va", quality="fast"),
+        num_inference_steps=9,
+        is_warmup=False,
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(
+        metadata,
+        lora_identity_provider=_runtime_lora_identity(
+            "/tutu.safetensors", strength=0.8
+        ),
+    )
+    server_args = _quality_server_args()
+    server_args.pipeline_config = MiniMaxH3PipelineConfig()
+    server_args.lora_path = "/tutu.safetensors"
+    server_args.lora_merge_mode = "dynamic"
+    monkeypatch.setenv("SGLANG_H3_EXPERIMENTAL_LORA_WORKLOAD", "1")
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+        "minimax_h3.release_metadata.minimax_h3_plan_from_batch",
+        return_value=plan,
+    ):
+        server_args.lora_scale = 1.0
+        with pytest.raises(ValueError, match="requires lora_scale=0.8"):
+            stage.forward(batch, server_args)
+        server_args.lora_scale = 0.8
+        assert stage.forward(batch, server_args) is batch
 
 
 def test_res_multistep_is_explicit_request_scoped_fast_canary(monkeypatch):

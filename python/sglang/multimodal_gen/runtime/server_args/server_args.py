@@ -10,6 +10,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import tempfile
 from dataclasses import field
@@ -328,6 +329,10 @@ class ServerArgs(DisaggServerArgsMixin):
     lora_alpha: int | None = None  # Override training alpha when metadata omits it
     lora_merge_mode: str = "auto"
     lora_weight_name: str | None = None
+    # Optional content pin for serving profiles whose quality contract includes
+    # a specific adapter artifact. The digest is checked after Hub resolution
+    # and before the adapter is deserialized.
+    lora_expected_sha256: str | None = None
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
@@ -353,6 +358,10 @@ class ServerArgs(DisaggServerArgsMixin):
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
+    # Optional content pin for the precomputed cache. This is intentionally
+    # separate from the checkpoint's source fingerprint: the same source can
+    # produce tables for different schedules.
+    minimax_h3_adaln_cache_expected_sha256: str | None = None
     # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
     minimax_h3_adaln_online: bool = False
     # Widest timestep plan the rebuild slab is sized for; see
@@ -627,6 +636,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_direct_gpu_weight_loading()
         if self.lora_alpha is not None and self.lora_alpha <= 0:
             raise ValueError("lora_alpha must be a positive integer")
+        self._validate_artifact_digest_pins()
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
@@ -646,6 +656,27 @@ class ServerArgs(DisaggServerArgsMixin):
                 "--minimax-h3-adaln-host-cache-gb only takes effect with "
                 "--minimax-h3-adaln-online; ignoring it"
             )
+
+    def _validate_artifact_digest_pins(self) -> None:
+        if self.lora_expected_sha256 is not None:
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", self.lora_expected_sha256) is None:
+                raise ValueError(
+                    "lora_expected_sha256 must use canonical sha256:<64 lowercase hex> format"
+                )
+            if self.lora_path is None:
+                raise ValueError("lora_expected_sha256 requires lora_path")
+        expected_digest = self.minimax_h3_adaln_cache_expected_sha256
+        if expected_digest is not None:
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", expected_digest) is None:
+                raise ValueError(
+                    "minimax_h3_adaln_cache_expected_sha256 must use canonical "
+                    "sha256:<64 lowercase hex> format"
+                )
+            if self.minimax_h3_adaln_cache_path is None:
+                raise ValueError(
+                    "minimax_h3_adaln_cache_expected_sha256 requires "
+                    "minimax_h3_adaln_cache_path"
+                )
 
     def _validate_scheduler_rpc_timeout(self) -> None:
         timeout = self.scheduler_rpc_timeout
@@ -2020,6 +2051,15 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--minimax-h3-adaln-cache-expected-sha256",
+            type=str,
+            default=ServerArgs.minimax_h3_adaln_cache_expected_sha256,
+            help=(
+                "Pin the MiniMax H3 AdaLN sidecar to a canonical "
+                "sha256:<digest> and reject mismatched content before loading."
+            ),
+        )
+        parser.add_argument(
             "--model-id",
             type=str,
             default=ServerArgs.model_id,
@@ -2834,6 +2874,15 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.lora_weight_name,
             help="Specific safetensors filename to load from a multi-file LoRA repo",
+        )
+        parser.add_argument(
+            "--lora-expected-sha256",
+            type=str,
+            default=ServerArgs.lora_expected_sha256,
+            help=(
+                "Pin the resolved LoRA artifact to a canonical sha256:<digest>. "
+                "The process fails before deserialization if the content differs."
+            ),
         )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)

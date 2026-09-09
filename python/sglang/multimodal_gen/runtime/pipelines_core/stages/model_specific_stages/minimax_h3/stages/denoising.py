@@ -790,6 +790,16 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device,
                 placement_managed=placement_managed,
             )
+            is_pdd_active = getattr(model, "is_pdd_active", None)
+            if (
+                callable(is_pdd_active)
+                and is_pdd_active()
+                and server_args.enable_breakable_cuda_graph
+            ):
+                raise ValueError(
+                    "MiniMax H3 PDD does not support breakable CUDA graphs because "
+                    "the full output head changes at every denoise step"
+                )
             build_vsa_h3_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
                 model=model,
                 packed=packed,

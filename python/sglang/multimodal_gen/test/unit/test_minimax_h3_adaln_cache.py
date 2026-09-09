@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -28,6 +29,28 @@ _ARCH = MiniMaxH3DiTArchConfig(
 )
 _BLOCK_WIDTH = 6 * MINIMAX_H3_ADALN_MODALITY_NUM * _ARCH.hidden_size
 _FINAL_WIDTH = 2 * _ARCH.hidden_size
+_ADAPTER_DIGEST = "sha256:" + "a" * 64
+
+
+def test_prebuilt_cache_digest_mismatch_fails_before_deserialization(tmp_path):
+    cache_path = tmp_path / "adaln.safetensors"
+    cache_path.write_bytes(b"not a safetensors file")
+    cache = MiniMaxH3AdalnCache(
+        _ARCH,
+        path=str(cache_path),
+        expected_sha256="sha256:" + "0" * 64,
+        model_variant="fl2va",
+    )
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache.safe_open"
+        ) as open_cache,
+        pytest.raises(ValueError, match="AdaLN cache SHA-256 mismatch"),
+    ):
+        cache.load(torch.device("cpu"))
+
+    open_cache.assert_not_called()
 
 
 def _ensure_single_process_parallel_runtime() -> None:
@@ -192,7 +215,12 @@ def test_sidecar_resolve_slots_and_block_all_match_per_step_paths(tmp_path):
         cache.resolve_slots([torch.tensor([9.0])])
 
 
-def _write_legacy_sidecar(path: Path, *, fingerprint: str = "sha256:test"):
+def _write_legacy_sidecar(
+    path: Path,
+    *,
+    fingerprint: str = "sha256:test",
+    adapter_metadata: dict[str, str] | None = None,
+):
     timesteps = torch.tensor([0.25, 0.5, 0.75], dtype=torch.float32)
     block_tables = [
         (
@@ -208,6 +236,13 @@ def _write_legacy_sidecar(path: Path, *, fingerprint: str = "sha256:test"):
         .reshape(3, _FINAL_WIDTH)
         .bfloat16()
     )
+    metadata = {
+        "format_version": "1",
+        "table_layout": "full",
+        "source_fingerprint": fingerprint,
+    }
+    if adapter_metadata is not None:
+        metadata.update(adapter_metadata)
     save_file(
         {
             "timesteps": timesteps,
@@ -215,11 +250,7 @@ def _write_legacy_sidecar(path: Path, *, fingerprint: str = "sha256:test"):
             **{f"blocks.{index}": table for index, table in enumerate(block_tables)},
         },
         path,
-        metadata={
-            "format_version": "1",
-            "table_layout": "full",
-            "source_fingerprint": fingerprint,
-        },
+        metadata=metadata,
     )
     return timesteps, block_tables, final_table
 
@@ -254,6 +285,121 @@ def test_legacy_sidecar_preserves_flat_timestep_lookup(tmp_path):
 
     with pytest.raises(ValueError, match="does not cover"):
         cache.resolve_slots([torch.tensor([9.0])])
+
+
+def _adapter_metadata(**overrides: str) -> dict[str, str]:
+    metadata = {
+        "adaln_adapter_sha256": _ADAPTER_DIGEST,
+        "adaln_adapter_scale": "1.0",
+        "adaln_adapter_application": "table_delta",
+        "adaln_adapter_tensors": str(2 * (_ARCH.num_layers + 1)),
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+def _adapter_sidecar_cache(tmp_path: Path, **metadata_overrides: str):
+    path = tmp_path / "adapter-aware.safetensors"
+    timesteps, _, _ = _write_legacy_sidecar(
+        path, adapter_metadata=_adapter_metadata(**metadata_overrides)
+    )
+    cache = MiniMaxH3AdalnCache(
+        _ARCH,
+        path=str(path),
+        legacy_provenance={
+            "format_version": "1",
+            "table_layout": "full",
+            "source_fingerprint": "sha256:test",
+        },
+    )
+    return cache, timesteps
+
+
+def test_adapter_aware_legacy_sidecar_requires_exact_runtime_binding(tmp_path):
+    cache, timesteps = _adapter_sidecar_cache(tmp_path)
+    cache.load(torch.device("cpu"))
+    assert cache.has_adapter_delta
+
+    with pytest.raises(ValueError, match="exact LoRA adapter"):
+        cache.resolve_slots([timesteps[:1]])
+    with pytest.raises(ValueError, match="adapter mismatch"):
+        cache.bind_adapter_identity("sha256:" + "b" * 64, 1.0)
+    with pytest.raises(ValueError, match="adapter mismatch"):
+        cache.bind_adapter_identity(_ADAPTER_DIGEST, 0.5)
+
+    cache.bind_adapter_identity(_ADAPTER_DIGEST, 1.0)
+    assert cache.resolve_slots([timesteps[:1]]).tolist() == [[0]]
+    cache.bind_adapter_identity(_ADAPTER_DIGEST, 1.0)
+    with pytest.raises(ValueError, match="changed after"):
+        cache.bind_adapter_identity("sha256:" + "b" * 64, 1.0)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"adaln_adapter_sha256": "not-a-digest"}, "SHA-256"),
+        ({"adaln_adapter_scale": "nan"}, "positive and finite"),
+        ({"adaln_adapter_application": "dynamic"}, "table_delta"),
+        ({"adaln_adapter_tensors": "3"}, "tensor count mismatch"),
+    ],
+)
+def test_adapter_aware_legacy_sidecar_rejects_bad_contract(
+    tmp_path, overrides, message
+):
+    cache, _ = _adapter_sidecar_cache(tmp_path, **overrides)
+    with pytest.raises(ValueError, match=message):
+        cache.load(torch.device("cpu"))
+
+
+def test_adapter_aware_legacy_sidecar_requires_complete_metadata(tmp_path):
+    metadata = _adapter_metadata()
+    metadata.pop("adaln_adapter_tensors")
+    path = tmp_path / "partial-adapter.safetensors"
+    _write_legacy_sidecar(path, adapter_metadata=metadata)
+    cache = MiniMaxH3AdalnCache(
+        _ARCH,
+        path=str(path),
+        legacy_provenance={
+            "format_version": "1",
+            "table_layout": "full",
+            "source_fingerprint": "sha256:test",
+        },
+    )
+    with pytest.raises(ValueError, match="must contain all"):
+        cache.load(torch.device("cpu"))
+
+
+def test_adapter_aware_sidecar_strips_only_declared_adaln_tensors(tmp_path):
+    cache, _ = _adapter_sidecar_cache(tmp_path)
+    cache.load(torch.device("cpu"))
+    adapter = {"blocks.0.attn.qkv_proj.lora_A": torch.zeros(1)}
+    for layer in range(_ARCH.num_layers):
+        for suffix in ("lora_A", "lora_B"):
+            adapter[f"blocks.{layer}.adaln_proj.linear.{suffix}"] = torch.zeros(1)
+    for suffix in ("lora_A", "lora_B"):
+        adapter[f"final_layer.adaln_proj.linear.{suffix}"] = torch.zeros(1)
+
+    stripped = cache.strip_baked_adaln_tensors(adapter)
+    assert set(stripped) == {"blocks.0.attn.qkv_proj.lora_A"}
+
+    adapter.pop("blocks.0.adaln_proj.linear.lora_A")
+    with pytest.raises(ValueError, match="tensor count"):
+        cache.strip_baked_adaln_tensors(adapter)
+
+
+def test_adapter_aware_sidecar_accepts_block_only_adaln_lora(tmp_path):
+    cache, _ = _adapter_sidecar_cache(
+        tmp_path, adaln_adapter_tensors=str(2 * _ARCH.num_layers)
+    )
+    cache.load(torch.device("cpu"))
+    adapter = {"blocks.0.attn.qkv_proj.lora_A": torch.zeros(1)}
+    for layer in range(_ARCH.num_layers):
+        for suffix in ("lora_A", "lora_B"):
+            adapter[f"blocks.{layer}.adaln_proj.linear.{suffix}"] = torch.zeros(1)
+
+    stripped = cache.strip_baked_adaln_tensors(adapter)
+
+    assert set(stripped) == {"blocks.0.attn.qkv_proj.lora_A"}
 
 
 def test_legacy_sidecar_requires_matching_checkpoint_fingerprint(tmp_path):
@@ -445,7 +591,7 @@ def test_precision_fp32_projects_in_fp32_then_stores_bf16(tmp_path):
         MiniMaxH3AdalnCache(_ARCH, weight_files=[str(weight_path)], precision="fp64")
 
 
-def test_lora_guard_rejects_adaln_keys_in_cache_mode():
+def test_lora_guard_rejects_adaln_keys_in_base_cache_mode(tmp_path):
     from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
         MiniMaxH3DiTModel,
     )
@@ -453,6 +599,7 @@ def test_lora_guard_rejects_adaln_keys_in_cache_mode():
     model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
     torch.nn.Module.__init__(model)
     model._adaln_precomputed = True
+    model.adaln_cache = _online_cache(tmp_path)
     adapter = {"blocks.0.adaln_proj.linear.lora_A": torch.zeros(1)}
     with pytest.raises(ValueError, match="adaln_proj"):
         MiniMaxH3DiTModel.prepare_lora_adapter(model, adapter)

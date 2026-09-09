@@ -3,7 +3,7 @@
 
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn.functional as F
@@ -278,6 +278,8 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {}
     pipeline.loaded_adapter_alphas = {}
+    pipeline.loaded_adapter_sha256 = {}
+    pipeline.loaded_adapter_adaln_multiplier = {}
     pipeline.device = "cpu"
     pipeline.modules = {"transformer": torch.nn.Module()}
     pipeline.server_args = SimpleNamespace(
@@ -299,9 +301,13 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
 
 def _load_adapter(pipeline, state_dict, lora_alpha=None):
     loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
+    safe_reader = MagicMock()
+    safe_reader.__enter__.return_value.metadata.return_value = {}
     with (
         patch(f"{loader_mod}.maybe_download_lora", return_value="/adapter"),
+        patch(f"{loader_mod}.safe_open", return_value=safe_reader),
         patch(f"{loader_mod}.load_file", return_value=state_dict),
+        patch(f"{loader_mod}._sha256_file", return_value="sha256:" + "a" * 64),
         patch(f"{loader_mod}.dist.is_initialized", return_value=False),
     ):
         pipeline.load_lora_adapter("/adapter", "adapter", rank=0, lora_alpha=lora_alpha)

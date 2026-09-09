@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 import struct
 from collections import OrderedDict
@@ -38,6 +40,22 @@ logger = init_logger(__name__)
 
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
+
+_ADAPTER_METADATA_FIELDS = (
+    "adaln_adapter_sha256",
+    "adaln_adapter_scale",
+    "adaln_adapter_application",
+    "adaln_adapter_tensors",
+)
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
 
 # The native adaln_proj tensor names the online rebuild streams; a checkpoint
 # without them (Diffusers layout, quantized export) cannot serve as a rebuild
@@ -394,6 +412,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         arch: MiniMaxH3DiTArchConfig,
         *,
         path: str | None = None,
+        expected_sha256: str | None = None,
         model_variant: str | None = None,
         legacy_provenance: dict[str, str] | None = None,
         weight_files: list[str] | None = None,
@@ -421,6 +440,8 @@ class MiniMaxH3AdalnCache(nn.Module):
                 f"with resident adaln_proj weights) or 'fp32', got {precision!r}"
             )
         self.path = path
+        self.expected_sha256 = expected_sha256
+        self.artifact_sha256: str | None = None
         self.model_variant = model_variant
         self.legacy_provenance = (
             dict(legacy_provenance) if legacy_provenance is not None else None
@@ -439,6 +460,12 @@ class MiniMaxH3AdalnCache(nn.Module):
         self._free_slots: list[int] = list(range(max_plans))
         self.host_cache_bytes = host_cache_bytes
         self.precision = precision
+        self._table_adapter_identity: tuple[str, float] | None = None
+        self._table_adapter_tensors = 0
+        self._bound_adapter_identity: tuple[str, float] | None = None
+        # Online and v2 caches contain base-model projections. An
+        # adapter-aware v1 sidecar becomes unbound when it is loaded below.
+        self._adapter_identity_bound = True
         # Constructed in load(): needs the device and the distributed runtime.
         self._host_tier: MiniMaxH3AdalnHostTier | None = None
         self.stats = MiniMaxH3AdalnCacheStats()
@@ -459,6 +486,15 @@ class MiniMaxH3AdalnCache(nn.Module):
             return
         if not os.path.isfile(self.path):
             raise ValueError(f"MiniMax H3 AdaLN cache does not exist: {self.path}")
+        self.artifact_sha256 = _sha256_file(self.path)
+        if (
+            self.expected_sha256 is not None
+            and self.artifact_sha256 != self.expected_sha256
+        ):
+            raise ValueError(
+                "MiniMax H3 AdaLN cache SHA-256 mismatch: "
+                f"expected {self.expected_sha256}, got {self.artifact_sha256}"
+            )
 
         with safe_open(self.path, framework="pt", device="cpu") as cache_file:
             metadata = cache_file.metadata() or {}
@@ -473,6 +509,12 @@ class MiniMaxH3AdalnCache(nn.Module):
             if metadata.get("format_version") != self._FORMAT_VERSION:
                 raise ValueError(
                     "MiniMax H3 AdaLN cache has an unsupported or missing format_version"
+                )
+            if any(
+                metadata.get(field) is not None for field in _ADAPTER_METADATA_FIELDS
+            ):
+                raise ValueError(
+                    "MiniMax H3 AdaLN v2 caches cannot contain adapter deltas"
                 )
             cache_variant = metadata.get("model_variant")
             if self.model_variant is not None and cache_variant != self.model_variant:
@@ -538,19 +580,66 @@ class MiniMaxH3AdalnCache(nn.Module):
                 )
         if metadata.get("table_layout") != "full":
             raise ValueError("MiniMax H3 AdaLN v1 cache requires full table layout")
-        if any(
-            metadata.get(field) is not None
-            for field in (
-                "adaln_adapter_sha256",
-                "adaln_adapter_scale",
-                "adaln_adapter_application",
-                "adaln_adapter_tensors",
-            )
-        ):
+        adapter_values = {
+            field: metadata.get(field) for field in _ADAPTER_METADATA_FIELDS
+        }
+        present = {
+            field for field, value in adapter_values.items() if value is not None
+        }
+        if present and present != set(_ADAPTER_METADATA_FIELDS):
             raise ValueError(
-                "adapter-aware AdaLN v1 caches are not supported by the upstream "
-                "cache path"
+                "MiniMax H3 AdaLN adapter metadata must contain all of "
+                f"{list(_ADAPTER_METADATA_FIELDS)}, got {sorted(present)}"
             )
+        table_adapter_identity = None
+        table_adapter_tensors = 0
+        if present:
+            adapter_digest = adapter_values["adaln_adapter_sha256"]
+            if (
+                not isinstance(adapter_digest, str)
+                or not adapter_digest.startswith("sha256:")
+                or len(adapter_digest) != 71
+            ):
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache has an invalid adapter SHA-256 digest"
+                )
+            try:
+                int(adapter_digest[7:], 16)
+            except ValueError as exc:
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache has an invalid adapter SHA-256 digest"
+                ) from exc
+            try:
+                adapter_scale = float(adapter_values["adaln_adapter_scale"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache has an invalid adapter scale"
+                ) from exc
+            if not math.isfinite(adapter_scale) or adapter_scale <= 0:
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache adapter scale must be positive and finite"
+                )
+            if adapter_values["adaln_adapter_application"] != "table_delta":
+                raise ValueError(
+                    "MiniMax H3 adapter-aware AdaLN cache must declare table_delta application"
+                )
+            try:
+                table_adapter_tensors = int(adapter_values["adaln_adapter_tensors"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache has an invalid adapter tensor count"
+                ) from exc
+            expected_adapter_tensors = {
+                2 * self.num_layers,
+                2 * (self.num_layers + 1),
+            }
+            if table_adapter_tensors not in expected_adapter_tensors:
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache adapter tensor count mismatch: "
+                    f"artifact has {table_adapter_tensors}, expected "
+                    f"one of {sorted(expected_adapter_tensors)}"
+                )
+            table_adapter_identity = (adapter_digest, adapter_scale)
 
         required = {
             "timesteps",
@@ -606,12 +695,69 @@ class MiniMaxH3AdalnCache(nn.Module):
         for slot in range(expected_rows):
             self._slots[_plan_key(plan_timesteps[slot])] = slot
         self._legacy_flat = True
+        self._table_adapter_identity = table_adapter_identity
+        self._table_adapter_tensors = table_adapter_tensors
+        self._adapter_identity_bound = table_adapter_identity is None
         self.register_buffer(
             "plan_timesteps", plan_timesteps.to(device), persistent=False
         )
         self.register_buffer("plan_lengths", plan_lengths.to(device), persistent=False)
         self.register_buffer("block_params", block_params.to(device), persistent=False)
         self.register_buffer("final_params", final_params.to(device), persistent=False)
+
+    @property
+    def has_adapter_delta(self) -> bool:
+        return self._table_adapter_identity is not None
+
+    def strip_baked_adaln_tensors(
+        self, adapter: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Remove AdaLN LoRA tensors already represented by a v1 sidecar."""
+        names = sorted(name for name in adapter if ".adaln_proj.linear.lora_" in name)
+        if not names:
+            return adapter
+        if not self.has_adapter_delta:
+            raise ValueError(
+                "MiniMax H3 AdaLN cache cannot apply LoRA deltas on adaln_proj; "
+                "use an adapter-aware v1 sidecar or resident AdaLN weights"
+            )
+        if len(names) != self._table_adapter_tensors:
+            raise ValueError(
+                "MiniMax H3 AdaLN LoRA tensor count does not match its sidecar: "
+                f"adapter has {len(names)}, sidecar declares "
+                f"{self._table_adapter_tensors}"
+            )
+        return {name: value for name, value in adapter.items() if name not in names}
+
+    def bind_adapter_identity(self, digest: str | None, scale: float | None) -> None:
+        if (digest is None) != (scale is None):
+            raise ValueError("AdaLN adapter digest and scale must be set together")
+        identity = None if digest is None else (digest, float(scale))
+        if identity is not None and (
+            not math.isfinite(identity[1]) or identity[1] <= 0
+        ):
+            raise ValueError("AdaLN adapter scale must be positive and finite")
+        if self._adapter_identity_bound:
+            if identity != self._bound_adapter_identity:
+                raise ValueError(
+                    "MiniMax H3 AdaLN adapter changed after the cache was bound: "
+                    f"bound={self._bound_adapter_identity!r}, requested={identity!r}"
+                )
+            return
+        if identity != self._table_adapter_identity:
+            raise ValueError(
+                "MiniMax H3 AdaLN cache adapter mismatch: artifact has "
+                f"{self._table_adapter_identity!r}, runtime expects {identity!r}"
+            )
+        self._bound_adapter_identity = identity
+        self._adapter_identity_bound = True
+
+    def validate_adapter_binding(self) -> None:
+        if not self._adapter_identity_bound:
+            raise ValueError(
+                "MiniMax H3 adapter-aware AdaLN cache requires its exact LoRA "
+                "adapter digest and effective scale before inference"
+            )
 
     def _allocate(self, device: torch.device) -> None:
         """Empty slab for the rebuild path; its pointers must never move.
@@ -908,6 +1054,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         replay signature (one graph per slot value), and an int baked into a
         captured gather would read the wrong slab row after slot reuse.
         """
+        self.validate_adapter_binding()
         if keys is None:
             keys = [_plan_key(timesteps) for timesteps in step_timesteps]
         if self._legacy_flat:
@@ -940,6 +1087,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         return torch.tensor(slots, dtype=torch.int64, device=self.block_params.device)
 
     def lookup(self, unique_timesteps: torch.Tensor) -> torch.Tensor:
+        self.validate_adapter_binding()
         if self._legacy_flat:
             key = _plan_key(unique_timesteps)
             slots = []
@@ -977,6 +1125,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         num_timesteps: int,
     ) -> tuple[tuple[torch.Tensor, ...], ...]:
         """Every block's AdaLN tuple via one layer-major slab gather."""
+        self.validate_adapter_binding()
         if self._legacy_flat:
             rows = cache_plan_index.reshape(-1)[:num_timesteps]
             stacked = self.block_params.index_select(0, rows)[:, 0].permute(1, 0, 2)
@@ -992,6 +1141,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         cache_plan_index: torch.Tensor,
         num_timesteps: int,
     ) -> tuple[torch.Tensor, ...]:
+        self.validate_adapter_binding()
         if self._legacy_flat:
             rows = cache_plan_index.reshape(-1)[:num_timesteps]
             params = self.final_params.index_select(0, rows)[:, 0]

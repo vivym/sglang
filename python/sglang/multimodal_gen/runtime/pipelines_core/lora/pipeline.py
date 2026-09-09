@@ -1,6 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
+import math
 import os
 from collections import defaultdict
 from collections.abc import Hashable
@@ -9,6 +11,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from safetensors import safe_open
 from safetensors.torch import load_file
 from torch.distributed.tensor import DTensor
 
@@ -47,6 +50,94 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = init_logger(__name__)
+
+_CURVE_ADALN_METADATA_KEYS = {
+    "curve_adaln_application",
+    "curve_adaln_input_dim",
+    "curve_adaln_pairs_stripped",
+    "curve_adaln_scale_multiplier",
+}
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _adaln_lora_scale_multiplier(
+    adapter: dict[str, torch.Tensor],
+    adapter_alpha: int | None,
+    adapter_metadata: dict[str, str] | None = None,
+) -> float | None:
+    """Return the uniform alpha/rank factor used by AdaLN LoRA modules."""
+    adapter_metadata = adapter_metadata or {}
+    a_keys = sorted(name for name in adapter if ".adaln_proj.linear.lora_A" in name)
+    b_keys = {name for name in adapter if ".adaln_proj.linear.lora_B" in name}
+    declared_keys = _CURVE_ADALN_METADATA_KEYS.intersection(adapter_metadata)
+    if declared_keys and (a_keys or b_keys):
+        raise ValueError(
+            "MiniMax H3 precomputed curve-AdaLN metadata conflicts with runtime "
+            "AdaLN LoRA tensors"
+        )
+    if not a_keys and not b_keys and declared_keys:
+        missing = _CURVE_ADALN_METADATA_KEYS.difference(adapter_metadata)
+        if missing:
+            raise ValueError(
+                "MiniMax H3 precomputed curve-AdaLN metadata is incomplete: "
+                f"missing={sorted(missing)}"
+            )
+        if adapter_metadata.get("format") != "minimax-h3-sglang-lora-v1":
+            raise ValueError(
+                "MiniMax H3 precomputed curve-AdaLN metadata requires the native "
+                "SGLang sidecar format"
+            )
+        if adapter_metadata["curve_adaln_application"] != "precomputed_table":
+            raise ValueError(
+                "MiniMax H3 curve-AdaLN application must be 'precomputed_table'"
+            )
+        try:
+            input_dim = int(adapter_metadata["curve_adaln_input_dim"])
+            pairs_stripped = int(adapter_metadata["curve_adaln_pairs_stripped"])
+            multiplier = float(adapter_metadata["curve_adaln_scale_multiplier"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "MiniMax H3 precomputed curve-AdaLN metadata has invalid numeric fields"
+            ) from exc
+        if input_dim <= 0:
+            raise ValueError("MiniMax H3 curve-AdaLN input dimension must be positive")
+        if pairs_stripped != 51:
+            raise ValueError(
+                "MiniMax H3 precomputed curve-AdaLN metadata must strip exactly "
+                "50 blocks and final_layer"
+            )
+        if not math.isfinite(multiplier) or multiplier <= 0:
+            raise ValueError(
+                "MiniMax H3 curve-AdaLN scale multiplier must be positive and finite"
+            )
+        return multiplier
+    if not a_keys and not b_keys:
+        return None
+    expected_b = {name[: -len("lora_A")] + "lora_B" for name in a_keys}
+    if b_keys != expected_b:
+        raise ValueError("MiniMax H3 AdaLN LoRA must contain paired A/B tensors")
+    factors = set()
+    for a_key in a_keys:
+        rank = int(adapter[a_key].shape[-2])
+        if rank <= 0:
+            raise ValueError("MiniMax H3 AdaLN LoRA rank must be positive")
+        alpha_key = a_key[: -len("lora_A")] + "alpha"
+        alpha = (
+            int(adapter[alpha_key].item()) if alpha_key in adapter else adapter_alpha
+        )
+        factors.add(1.0 if alpha is None else float(alpha) / rank)
+    if len(factors) != 1:
+        raise ValueError(
+            "MiniMax H3 adapter-aware AdaLN tables require a uniform alpha/rank scale"
+        )
+    return factors.pop()
 
 
 def _swap_peft_swiglu_fc1_lora_b(
@@ -138,6 +229,8 @@ class LoRAPipeline(ComposedPipelineBase):
     lora_adapters: dict[str, dict[str, torch.Tensor]]
     loaded_adapter_paths: dict[str, str]  # nickname -> lora_path
     loaded_adapter_alphas: dict[str, int | None]
+    loaded_adapter_sha256: dict[str, str]
+    loaded_adapter_adaln_multiplier: dict[str, float]
     # nickname -> adapter_config lora_alpha
     # Track current adapter per module: {"transformer": "high_lora", "transformer_2": "low_lora"}
     cur_adapter_name: dict[str, str]
@@ -169,6 +262,8 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_adapters = defaultdict(dict)
         self.loaded_adapter_paths = {}
         self.loaded_adapter_alphas = {}
+        self.loaded_adapter_sha256 = {}
+        self.loaded_adapter_adaln_multiplier = {}
         self.cur_adapter_name = {}
         self.cur_adapter_path = {}
         self.cur_adapter_strength = {}
@@ -872,7 +967,22 @@ class LoRAPipeline(ComposedPipelineBase):
         if rank != 0:
             lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
 
+        adapter_digest = _sha256_file(lora_local_path)
+        expected_digest = getattr(self.server_args, "lora_expected_sha256", None)
+        if expected_digest is not None and adapter_digest != expected_digest:
+            raise ValueError(
+                "LoRA artifact SHA-256 mismatch: "
+                f"expected {expected_digest}, got {adapter_digest} for {lora_path}"
+            )
+
+        with safe_open(lora_local_path, framework="pt", device="cpu") as handle:
+            adapter_metadata = handle.metadata() or {}
         raw_state_dict = load_file(lora_local_path)
+        pdd_state_dict = {
+            name: raw_state_dict.pop(name)
+            for name in tuple(raw_state_dict)
+            if name.startswith("pdd.")
+        }
         adapter_config = load_peft_config(lora_local_path)
         lora_state_dict = normalize_lora_state_dict(
             raw_state_dict,
@@ -910,7 +1020,7 @@ class LoRAPipeline(ComposedPipelineBase):
             if merge_index is not None:
                 to_merge_params[target_name][merge_index] = weight
                 # A/B of one fused layer must be laid out together (GQA B cannot stack).
-                if target_name.endswith((".lora_A", ".lora_B")):
+                if target_name.endswith((".lora_A", ".lora_B", ".alpha")):
                     continue
                 if len(to_merge_params[target_name]) == num_params_to_merge:
                     sorted_tensors = [
@@ -936,15 +1046,92 @@ class LoRAPipeline(ComposedPipelineBase):
             adapter_lora_alpha,
             self.device,
         )
+        adaln_multiplier = _adaln_lora_scale_multiplier(
+            self.lora_adapters[lora_nickname],
+            adapter_lora_alpha,
+            adapter_metadata,
+        )
         transformer = self.modules["transformer"]
         if isinstance(transformer, BaseDiT):
             self.lora_adapters[lora_nickname] = transformer.prepare_lora_adapter(
                 self.lora_adapters[lora_nickname]
             )
 
+        if pdd_state_dict:
+            register_pdd = getattr(transformer, "register_pdd_adapter", None)
+            if not callable(register_pdd):
+                raise ValueError(
+                    "PDD tensors require a transformer with register_pdd_adapter()"
+                )
+            register_pdd(
+                digest=adapter_digest,
+                tensors=pdd_state_dict,
+                metadata=adapter_metadata,
+            )
+        elif adapter_metadata.get("format") == "minimax-h3-sglang-pdd-v1":
+            raise ValueError("MiniMax H3 PDD sidecar is missing its parallel heads")
+
         self.loaded_adapter_paths[lora_nickname] = lora_path
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
+        self.loaded_adapter_sha256[lora_nickname] = adapter_digest
+        if adaln_multiplier is None:
+            self.loaded_adapter_adaln_multiplier.pop(lora_nickname, None)
+        else:
+            self.loaded_adapter_adaln_multiplier[lora_nickname] = adaln_multiplier
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
+
+    def get_lora_runtime_identity(
+        self, target: str = "transformer"
+    ) -> dict[str, Any] | None:
+        """Describe the adapters that are actually active on one model target."""
+        config = self.cur_adapter_config.get(target)
+        if config is None:
+            return None
+        nicknames, strengths = config
+        return {
+            "target": target,
+            "nicknames": tuple(nicknames),
+            "paths": tuple(self.loaded_adapter_paths.get(name) for name in nicknames),
+            "sha256": tuple(self.loaded_adapter_sha256.get(name) for name in nicknames),
+            "alphas": tuple(self.loaded_adapter_alphas.get(name) for name in nicknames),
+            "strengths": tuple(float(value) for value in strengths),
+            "merged": bool(self.is_lora_merged.get(target, False)),
+        }
+
+    def _set_model_adaln_adapter_identity(
+        self,
+        module_name: str,
+        lora_nicknames: list[str],
+        strengths: list[float],
+    ) -> None:
+        model = self.modules.get(module_name)
+        setter = getattr(model, "set_expected_adaln_adapter_identity", None)
+        if not callable(setter):
+            return
+        identities = [
+            (
+                nickname,
+                self.loaded_adapter_sha256.get(nickname),
+                float(strength)
+                * self.loaded_adapter_adaln_multiplier.get(nickname, 1.0),
+            )
+            for nickname, strength in zip(lora_nicknames, strengths)
+            if nickname in self.loaded_adapter_adaln_multiplier
+        ]
+        if len(identities) > 1:
+            raise ValueError(
+                "MiniMax H3 AdaLN caches support exactly one AdaLN LoRA adapter, "
+                f"got {[identity[0] for identity in identities]}"
+            )
+        if not identities:
+            setter(None, None)
+            return
+        nickname, digest, effective_scale = identities[0]
+        if digest is None:
+            raise ValueError(
+                f"MiniMax H3 AdaLN LoRA adapter {nickname!r} has no content digest"
+            )
+        setter(digest, effective_scale)
 
     def set_lora(
         self,
@@ -1018,6 +1205,11 @@ class LoRAPipeline(ComposedPipelineBase):
             elif (
                 alpha is not None and self.loaded_adapter_alphas.get(nickname) != alpha
             ):
+                if nickname in self.loaded_adapter_adaln_multiplier:
+                    raise ValueError(
+                        "MiniMax H3 AdaLN LoRA alpha cannot change after its "
+                        "adapter-aware cache was prepared"
+                    )
                 self.loaded_adapter_alphas[nickname] = alpha
                 adapter_updated = True
 
@@ -1061,6 +1253,9 @@ class LoRAPipeline(ComposedPipelineBase):
 
             merge_weights_by_module = {}
             for module_name, lora_layers_dict in target_modules:
+                self._set_model_adaln_adapter_identity(
+                    module_name, tgt_nicknames, tgt_strengths
+                )
                 merge_weights_by_module[module_name] = (
                     first_effective_merge_weights
                     if module_name == first_module_name
@@ -1220,6 +1415,9 @@ class LoRAPipeline(ComposedPipelineBase):
         if not target_modules:
             return
 
+        for module_name, _ in target_modules:
+            self._set_model_adaln_adapter_identity(module_name, [], [])
+
         modules_requiring_unmerge = []
         for module_name, lora_layers_dict in target_modules:
             if self.is_lora_merged.get(module_name, False) or any(
@@ -1258,6 +1456,13 @@ class LoRAPipeline(ComposedPipelineBase):
             logger.warning("merge_lora_weights: %s", error)
         if not target_modules:
             return
+
+        for module_name, _ in target_modules:
+            config = self.cur_adapter_config.get(module_name)
+            nicknames = [] if config is None else config[0]
+            self._set_model_adaln_adapter_identity(
+                module_name, nicknames, [float(strength)] * len(nicknames)
+            )
 
         # Disable layerwise offload if enabled: load all layers to GPU
         with self._temporarily_disable_offload(target_modules=target_modules):
@@ -1326,6 +1531,9 @@ class LoRAPipeline(ComposedPipelineBase):
             logger.warning("unmerge_lora_weights: %s", error)
         if not target_modules:
             return
+
+        for module_name, _ in target_modules:
+            self._set_model_adaln_adapter_identity(module_name, [], [])
 
         # Disable layerwise offload if enabled: load all layers to GPU
 

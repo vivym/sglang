@@ -39,6 +39,7 @@ def test_sm80_research_mode_requires_persistent_root() -> None:
     (
         "cuda_per_warp_fp32_precombined_skip_noop",
         "cuda_fp16_row_pipeline_precombined_scale",
+        "cuda_fp16_row_pipeline_precombined_scale_interleaved_softmax",
     ),
 )
 def test_sm80_research_mode_binds_root_variant_and_extension_hash(

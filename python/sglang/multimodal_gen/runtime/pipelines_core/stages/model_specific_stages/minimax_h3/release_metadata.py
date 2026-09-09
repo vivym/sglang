@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sample.sampling_params import QUALITY_LEVELS
@@ -43,6 +44,31 @@ _MINIMAX_H3_FAST_WORKLOAD = {
     "audio_flow_shift": 3.0,
 }
 
+_MINIMAX_H3_EXPERIMENTAL_LORA_WORKLOAD = {
+    "task": "t2va",
+    "width": 1344,
+    "height": 768,
+    "fps": 24,
+    "frame_count": {124, 243, 362},
+    # LightX2V publishes 4/8-NFE adapters as 5/9 sigma-point schedules.
+    "num_inference_steps": {5, 9},
+    "flow_shift": 6.0,
+    "audio_flow_shift": 3.0,
+}
+
+_MINIMAX_H3_EXPERIMENTAL_FASTH3_WORKLOAD = {
+    "task": "t2va",
+    "width": 1344,
+    "height": 768,
+    "fps": 24,
+    "frame_count": {124, 243, 362},
+    # FastH3 publishes four forwards; Tutu publishes eight forwards. Both use
+    # explicit base schedules on the H3 12/3 shifted clocks.
+    "num_inference_steps": {5, 9},
+    "flow_shift": 12.0,
+    "audio_flow_shift": 3.0,
+}
+
 _MINIMAX_H3_RES_MULTISTEP_CANARY_WORKLOAD = {
     "task": "t2va",
     "width": 1344,
@@ -54,6 +80,57 @@ _MINIMAX_H3_RES_MULTISTEP_CANARY_WORKLOAD = {
     "flow_shift": 12.0,
     "audio_flow_shift": 3.0,
 }
+
+_MINIMAX_H3_BAKED_LORA_CONFIG_KEY = "minimax_h3_baked_lora"
+_MINIMAX_H3_BAKED_LORA_MODE = "bf16_lora_merge_then_convrot_int8_requantize"
+_SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def _validate_baked_lora_profile(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            f"quantization_config.{_MINIMAX_H3_BAKED_LORA_CONFIG_KEY} must be an object"
+        )
+    if value.get("format_version") != "1":
+        raise ValueError("MiniMax-H3 baked LoRA format_version must be '1'")
+    if value.get("mode") != _MINIMAX_H3_BAKED_LORA_MODE:
+        raise ValueError("MiniMax-H3 baked LoRA mode is unsupported")
+    for field in ("adapter_sha256", "source_checkpoint_sha256", "converter_revision"):
+        digest = value.get(field)
+        if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+            raise ValueError(f"MiniMax-H3 baked LoRA {field} must be a SHA-256 digest")
+    config_digest = value.get("adapter_config_sha256")
+    if config_digest != "none" and (
+        not isinstance(config_digest, str)
+        or _SHA256_PATTERN.fullmatch(config_digest) is None
+    ):
+        raise ValueError(
+            "MiniMax-H3 baked LoRA adapter_config_sha256 must be 'none' or a digest"
+        )
+    scale = value.get("adapter_scale")
+    if (
+        isinstance(scale, bool)
+        or not isinstance(scale, (int, float))
+        or not math.isfinite(float(scale))
+        or float(scale) <= 0
+    ):
+        raise ValueError("MiniMax-H3 baked LoRA adapter_scale must be positive")
+    alphas = value.get("adapter_alphas")
+    if not isinstance(alphas, list) or not alphas:
+        raise ValueError("MiniMax-H3 baked LoRA adapter_alphas must be non-empty")
+    if any(
+        isinstance(alpha, bool)
+        or not isinstance(alpha, (int, float))
+        or not math.isfinite(float(alpha))
+        or float(alpha) <= 0
+        for alpha in alphas
+    ):
+        raise ValueError("MiniMax-H3 baked LoRA adapter_alphas must be positive")
+    if value.get("lora_pairs") != 208:
+        raise ValueError("MiniMax-H3 baked LoRA must cover all 208 runtime LoRA layers")
+    return dict(value)
 
 
 def _string_list(value: Any, path: str) -> tuple[str, ...]:
@@ -75,6 +152,8 @@ class MiniMaxH3ReleaseMetadata:
     task_aliases: Mapping[str, str]
     video_sigma_shift: float
     audio_sigma_shift: float
+    base_schedule: tuple[float, ...] | None
+    lora_scale: float | None
 
     @classmethod
     def from_model_index(
@@ -115,6 +194,38 @@ class MiniMaxH3ReleaseMetadata:
                 "model_index.json._minimax_h3.sigma_shift_scales requires numeric "
                 "video and audio values"
             ) from exc
+        base_schedule_raw = raw.get("base_schedule")
+        base_schedule = None
+        if base_schedule_raw is not None:
+            if not isinstance(base_schedule_raw, list):
+                raise ValueError(
+                    "model_index.json._minimax_h3.base_schedule must be a list"
+                )
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+                minimax_h3_time_shift_sigmas,
+            )
+
+            # The helper owns the exact endpoint, monotonicity, and finite checks.
+            minimax_h3_time_shift_sigmas(
+                num_steps=len(base_schedule_raw),
+                shift_scale=1.0,
+                base_schedule=base_schedule_raw,
+            )
+            base_schedule = tuple(float(value) for value in base_schedule_raw)
+        lora_scale_raw = raw.get("lora_scale")
+        lora_scale = None
+        if lora_scale_raw is not None:
+            if isinstance(lora_scale_raw, bool) or not isinstance(
+                lora_scale_raw, (int, float)
+            ):
+                raise ValueError(
+                    "model_index.json._minimax_h3.lora_scale must be numeric"
+                )
+            lora_scale = float(lora_scale_raw)
+            if not math.isfinite(lora_scale) or lora_scale <= 0:
+                raise ValueError(
+                    "model_index.json._minimax_h3.lora_scale must be positive and finite"
+                )
         metadata = cls(
             schema_version=1,
             partition=partition,
@@ -122,6 +233,8 @@ class MiniMaxH3ReleaseMetadata:
             task_aliases=dict(aliases),
             video_sigma_shift=video_sigma,
             audio_sigma_shift=audio_sigma,
+            base_schedule=base_schedule,
+            lora_scale=lora_scale,
         )
         for task in metadata.tasks:
             if canonical_minimax_h3_task(task) != task:
@@ -163,9 +276,98 @@ class MiniMaxH3ReleaseMetadata:
 
 
 class MiniMaxH3PartitionAdmissionStage(PipelineStage):
-    def __init__(self, metadata: MiniMaxH3ReleaseMetadata) -> None:
+    def __init__(
+        self,
+        metadata: MiniMaxH3ReleaseMetadata,
+        baked_lora_profile: Mapping[str, Any] | None = None,
+        lora_identity_provider: Callable[[], Mapping[str, Any] | None] | None = None,
+    ) -> None:
         super().__init__()
         self.metadata = metadata
+        self.baked_lora_profile = _validate_baked_lora_profile(baked_lora_profile)
+        self.lora_identity_provider = lora_identity_provider
+
+    def _validate_runtime_lora_identity(self, server_args: ServerArgs) -> None:
+        expected_digest = getattr(server_args, "lora_expected_sha256", None)
+        if (
+            not isinstance(expected_digest, str)
+            or _SHA256_PATTERN.fullmatch(expected_digest) is None
+        ):
+            raise ValueError(
+                'MiniMax-H3 quality="fast" startup LoRA requires '
+                "--lora-expected-sha256=sha256:<digest>"
+            )
+        if self.lora_identity_provider is None:
+            raise ValueError(
+                'MiniMax-H3 quality="fast" cannot verify the active LoRA identity'
+            )
+        identity = self.lora_identity_provider()
+        if not isinstance(identity, Mapping):
+            raise ValueError(
+                'MiniMax-H3 quality="fast" requires an active transformer LoRA'
+            )
+        nicknames = identity.get("nicknames")
+        paths = identity.get("paths")
+        digests = identity.get("sha256")
+        alphas = identity.get("alphas")
+        strengths = identity.get("strengths")
+        values = (nicknames, paths, digests, alphas, strengths)
+        if any(
+            not isinstance(value, (tuple, list)) or len(value) != 1 for value in values
+        ):
+            raise ValueError(
+                'MiniMax-H3 quality="fast" requires exactly one active transformer LoRA'
+            )
+        expected_path = getattr(server_args, "lora_path", None)
+        expected_alpha = getattr(server_args, "lora_alpha", None)
+        expected_strength = float(getattr(server_args, "lora_scale", 1.0))
+        mismatches = {}
+        actual = {
+            "path": paths[0],
+            "sha256": digests[0],
+            "alpha": alphas[0],
+            "strength": float(strengths[0]),
+            "merged": bool(identity.get("merged", False)),
+            "adaln_cache_path": identity.get("adaln_cache_path"),
+            "adaln_cache_sha256": identity.get("adaln_cache_sha256"),
+        }
+        expected_adaln_path = getattr(server_args, "minimax_h3_adaln_cache_path", None)
+        expected_adaln_digest = getattr(
+            server_args, "minimax_h3_adaln_cache_expected_sha256", None
+        )
+        if not isinstance(expected_adaln_path, str) or not expected_adaln_path:
+            raise ValueError(
+                'MiniMax-H3 quality="fast" startup LoRA requires an explicit '
+                "--minimax-h3-adaln-cache-path"
+            )
+        if (
+            not isinstance(expected_adaln_digest, str)
+            or _SHA256_PATTERN.fullmatch(expected_adaln_digest) is None
+        ):
+            raise ValueError(
+                'MiniMax-H3 quality="fast" startup LoRA requires '
+                "--minimax-h3-adaln-cache-expected-sha256=sha256:<digest>"
+            )
+        expected = {
+            "path": expected_path,
+            "sha256": expected_digest,
+            "alpha": expected_alpha,
+            "strength": expected_strength,
+            "merged": False,
+            "adaln_cache_path": expected_adaln_path,
+            "adaln_cache_sha256": expected_adaln_digest,
+        }
+        if expected_alpha is None:
+            mismatches["alpha"] = {"expected": "explicit lora_alpha", "actual": None}
+        for name, wanted in expected.items():
+            if name == "alpha" and wanted is None:
+                continue
+            if actual[name] != wanted:
+                mismatches[name] = {"expected": wanted, "actual": actual[name]}
+        if mismatches:
+            raise ValueError(
+                f'MiniMax-H3 quality="fast" active LoRA identity mismatch: {mismatches}'
+            )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         task = None if batch.sampling_params is None else batch.sampling_params.task
@@ -199,15 +401,21 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         if sampler_mode not in {"euler", "res_multistep"}:
             raise ValueError(f"unsupported MiniMax-H3 sampler_mode {sampler_mode!r}")
         startup_lora = getattr(server_args, "lora_path", None)
+        baked_lora = self.baked_lora_profile
+        if startup_lora is not None and baked_lora is not None:
+            raise ValueError(
+                "MiniMax-H3 baked LoRA checkpoints cannot apply a startup LoRA"
+            )
+        has_lora_weights = startup_lora is not None or baked_lora is not None
         uses_res_multistep = sampler_mode == "res_multistep"
         if not batch.is_warmup:
-            if startup_lora is not None and uses_res_multistep:
+            if has_lora_weights and uses_res_multistep:
                 raise ValueError(
-                    "MiniMax-H3 res_multistep cannot be combined with a startup LoRA"
+                    "MiniMax-H3 res_multistep cannot be combined with LoRA weights"
                 )
-            if startup_lora is not None and quality != "fast":
+            if has_lora_weights and quality != "fast":
                 raise ValueError(
-                    'MiniMax-H3 with a startup LoRA requires quality="fast"; '
+                    'MiniMax-H3 with startup or baked LoRA requires quality="fast"; '
                     f"quality={quality!r} cannot describe the effective model state"
                 )
             if uses_res_multistep and quality != "fast":
@@ -215,10 +423,10 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                     'MiniMax-H3 res_multistep requires quality="fast"; '
                     f"quality={quality!r} cannot describe the solver trajectory"
                 )
-            if quality == "fast" and startup_lora is None and not uses_res_multistep:
+            if quality == "fast" and not has_lora_weights and not uses_res_multistep:
                 raise ValueError(
                     'MiniMax-H3 quality="fast" requires an explicitly configured '
-                    "startup LoRA or sampler_mode='res_multistep'"
+                    "startup/baked LoRA or sampler_mode='res_multistep'"
                 )
         high_quality = quality == "high"
         if high_quality and not batch.is_warmup:
@@ -330,20 +538,35 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                         f"{_MINIMAX_H3_RES_MULTISTEP_CANARY_WORKLOAD}; got {actual}"
                     )
                 return batch
-            try:
-                lora_scale = float(getattr(server_args, "lora_scale", None))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    'MiniMax-H3 quality="fast" requires lora_scale=1.0'
-                ) from exc
-            if (
-                lora_scale != 1.0
-                or getattr(server_args, "lora_merge_mode", None) != "dynamic"
-            ):
-                raise ValueError(
-                    'MiniMax-H3 quality="fast" requires lora_scale=1.0 and '
-                    'lora_merge_mode="dynamic"'
-                )
+            expected_lora_scale = (
+                self.metadata.lora_scale
+                if self.metadata.lora_scale is not None
+                else 1.0
+            )
+            if baked_lora is not None:
+                if float(baked_lora["adapter_scale"]) != expected_lora_scale:
+                    raise ValueError(
+                        'MiniMax-H3 quality="fast" baked checkpoint requires '
+                        f"adapter_scale={expected_lora_scale}"
+                    )
+            else:
+                try:
+                    lora_scale = float(getattr(server_args, "lora_scale", None))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        'MiniMax-H3 quality="fast" requires lora_scale='
+                        f"{expected_lora_scale}"
+                    ) from exc
+                if (
+                    lora_scale != expected_lora_scale
+                    or getattr(server_args, "lora_merge_mode", None) != "dynamic"
+                ):
+                    raise ValueError(
+                        'MiniMax-H3 quality="fast" requires lora_scale='
+                        f"{expected_lora_scale} and "
+                        'lora_merge_mode="dynamic"'
+                    )
+                self._validate_runtime_lora_identity(server_args)
             plan = minimax_h3_plan_from_batch(batch)
             if plan is None:
                 raise ValueError(
@@ -385,10 +608,43 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
                 _MINIMAX_H3_FAST_WORKLOAD["audio_flow_shift"],
                 abs_tol=1e-9,
             )
-            if not exact or not sets_match or not shifts:
+            validated_fast = exact and sets_match and shifts
+            experimental_workloads = (
+                _MINIMAX_H3_EXPERIMENTAL_LORA_WORKLOAD,
+                _MINIMAX_H3_EXPERIMENTAL_FASTH3_WORKLOAD,
+            )
+            experimental_fast = any(
+                all(
+                    actual[name] == workload[name]
+                    for name in ("task", "width", "height", "fps")
+                )
+                and all(
+                    actual[name] in workload[name]
+                    for name in ("frame_count", "num_inference_steps")
+                )
+                and math.isclose(
+                    actual["flow_shift"], workload["flow_shift"], abs_tol=1e-9
+                )
+                and math.isclose(
+                    actual["audio_flow_shift"],
+                    workload["audio_flow_shift"],
+                    abs_tol=1e-9,
+                )
+                for workload in experimental_workloads
+            )
+            experimental_enabled = os.environ.get(
+                "SGLANG_H3_EXPERIMENTAL_LORA_WORKLOAD", "0"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if experimental_fast and not experimental_enabled:
+                raise ValueError(
+                    "MiniMax-H3 experimental LoRA workload is disabled; set "
+                    "SGLANG_H3_EXPERIMENTAL_LORA_WORKLOAD=1"
+                )
+            if not validated_fast and not experimental_fast:
                 raise ValueError(
                     'MiniMax-H3 quality="fast" canary is validated only for '
-                    f"{_MINIMAX_H3_FAST_WORKLOAD}; got {actual}"
+                    f"{_MINIMAX_H3_FAST_WORKLOAD}; experimental opt-in accepts "
+                    f"{experimental_workloads}; got {actual}"
                 )
         return batch
 

@@ -140,6 +140,55 @@ def _from_dict_without_model_resolution(
         return ServerArgs.from_dict(kwargs)
 
 
+class TestArtifactDigestPins(unittest.TestCase):
+    @staticmethod
+    def _args(**overrides):
+        args = object.__new__(ServerArgs)
+        args.lora_path = "/adapter.safetensors"
+        args.lora_expected_sha256 = None
+        args.minimax_h3_adaln_cache_path = "/adaln.safetensors"
+        args.minimax_h3_adaln_cache_expected_sha256 = None
+        for name, value in overrides.items():
+            setattr(args, name, value)
+        return args
+
+    def test_accepts_canonical_pins(self):
+        args = self._args(
+            lora_expected_sha256="sha256:" + "a" * 64,
+            minimax_h3_adaln_cache_expected_sha256="sha256:" + "b" * 64,
+        )
+
+        args._validate_artifact_digest_pins()
+
+    def test_rejects_noncanonical_and_unbound_pins(self):
+        for field, value, message in (
+            ("lora_expected_sha256", "A" * 64, "canonical"),
+            (
+                "minimax_h3_adaln_cache_expected_sha256",
+                "sha256:" + "A" * 64,
+                "canonical",
+            ),
+        ):
+            with self.subTest(field=field):
+                args = self._args(**{field: value})
+                with self.assertRaisesRegex(ValueError, message):
+                    args._validate_artifact_digest_pins()
+
+        args = self._args(
+            lora_path=None,
+            lora_expected_sha256="sha256:" + "a" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "requires lora_path"):
+            args._validate_artifact_digest_pins()
+
+        args = self._args(
+            minimax_h3_adaln_cache_path=None,
+            minimax_h3_adaln_cache_expected_sha256="sha256:" + "b" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "requires.*cache_path"):
+            args._validate_artifact_digest_pins()
+
+
 class TestAsyncOutputPersistence(unittest.TestCase):
     def test_default_is_disabled(self):
         args = ServerArgs(model_path="/fake")

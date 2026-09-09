@@ -672,7 +672,11 @@ def test_deferred_attention_rejects_backend_fallback():
         model._resolve_attention_backend_once()
 
 
-def test_token_refiner_routes_cube_selection_to_exact_fa():
+@pytest.mark.parametrize(
+    "selected_backend",
+    [AttentionBackendEnum.CUBE_SPARSE_ATTN, AttentionBackendEnum.SAGE_ATTN],
+)
+def test_token_refiner_routes_approximate_selection_to_exact_fa(selected_backend):
     class FakeImpl:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -687,7 +691,7 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
         def get_impl_cls(self):
             return FakeImpl
 
-    cube = FakeBackend(AttentionBackendEnum.CUBE_SPARSE_ATTN)
+    approximate = FakeBackend(selected_backend)
     fa = FakeBackend(AttentionBackendEnum.FA)
     attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
     torch.nn.Module.__init__(attention)
@@ -701,7 +705,7 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
         "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
         return_value=fa,
     ) as resolve:
-        attention._set_attention_backend(cube)
+        attention._set_attention_backend(approximate)
 
     assert attention._attention_backend_enum is AttentionBackendEnum.FA
     resolve.assert_called_once_with(
