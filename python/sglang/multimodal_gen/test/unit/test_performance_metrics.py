@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -87,6 +88,39 @@ def test_worker_records_replica_load_and_runtime_peaks():
     assert worker._runtime_peak_reserved_mb == 3072.0
     assert metrics.memory_snapshots["load_peak"].peak_reserved_mb == 5120.0
     assert metrics.memory_snapshots["runtime_peak"].peak_reserved_mb == 3584.0
+
+
+def test_worker_records_output_and_total_through_output_timings(monkeypatch):
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.is_output_rank = True
+    worker.server_args = SimpleNamespace(model_path="model")
+    worker._realtime_sessions = SimpleNamespace(attach=lambda _req: None)
+    worker._record_output_peak_memory = Mock()
+    worker._materialize_output_transport = Mock()
+    metrics = RequestMetrics("request")
+    request = SimpleNamespace(
+        request_id="request-id",
+        perf_dump_path="metrics.json",
+        is_warmup=True,
+        suppress_logs=True,
+        return_raw_frames=False,
+    )
+    output = OutputBatch(output=[], metrics=metrics)
+
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
+    result = worker._execute_forward_common(
+        request,
+        forward_fn=lambda: output,
+        log_reqs=[],
+        return_req=False,
+        save_output_paths=lambda _output: None,
+        error_context="test request",
+    )
+
+    assert result is output
+    assert metrics.total_duration_ms >= 0
+    assert metrics.stages["GPUWorker.output_materialize_transport"] >= 0
+    assert metrics.stages["GPUWorker.total_through_output"] >= metrics.total_duration_ms
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):

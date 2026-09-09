@@ -576,14 +576,29 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
-            req_label = req.request_id[:8] if req.request_id else "unnamed"
-            with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
-                self._materialize_output_transport(output_batch, req, save_output_paths)
-            self._record_output_peak_memory(output_batch)
-
             collect_perf = (
                 req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
             )
+            req_label = req.request_id[:8] if req.request_id else "unnamed"
+            output_started = time.perf_counter()
+            try:
+                with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
+                    self._materialize_output_transport(
+                        output_batch, req, save_output_paths
+                    )
+            finally:
+                if collect_perf:
+                    output_duration_s = time.perf_counter() - output_started
+                    total_through_output_s = time.monotonic() - start_time
+                    for metrics in output_metrics:
+                        metrics.record_stage(
+                            "GPUWorker.output_materialize_transport", output_duration_s
+                        )
+                        metrics.record_stage(
+                            "GPUWorker.total_through_output", total_through_output_s
+                        )
+            self._record_output_peak_memory(output_batch)
+
             if collect_perf and not req.is_warmup:
                 self._record_replica_peak_memory(output_metrics)
 
@@ -827,6 +842,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             def build_output_path(idx: int) -> str:
                 return req.output_file_path(num_outputs, idx)
 
+        output_metrics = self._iter_output_metrics(output_batch)
+        stage_recorder = None
+        if output_metrics and (
+            getattr(req, "perf_dump_path", None) is not None
+            or envs.SGLANG_DIFFUSION_STAGE_LOGGING
+        ):
+
+            def stage_recorder(stage_name: str, duration_s: float) -> None:
+                for metrics in output_metrics:
+                    metrics.record_stage(stage_name, duration_s)
+
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             req.data_type,
@@ -843,6 +869,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             enable_upscaling=req.enable_upscaling,
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
+            stage_recorder=stage_recorder,
         )
 
     def _can_persist_output_asynchronously(

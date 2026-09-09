@@ -175,11 +175,17 @@ def test_x264_auto_thread_count(monkeypatch, height, available_cpus, expected_th
 def test_video_direct_save_short_circuits_materialization(tmp_path, monkeypatch):
     output_path = tmp_path / "sample.mp4"
     direct_calls = []
+    timings = {}
+
+    def direct_save(**kwargs):
+        direct_calls.append(kwargs)
+        kwargs["stage_recorder"]("OutputSave.direct.pipe_write", 1.25)
+        return True
 
     monkeypatch.setattr(
         output_utils,
         "_try_save_cuda_video_direct",
-        lambda **kwargs: direct_calls.append(kwargs) or True,
+        direct_save,
     )
     monkeypatch.setattr(
         output_utils,
@@ -195,10 +201,12 @@ def test_video_direct_save_short_circuits_materialization(tmp_path, monkeypatch)
         fps=24,
         save_output=True,
         build_output_path=lambda _idx: str(output_path),
+        stage_recorder=lambda name, duration: timings.__setitem__(name, duration),
     )
 
     assert paths == [str(output_path)]
     assert len(direct_calls) == 1
+    assert timings == {"OutputSave.direct.pipe_write": 1.25}
 
 
 def test_multiple_videos_use_parallel_direct_save_with_serial_fallback(

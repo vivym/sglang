@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import copy
@@ -54,6 +55,19 @@ _MAX_CUDA_VIDEO_CONVERSION_CHUNK_BYTES = 128 * 1024 * 1024
 _MAX_PARALLEL_CUDA_VIDEO_SAVES = 2
 _cuda_video_buffer_cache_lock = threading.Lock()
 _cached_cuda_video_buffer: "_CudaMemfdVideoBuffer | None" = None
+
+
+def _record_output_timing(
+    stage_recorder: Callable[[str, float], None] | None,
+    stage_name: str,
+    duration_s: float,
+) -> None:
+    if stage_recorder is None:
+        return
+    try:
+        stage_recorder(stage_name, duration_s)
+    except Exception:
+        logger.debug("Output timing recorder failed for %s", stage_name, exc_info=True)
 
 
 class _CudaMemfdVideoBuffer:
@@ -495,6 +509,7 @@ def _try_save_cuda_video_direct(
     fps: int,
     audio_sample_rate: Optional[int],
     output_compression: Optional[int],
+    stage_recorder: Callable[[str, float], None] | None = None,
 ) -> bool:
     """Stream CUDA RGB chunks to ffmpeg through a registered memfd."""
     if not hasattr(os, "memfd_create") or not hasattr(os, "sendfile"):
@@ -524,6 +539,14 @@ def _try_save_cuda_video_direct(
         return False
     crf = int((1 - quality / 10.0) * 51)
 
+    direct_started = time.perf_counter()
+    audio_prepare_s = 0.0
+    process_start_s = 0.0
+    buffer_acquire_s = 0.0
+    cuda_convert_d2h_s = 0.0
+    pipe_write_s = 0.0
+    ffmpeg_flush_wait_s = 0.0
+    audio_started = time.perf_counter()
     audio_np = _normalize_audio_to_numpy(audio)
     tmp_wav_path = None
     try:
@@ -539,6 +562,7 @@ def _try_save_cuda_video_direct(
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 tmp_wav_path = f.name
             scipy_wavfile.write(tmp_wav_path, selected_sr, audio_np)
+        audio_prepare_s = time.perf_counter() - audio_started
 
         ffmpeg_exe = _resolve_ffmpeg_exe()
         command = [
@@ -597,24 +621,29 @@ def _try_save_cuda_video_direct(
         command += ["-v", "warning", save_file_path]
 
         with tempfile.TemporaryFile() as stderr_file:
+            process_started = time.perf_counter()
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr_file,
             )
+            process_start_s = time.perf_counter() - process_started
             try:
                 if process.stdin is None:
                     raise RuntimeError("ffmpeg stdin pipe was not created")
+                buffer_started = time.perf_counter()
                 with _acquire_cuda_video_buffer(
                     (chunk_frames, height, width, 3)
                 ) as buffer:
+                    buffer_acquire_s = time.perf_counter() - buffer_started
                     assert buffer.tensor is not None
                     for start in range(0, num_frames, chunk_frames):
                         end = min(start + chunk_frames, num_frames)
                         with maybe_record_function(
                             f"VIDEO_CHUNK frames {start}-{end} convert+pipe_to_x264"
                         ):
+                            convert_started = time.perf_counter()
                             frames = (
                                 (video[:, start:end] * 255)
                                 .clamp_(0, 255)
@@ -625,16 +654,23 @@ def _try_save_cuda_video_direct(
                                 frames, non_blocking=True
                             )
                             torch.cuda.current_stream(video.device).synchronize()
+                            cuda_convert_d2h_s += (
+                                time.perf_counter() - convert_started
+                            )
                             del frames
+                            pipe_started = time.perf_counter()
                             _sendfile_all(
                                 process.stdin.fileno(),
                                 buffer.fd,
                                 (end - start) * height * width * 3,
                             )
+                            pipe_write_s += time.perf_counter() - pipe_started
                 with maybe_record_function("FFMPEG_FLUSH stdin_close+wait"):
+                    flush_started = time.perf_counter()
                     process.stdin.close()
                     process.stdin = None
                     returncode = process.wait()
+                    ffmpeg_flush_wait_s = time.perf_counter() - flush_started
             finally:
                 if process.stdin is not None:
                     process.stdin.close()
@@ -657,6 +693,16 @@ def _try_save_cuda_video_direct(
         logger.debug("Direct CUDA video save failure", exc_info=True)
         return False
     finally:
+        for stage_name, duration_s in (
+            ("OutputSave.direct.audio_prepare", audio_prepare_s),
+            ("OutputSave.direct.process_start", process_start_s),
+            ("OutputSave.direct.buffer_acquire", buffer_acquire_s),
+            ("OutputSave.direct.cuda_convert_d2h", cuda_convert_d2h_s),
+            ("OutputSave.direct.pipe_write", pipe_write_s),
+            ("OutputSave.direct.ffmpeg_flush_wait", ffmpeg_flush_wait_s),
+            ("OutputSave.direct.total", time.perf_counter() - direct_started),
+        ):
+            _record_output_timing(stage_recorder, stage_name, duration_s)
         if tmp_wav_path:
             try:
                 os.remove(tmp_wav_path)
@@ -1166,6 +1212,7 @@ def save_outputs(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
+    stage_recorder: Callable[[str, float], None] | None = None,
 ) -> list[str]:
     output_paths: list[str] = []
     samples = (
@@ -1229,6 +1276,7 @@ def save_outputs(
                         fps=fps,
                         audio_sample_rate=audio_sample_rate,
                         output_compression=output_compression,
+                        stage_recorder=(stage_recorder if len(outputs) == 1 else None),
                     )
                 if direct_saved:
                     if samples_out is not None:
@@ -1239,22 +1287,30 @@ def save_outputs(
                     logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
                     continue
 
-        frames = post_process_sample(
-            sample,
-            data_type,
-            fps,
-            save_output,
-            save_file_path,
-            audio_sample_rate=audio_sample_rate,
-            output_compression=output_compression,
-            enable_frame_interpolation=enable_frame_interpolation,
-            frame_interpolation_exp=frame_interpolation_exp,
-            frame_interpolation_scale=frame_interpolation_scale,
-            frame_interpolation_model_path=frame_interpolation_model_path,
-            enable_upscaling=enable_upscaling,
-            upscaling_model_path=upscaling_model_path,
-            upscaling_scale=upscaling_scale,
-        )
+        fallback_started = time.perf_counter()
+        try:
+            frames = post_process_sample(
+                sample,
+                data_type,
+                fps,
+                save_output,
+                save_file_path,
+                audio_sample_rate=audio_sample_rate,
+                output_compression=output_compression,
+                enable_frame_interpolation=enable_frame_interpolation,
+                frame_interpolation_exp=frame_interpolation_exp,
+                frame_interpolation_scale=frame_interpolation_scale,
+                frame_interpolation_model_path=frame_interpolation_model_path,
+                enable_upscaling=enable_upscaling,
+                upscaling_model_path=upscaling_model_path,
+                upscaling_scale=upscaling_scale,
+            )
+        finally:
+            _record_output_timing(
+                stage_recorder,
+                "OutputSave.fallback.total",
+                time.perf_counter() - fallback_started,
+            )
 
         if samples_out is not None:
             samples_out.append(sample)
