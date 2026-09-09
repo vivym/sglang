@@ -146,8 +146,11 @@ class DisaggServerArgsMixin:
             "--disagg-transfer-backend",
             type=str,
             default=cls.disagg_transfer_backend,
-            choices=["auto", "mock", "mooncake"],
-            help="Transfer backend for multimodal diffusion disaggregation.",
+            choices=["auto", "mock", "mooncake", "tcp"],
+            help=(
+                "Transfer backend for multimodal diffusion disaggregation. "
+                "'tcp' uses bounded checksummed ZMQ over ordinary Ethernet."
+            ),
         )
         parser.add_argument(
             "--disagg-transfer-pool-size",
@@ -156,11 +159,84 @@ class DisaggServerArgsMixin:
             help="Size of the P2P transfer buffer pool in bytes.",
         )
         parser.add_argument(
+            "--disagg-transfer-max-payload-size",
+            type=int,
+            default=cls.disagg_transfer_max_payload_size,
+            help="Maximum bytes accepted by one disaggregated tensor transfer.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-listen-port",
+            type=int,
+            default=cls.disagg_transfer_listen_port,
+            help=(
+                "TCP tensor receiver port. Zero selects an ephemeral port; set a "
+                "fixed port when the receiver is exposed through a service or "
+                "network policy."
+            ),
+        )
+        parser.add_argument(
+            "--disagg-transfer-timeout",
+            type=float,
+            default=cls.disagg_transfer_timeout,
+            help="Per-attempt tensor transfer timeout in seconds.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-retries",
+            type=int,
+            default=cls.disagg_transfer_retries,
+            help="Retry count after the first TCP tensor transfer attempt.",
+        )
+        parser.add_argument(
             "--disagg-transfer-pin-memory",
             type=str,
             default=cls.disagg_transfer_pin_memory,
             choices=["auto", "off", "required"],
             help="CUDA host-register same-host shared-memory transfer buffers.",
+        )
+        parser.add_argument(
+            "--disagg-media-encoder-endpoint",
+            type=str,
+            default=cls.disagg_media_encoder_endpoint,
+            help=(
+                "Absolute ipc:// endpoint for the co-located CPU media encoder. "
+                "MiniMax H3 decoder roles require it to return media manifests."
+            ),
+        )
+        parser.add_argument(
+            "--disagg-media-shared-memory-root",
+            type=str,
+            default=cls.disagg_media_shared_memory_root,
+            help="Shared tmpfs root mounted into decoder and media containers.",
+        )
+        parser.add_argument(
+            "--disagg-media-max-payload-size",
+            type=int,
+            default=cls.disagg_media_max_payload_size,
+            help="Maximum bytes in one staged RGB24/PCM media payload.",
+        )
+        parser.add_argument(
+            "--disagg-media-staging-slots",
+            type=int,
+            default=cls.disagg_media_staging_slots,
+            help="Maximum staged decoder outputs awaiting CPU media completion.",
+        )
+        parser.add_argument(
+            "--disagg-media-timeout",
+            type=float,
+            default=cls.disagg_media_timeout,
+            help="Timeout in seconds for one CPU media encoding attempt.",
+        )
+        parser.add_argument(
+            "--disagg-media-retries",
+            type=int,
+            default=cls.disagg_media_retries,
+            help="Retry count for an idempotent CPU media encoding attempt.",
+        )
+        parser.add_argument(
+            "--disagg-media-startup-timeout",
+            type=float,
+            default=cls.disagg_media_startup_timeout,
+            help="Seconds to wait for the co-located media service health check.",
         )
         parser.add_argument(
             "--disagg-p2p-hostname",

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -15,6 +16,10 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class MiniMaxH3LatentPreparationStage(PipelineStage):
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
             minimax_h3_plan_from_batch,

@@ -362,6 +362,10 @@ class ServerArgs(DisaggServerArgsMixin):
     # separate from the checkpoint's source fingerprint: the same source can
     # produce tables for different schedules.
     minimax_h3_adaln_cache_expected_sha256: str | None = None
+    # Content-addressed production manifest used by disaggregated H3 roles.
+    minimax_h3_disagg_manifest_path: str | None = None
+    # Local root corresponding to the manifest's relative artifact paths.
+    minimax_h3_disagg_artifact_root: str | None = None
     # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
     minimax_h3_adaln_online: bool = False
     # Widest timestep plan the rebuild slab is sized for; see
@@ -542,9 +546,22 @@ class ServerArgs(DisaggServerArgsMixin):
     disagg_max_slots_per_instance: int = 8
     disagg_transfer_redundancy: float = 1.25
     disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
-    disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
+    disagg_transfer_backend: Literal["auto", "mock", "mooncake", "tcp"] = "auto"
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
+    disagg_transfer_max_payload_size: int = 256 * 1024 * 1024
+    disagg_transfer_listen_port: int = 0
+    disagg_transfer_timeout: float = 60.0
+    disagg_transfer_retries: int = 1
     disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
+    # Decoder-to-CPU media handoff. The endpoint must be a same-host Unix
+    # domain socket; bulk RGB24/PCM stays in the bounded shared-memory root.
+    disagg_media_encoder_endpoint: str | None = None
+    disagg_media_shared_memory_root: str = "/dev/shm/sglang-h3-media"
+    disagg_media_max_payload_size: int = 1536 * 1024**2
+    disagg_media_staging_slots: int = 2
+    disagg_media_timeout: float = 300.0
+    disagg_media_retries: int = 1
+    disagg_media_startup_timeout: float = 30.0
     disagg_p2p_hostname: str = "127.0.0.1"
     disagg_ib_device: str | None = None
     disagg_server_addr: str | None = None
@@ -631,6 +648,7 @@ class ServerArgs(DisaggServerArgsMixin):
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
         self._validate_scheduler_rpc_timeout()
+        self._validate_disagg_transport()
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
@@ -644,6 +662,81 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_disagg_transport(self) -> None:
+        positive_integer_fields = (
+            "disagg_transfer_pool_size",
+            "disagg_transfer_max_payload_size",
+            "disagg_media_max_payload_size",
+            "disagg_media_staging_slots",
+        )
+        for name in positive_integer_fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            isinstance(self.disagg_transfer_listen_port, bool)
+            or not isinstance(self.disagg_transfer_listen_port, int)
+            or not 0 <= self.disagg_transfer_listen_port <= 65535
+        ):
+            raise ValueError(
+                "disagg_transfer_listen_port must be an integer from 0 to 65535"
+            )
+        if self.disagg_transfer_max_payload_size > self.disagg_transfer_pool_size:
+            raise ValueError(
+                "disagg_transfer_max_payload_size must not exceed "
+                "disagg_transfer_pool_size"
+            )
+        if (
+            isinstance(self.disagg_transfer_timeout, bool)
+            or not isinstance(self.disagg_transfer_timeout, (int, float))
+            or not math.isfinite(self.disagg_transfer_timeout)
+            or self.disagg_transfer_timeout <= 0
+        ):
+            raise ValueError("disagg_transfer_timeout must be a positive finite number")
+        if (
+            isinstance(self.disagg_transfer_retries, bool)
+            or not isinstance(self.disagg_transfer_retries, int)
+            or self.disagg_transfer_retries < 0
+        ):
+            raise ValueError("disagg_transfer_retries must be a non-negative integer")
+        if (
+            isinstance(self.disagg_media_timeout, bool)
+            or not isinstance(self.disagg_media_timeout, (int, float))
+            or not math.isfinite(self.disagg_media_timeout)
+            or self.disagg_media_timeout <= 0
+        ):
+            raise ValueError("disagg_media_timeout must be a positive finite number")
+        if (
+            isinstance(self.disagg_media_startup_timeout, bool)
+            or not isinstance(self.disagg_media_startup_timeout, (int, float))
+            or not math.isfinite(self.disagg_media_startup_timeout)
+            or self.disagg_media_startup_timeout <= 0
+        ):
+            raise ValueError(
+                "disagg_media_startup_timeout must be a positive finite number"
+            )
+        if (
+            isinstance(self.disagg_media_retries, bool)
+            or not isinstance(self.disagg_media_retries, int)
+            or self.disagg_media_retries < 0
+        ):
+            raise ValueError("disagg_media_retries must be a non-negative integer")
+        if self.disagg_media_encoder_endpoint is not None:
+            from sglang.multimodal_gen.runtime.media_encoder.client import (
+                validate_ipc_endpoint,
+            )
+
+            validate_ipc_endpoint(self.disagg_media_encoder_endpoint)
+            if self.disagg_role != RoleType.DECODER:
+                raise ValueError(
+                    "disagg_media_encoder_endpoint is only valid for the decoder role"
+                )
+            media_root = os.path.expanduser(self.disagg_media_shared_memory_root)
+            if not os.path.isabs(media_root):
+                raise ValueError(
+                    "disagg_media_shared_memory_root must be an absolute path"
+                )
 
     def _validate_minimax_h3_adaln(self) -> None:
         # Warn, not raise: config-file and from_kwargs construction mark every
@@ -2057,6 +2150,26 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Pin the MiniMax H3 AdaLN sidecar to a canonical "
                 "sha256:<digest> and reject mismatched content before loading."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-disagg-manifest-path",
+            type=str,
+            default=ServerArgs.minimax_h3_disagg_manifest_path,
+            help=(
+                "Content-addressed production artifact manifest required by each "
+                "disaggregated MiniMax H3 compute role. The role hashes only its "
+                "owned artifacts and exchanges the global manifest identity at "
+                "role boundaries."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-disagg-artifact-root",
+            type=str,
+            default=ServerArgs.minimax_h3_disagg_artifact_root,
+            help=(
+                "Local root for paths in --minimax-h3-disagg-manifest-path. "
+                "Defaults to source_root recorded by the manifest."
             ),
         )
         parser.add_argument(

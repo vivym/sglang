@@ -465,6 +465,9 @@ class OutputBatch:
     # Local scheduler transport may temporarily carry PendingOutputFileRef;
     # clients materialize it back to a string before exposing the result.
     output_file_paths: list[Any] | None = None
+    # Disaggregated decoders return a durable URI/object manifest instead of
+    # worker-local files or raw RGB/PCM tensors.
+    media_manifest: dict[str, Any] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional[RequestMetrics] = None
@@ -483,5 +486,6 @@ class OutputBatch:
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
         self.output_file_paths = None
+        self.media_manifest = None
         self.raw_frame_batches = None
         self.noise_pred = None

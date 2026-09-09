@@ -21,8 +21,10 @@ from sglang.multimodal_gen.runtime.entrypoints.http_server import (
 from sglang.multimodal_gen.test.server.test_server_utils import ServerManager
 
 
-def _make_request(warmup_done) -> SimpleNamespace:
+def _make_request(warmup_done, server_args=None) -> SimpleNamespace:
     state = SimpleNamespace(server_warmup_done=warmup_done)
+    if server_args is not None:
+        state.server_args = server_args
     return SimpleNamespace(app=SimpleNamespace(state=state))
 
 
@@ -51,6 +53,26 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
         warmup_done.set()
         resp = await health_generate(_make_request(warmup_done))
         self.assertEqual(resp, {"status": "ok"})
+
+    async def test_disagg_head_returns_503_until_all_roles_register(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+        from sglang.multimodal_gen.runtime.scheduler_client import (
+            async_scheduler_client,
+        )
+
+        warmup_done = asyncio.Event()
+        warmup_done.set()
+        request = _make_request(
+            warmup_done, SimpleNamespace(disagg_role=RoleType.SERVER)
+        )
+        with mock.patch.object(
+            async_scheduler_client,
+            "disagg_registration_ready",
+            mock.AsyncMock(side_effect=[False, True]),
+        ):
+            resp = await health(request)
+            self.assertEqual(resp.status_code, 503)
+            self.assertEqual(await health(request), {"status": "ok"})
 
 
 class _FakeResponse:

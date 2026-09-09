@@ -14,6 +14,7 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
     monkeypatch.setenv("MINIMAX_H3_FORCE_VAE_RESIDENT", "1")
     monkeypatch.setenv("MINIMAX_H3_CONVROT", "1")
     monkeypatch.setenv("MINIMAX_H3_DUMP_LATENTS_PATH", "/runs/latents/{request_id}.pt")
+    monkeypatch.setenv("MINIMAX_H3_DEBUG_TENSOR_DUMP_ROOT", "/runs/debug-tensors")
     monkeypatch.setenv("MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS", "0")
     monkeypatch.setenv("SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP", "1")
     monkeypatch.setenv("SGLANG_H3_MEMORY_PROFILE", "1")
@@ -110,6 +111,7 @@ def test_runtime_config_exposes_effective_generation_identity(monkeypatch):
             "force_vae_resident": "1",
             "convrot_assertion": "1",
             "latent_dump_path_template": "/runs/latents/{request_id}.pt",
+            "debug_tensor_dump_root": "/runs/debug-tensors",
             "reuse_text_embeddings": "0",
             "experimental_res_multistep": "1",
             "memory_profile": "1",
@@ -134,6 +136,7 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
         "MINIMAX_H3_FORCE_VAE_RESIDENT",
         "MINIMAX_H3_CONVROT",
         "MINIMAX_H3_DUMP_LATENTS_PATH",
+        "MINIMAX_H3_DEBUG_TENSOR_DUMP_ROOT",
         "MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS",
         "SGLANG_H3_EXPERIMENTAL_RES_MULTISTEP",
         "SGLANG_H3_MEMORY_PROFILE",
@@ -219,6 +222,7 @@ def test_runtime_config_falls_back_to_defaults_and_single_scheduler_port(monkeyp
         "force_vae_resident": "1",
         "convrot_assertion": None,
         "latent_dump_path_template": None,
+        "debug_tensor_dump_root": None,
         "reuse_text_embeddings": "0",
         "experimental_res_multistep": "0",
         "memory_profile": "0",

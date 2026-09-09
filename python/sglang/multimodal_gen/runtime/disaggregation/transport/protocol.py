@@ -11,6 +11,11 @@ from typing import Any
 
 TRANSFER_MAGIC = b"__transfer__"
 
+# Role registrations are soft state owned by the head. Periodic refresh lets
+# workers recover after a head restart and lets readiness reject dead workers.
+DISAGG_REGISTRATION_HEARTBEAT_INTERVAL_S = 10.0
+DISAGG_REGISTRATION_STALE_AFTER_S = 30.0
+
 
 class TransferMsgType:
     # Instance → DiffusionServer
@@ -23,6 +28,7 @@ class TransferMsgType:
     ALLOC = "transfer_alloc"
     PUSH = "transfer_push"
     READY = "transfer_ready"
+    ABORT = "transfer_abort"
 
     # Registration
     REGISTER = "transfer_register"
@@ -33,7 +39,9 @@ class TransferMsgType:
 class TransferStagedMsg:
     msg_type: str = TransferMsgType.STAGED
     request_id: str = ""
+    transfer_id: str = ""
     data_size: int = 0
+    transfer_backend: str = ""
     manifest: dict = field(default_factory=dict)
     session_id: str = ""
     pool_ptr: int = 0
@@ -45,6 +53,7 @@ class TransferStagedMsg:
 class TransferAllocMsg:
     msg_type: str = TransferMsgType.ALLOC
     request_id: str = ""
+    transfer_id: str = ""
     data_size: int = 0
     source_role: str = ""
 
@@ -53,16 +62,20 @@ class TransferAllocMsg:
 class TransferAllocatedMsg:
     msg_type: str = TransferMsgType.ALLOCATED
     request_id: str = ""
+    transfer_id: str = ""
+    transfer_backend: str = ""
     session_id: str = ""
     pool_ptr: int = 0
     slot_offset: int = 0
     slot_size: int = 0
+    error: str | None = None
 
 
 @dataclass
 class TransferPushMsg:
     msg_type: str = TransferMsgType.PUSH
     request_id: str = ""
+    transfer_id: str = ""
     dest_session_id: str = ""
     dest_addr: int = 0
     transfer_size: int = 0
@@ -72,12 +85,16 @@ class TransferPushMsg:
 class TransferPushedMsg:
     msg_type: str = TransferMsgType.PUSHED
     request_id: str = ""
+    transfer_id: str = ""
+    error: str | None = None
 
 
 @dataclass
 class TransferReadyMsg:
     msg_type: str = TransferMsgType.READY
     request_id: str = ""
+    transfer_id: str = ""
+    data_size: int = 0
     manifest: dict = None
     slot_offset: int = 0
     scalar_fields: dict = None
@@ -93,13 +110,25 @@ class TransferReadyMsg:
 class TransferDoneMsg:
     msg_type: str = TransferMsgType.DONE
     request_id: str = ""
+    completed_transfer_id: str = ""
+    transfer_id: str = ""
     error: str | None = None
+    transfer_backend: str = ""
+
+
+@dataclass
+class TransferAbortMsg:
+    msg_type: str = TransferMsgType.ABORT
+    request_id: str = ""
+    transfer_id: str = ""
+    reason: str = ""
 
 
 @dataclass
 class TransferRegisterMsg:
     msg_type: str = TransferMsgType.REGISTER
     role: str = ""
+    transfer_backend: str = ""
     session_id: str = ""
     pool_ptr: int = 0
     pool_size: int = 0

@@ -27,6 +27,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
     VideoListResponse,
@@ -333,6 +334,8 @@ def _video_job_from_sampling(
     req: VideoGenerationsRequest,
     sampling: SamplingParams,
     served_model_name: str,
+    *,
+    publish_local_file_path: bool = True,
 ) -> Dict[str, Any]:
     size_str = f"{sampling.width}x{sampling.height}"
     seconds = int(round((sampling.num_frames or 0) / float(sampling.fps or 24)))
@@ -346,7 +349,11 @@ def _video_job_from_sampling(
         "size": size_str,
         "seconds": str(seconds),
         "quality": "standard",
-        "file_path": os.path.abspath(sampling.output_file_path()),
+        "file_path": (
+            os.path.abspath(sampling.output_file_path())
+            if publish_local_file_path
+            else None
+        ),
     }
 
 
@@ -388,6 +395,34 @@ async def _dispatch_job_async(
             batch,
             scheduler_batches=scheduler_batches,
         )
+        if result.media_manifest is not None:
+            from sglang.multimodal_gen.runtime.media_encoder.protocol import (
+                MediaEncodeManifest,
+            )
+
+            manifest = MediaEncodeManifest.from_dict(result.media_manifest)
+            if manifest.request_id != job_id:
+                raise RuntimeError(
+                    "media manifest request identity does not match the video job"
+                )
+            update_fields = {
+                "status": "completed",
+                "progress": 100,
+                "completed_at": int(time.time()),
+                "url": manifest.uri,
+                "file_path": None,
+                "file_paths": None,
+                "num_outputs": 1,
+                "size": f"{manifest.width}x{manifest.height}",
+                "seconds": f"{manifest.duration_seconds:g}",
+                "media_manifest": manifest.to_dict(),
+            }
+            update_fields = add_common_data_to_response(
+                update_fields, request_id=job_id, result=result
+            )
+            await VIDEO_STORE.update_fields(job_id, update_fields)
+            return
+
         save_file_path = save_file_path_list[0]
         try:
             final_media_fields = await asyncio.to_thread(
@@ -766,6 +801,7 @@ async def create_video(
             req,
             sampling_params,
             server_args.served_model_name,
+            publish_local_file_path=(server_args.disagg_role == RoleType.MONOLITHIC),
         )
         job.update(sampling_params.project_video_queued_job_fields(batch))
         await VIDEO_STORE.upsert(request_id, job)

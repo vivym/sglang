@@ -101,12 +101,12 @@ def _run_http_server_process(server_args: ServerArgs) -> None:
     launch_http_server_only(server_args)
 
 
-def _run_scheduler_process(*args) -> None:
+def _run_scheduler_process(*args, **kwargs) -> None:
     # The launcher owns terminal interrupts and asks workers to stop through
     # ShutdownReq. Letting every process handle Ctrl-C races that request and
     # leaves noisy KeyboardInterrupt tracebacks from worker event loops.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    _run_scheduler_process_entrypoint(*args)
+    _run_scheduler_process_entrypoint(*args, **kwargs)
 
 
 def _request_monolithic_scheduler_shutdown(server_args: ServerArgs) -> None:
@@ -489,6 +489,7 @@ def launch_pool_disagg_server(
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        max_transfer_payload_bytes=server_args.disagg_transfer_max_payload_size,
     )
     diffusion_server.start()
 
@@ -640,6 +641,7 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        max_transfer_payload_bytes=server_args.disagg_transfer_max_payload_size,
         server_args=server_args,
         glm_distributed_mode_enabled=glm_distributed_mode_enabled,
         **denoiser_options,

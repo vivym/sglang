@@ -24,7 +24,16 @@ import torch
 import zmq
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.disaggregation.boundary import (
+    DISAGG_ATTEMPT_ID_EXTRA_KEY,
+    partition_boundary_fields,
+    validate_boundary_fields,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.disaggregation.telemetry import (
+    cuda_events_elapsed_s,
+    log_disagg_receipt,
+)
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferTensorBuffer,
 )
@@ -39,6 +48,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.manager import (
     DiffusionTransferManager,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
+    DISAGG_REGISTRATION_HEARTBEAT_INTERVAL_S,
     TRANSFER_MAGIC,
     TransferAllocatedMsg,
     TransferDoneMsg,
@@ -50,7 +60,17 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    _normalize_audio_to_numpy,
+    attach_audio_to_video_sample,
+    expand_request_outputs,
+    materialize_output_sample,
+)
+from sglang.multimodal_gen.runtime.media_encoder import (
+    MediaEncoderClient,
+    SharedMemoryMediaStager,
+    StagedMediaPayload,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
@@ -66,6 +86,26 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
 logger = init_logger(__name__)
+
+
+_UPSTREAM_ROLE = {
+    RoleType.DENOISER: RoleType.ENCODER,
+    RoleType.DECODER: RoleType.DENOISER,
+}
+
+_DOWNSTREAM_ROLE = {
+    RoleType.ENCODER: RoleType.DENOISER,
+    RoleType.DENOISER: RoleType.DECODER,
+}
+
+
+@dataclasses.dataclass
+class _MediaEncodeQueueItem:
+    staged: StagedMediaPayload
+    completed_transfer_id: str
+    decoder_compute_s: float
+    materialize_s: float
+    staging_s: float
 
 
 def _advertised_pool_work_endpoint(server_args) -> str:
@@ -429,6 +469,59 @@ class SchedulerDisaggMixin:
     # Initialization
     # ------------------------------------------------------------------
 
+    def _extract_disagg_transfer_fields(
+        self: Scheduler,
+        req: Req,
+        *,
+        source_role: RoleType,
+        destination_role: RoleType,
+    ) -> tuple[dict, dict]:
+        """Combine generic ``Req`` fields with an explicit model boundary."""
+        if _DOWNSTREAM_ROLE.get(source_role) is not destination_role:
+            raise ValueError(
+                "invalid diffusion disaggregation role edge: "
+                f"{source_role.value!r} -> {destination_role.value!r}"
+            )
+        tensor_fields, scalar_fields = extract_transfer_fields(req)
+        pipeline = getattr(getattr(self, "worker", None), "pipeline", None)
+        filter_hook = getattr(pipeline, "filter_disagg_transfer_fields", None)
+        if filter_hook is not None:
+            filter_hook(
+                req,
+                source_role=source_role,
+                destination_role=destination_role,
+                tensor_fields=tensor_fields,
+                scalar_fields=scalar_fields,
+            )
+        hook = getattr(pipeline, "export_disagg_boundary", None)
+        if hook is None:
+            return tensor_fields, scalar_fields
+
+        boundary_tensors, boundary_scalars = hook(
+            req,
+            source_role=source_role,
+            destination_role=destination_role,
+        )
+        validate_boundary_fields(boundary_tensors, kind="tensor")
+        validate_boundary_fields(boundary_scalars, kind="scalar")
+        duplicate_names = set(boundary_tensors) & set(boundary_scalars)
+        if duplicate_names:
+            raise ValueError(
+                "disaggregation boundary fields cannot be both tensor and scalar: "
+                f"{sorted(duplicate_names)!r}"
+            )
+        collisions = (set(boundary_tensors) & set(tensor_fields)) | (
+            set(boundary_scalars) & set(scalar_fields)
+        )
+        if collisions:
+            raise ValueError(
+                "disaggregation boundary fields collide with generic request fields: "
+                f"{sorted(collisions)!r}"
+            )
+        tensor_fields.update(boundary_tensors)
+        scalar_fields.update(boundary_scalars)
+        return tensor_fields, scalar_fields
+
     def _init_disagg_state(self: Scheduler, server_args, local_rank: int) -> None:
         """Initialize all disaggregation state, sockets, and transfer infrastructure."""
         from sglang.multimodal_gen.runtime.disaggregation.metrics import DisaggMetrics
@@ -439,6 +532,9 @@ class SchedulerDisaggMixin:
         self._disagg_mode = getattr(server_args, "disagg_mode", False)
         self._pool_work_pull = None
         self._pool_result_push = None
+        self._registration_heartbeat_stop = None
+        self._registration_heartbeat_thread = None
+        self._registration_heartbeat_zmq = None
         self._transfer_manager = None
         self._transfer_stream = None
         self._rdma_push_queue = None
@@ -446,13 +542,65 @@ class SchedulerDisaggMixin:
         self._rdma_push_zmq = None
         self._compute_ready_queue = None
         self._recv_prefetch_thread = None
+        self._media_stager = None
+        self._media_encode_queue = None
+        self._media_encode_thread = None
 
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
             device = torch.device(f"{current_platform.device_type}:{local_rank}")
             self._transfer_stream = torch.get_device_module().Stream(device=device)
             self._init_disagg_sockets()
+            self._init_media_encoder_handoff()
             self._init_disagg_transfer_manager()
+
+    def _init_media_encoder_handoff(self: Scheduler) -> None:
+        endpoint = getattr(self.server_args, "disagg_media_encoder_endpoint", None)
+        if (
+            self.gpu_id != 0
+            or self._disagg_role != RoleType.DECODER
+            or endpoint is None
+        ):
+            return
+        probe = MediaEncoderClient(
+            endpoint,
+            timeout_s=1.0,
+            retries=0,
+            context=self.context,
+        )
+        startup_deadline = (
+            time.monotonic() + self.server_args.disagg_media_startup_timeout
+        )
+        while True:
+            remaining = startup_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "co-located CPU media encoder did not become ready at "
+                    f"{endpoint} within "
+                    f"{self.server_args.disagg_media_startup_timeout:g}s"
+                )
+            if probe.health(timeout_s=min(1.0, remaining)):
+                break
+            time.sleep(min(0.25, remaining))
+        slot_count = self.server_args.disagg_media_staging_slots
+        self._media_stager = SharedMemoryMediaStager(
+            self.server_args.disagg_media_shared_memory_root,
+            max_payload_bytes=self.server_args.disagg_media_max_payload_size,
+            max_slots=slot_count,
+        )
+        self._media_encode_queue = queue.Queue(maxsize=slot_count)
+        self._media_encode_thread = threading.Thread(
+            target=self._media_encode_loop,
+            daemon=True,
+            name="h3-media-encode",
+        )
+        self._media_encode_thread.start()
+        logger.info(
+            "Decoder media handoff enabled: endpoint=%s root=%s slots=%d",
+            endpoint,
+            self._media_stager.root,
+            slot_count,
+        )
 
     def _init_disagg_sockets(self: Scheduler):
         """Initialize ZMQ sockets for disaggregated mode (DiffusionServer-mediated).
@@ -506,9 +654,11 @@ class SchedulerDisaggMixin:
             self._preallocated_slots = {}
             register_msg = TransferRegisterMsg(
                 role=self._disagg_role.value,
+                transfer_backend="relay",
                 work_endpoint=_advertised_pool_work_endpoint(sa),
             )
             self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
+            self._start_disagg_registration_heartbeat(register_msg)
             self._compute_ready_queue = queue.Queue(maxsize=4)
             self._recv_prefetch_thread = threading.Thread(
                 target=self._recv_prefetch_loop,
@@ -534,6 +684,13 @@ class SchedulerDisaggMixin:
             hostname=hostname,
             gpu_id=physical_gpu_id,
             ib_device=ib_device,
+            backend=getattr(sa, "disagg_transfer_backend", "auto"),
+            listen_port=getattr(sa, "disagg_transfer_listen_port", 0),
+            timeout_s=getattr(sa, "disagg_transfer_timeout", 60.0),
+            max_payload_bytes=getattr(
+                sa, "disagg_transfer_max_payload_size", 256 * 1024 * 1024
+            ),
+            max_retries=getattr(sa, "disagg_transfer_retries", 1),
         )
 
         # Use GPU buffer when engine supports GPUDirect RDMA, CPU pinned otherwise
@@ -580,6 +737,7 @@ class SchedulerDisaggMixin:
         # --encoder/denoiser/decoder-urls ordering).
         register_msg = TransferRegisterMsg(
             role=self._disagg_role.value,
+            transfer_backend=engine.backend_name,
             session_id=self._transfer_manager.session_id,
             pool_ptr=self._transfer_manager.pool_data_ptr,
             pool_size=self._transfer_manager.pool_size,
@@ -587,9 +745,12 @@ class SchedulerDisaggMixin:
             preallocated_slots=preallocated_slot_info,
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
+        self._start_disagg_registration_heartbeat(register_msg)
         logger.info(
-            "Transfer %s: registered with DS (session=%s, pool=%d bytes, prealloc=%d)",
+            "Transfer %s: registered with DS (backend=%s, session=%s, "
+            "pool=%d bytes, prealloc=%d)",
             self._disagg_role.value.upper(),
+            engine.backend_name,
             self._transfer_manager.session_id,
             pool_size,
             len(preallocated_slot_info),
@@ -635,6 +796,62 @@ class SchedulerDisaggMixin:
     # Background threads
     # ------------------------------------------------------------------
 
+    def _start_disagg_registration_heartbeat(
+        self: Scheduler, register_msg: TransferRegisterMsg
+    ) -> None:
+        """Refresh role registration without sharing the main result socket."""
+        self._registration_heartbeat_stop = threading.Event()
+        frames = encode_transfer_msg(register_msg)
+        self._registration_heartbeat_thread = threading.Thread(
+            target=self._disagg_registration_heartbeat_loop,
+            args=(frames,),
+            daemon=True,
+            name=f"disagg-heartbeat-{self._disagg_role.value}",
+        )
+        self._registration_heartbeat_thread.start()
+
+    def _disagg_registration_heartbeat_loop(
+        self: Scheduler, frames: list[bytes]
+    ) -> None:
+        heartbeat_socket = None
+        try:
+            heartbeat_socket, _ = get_zmq_socket(
+                self.context,
+                zmq.PUSH,
+                self.server_args.pool_result_endpoint,
+                bind=False,
+                send_hwm=1,
+                send_timeout_ms=0,
+                linger_ms=0,
+                immediate=True,
+            )
+            self._registration_heartbeat_zmq = heartbeat_socket
+            while not self._registration_heartbeat_stop.wait(
+                DISAGG_REGISTRATION_HEARTBEAT_INTERVAL_S
+            ):
+                try:
+                    heartbeat_socket.send_multipart(frames, zmq.NOBLOCK)
+                except zmq.Again:
+                    logger.debug(
+                        "Disagg %s registration heartbeat dropped while head is unavailable",
+                        self._disagg_role.value.upper(),
+                    )
+        finally:
+            if heartbeat_socket is not None:
+                heartbeat_socket.close()
+            self._registration_heartbeat_zmq = None
+
+    def _stop_disagg_registration_heartbeat(self: Scheduler) -> None:
+        if self._registration_heartbeat_stop is not None:
+            self._registration_heartbeat_stop.set()
+        if self._registration_heartbeat_thread is not None:
+            self._registration_heartbeat_thread.join(timeout=5)
+            if self._registration_heartbeat_thread.is_alive():
+                logger.error("Timed out while stopping disagg registration heartbeat")
+            else:
+                self._registration_heartbeat_thread = None
+        self._registration_heartbeat_stop = None
+
     def _rdma_push_loop(self: Scheduler):
         """Background thread: execute RDMA push + notify DS.
 
@@ -646,28 +863,152 @@ class SchedulerDisaggMixin:
             item = self._rdma_push_queue.get()
             if item is None:
                 break  # Shutdown signal
-            request_id, dest_session_id, dest_addr, transfer_size = item
+            request_id, transfer_id, dest_session_id, dest_addr, transfer_size = item
+            error = None
+            push_started = time.monotonic()
             try:
                 success = self._transfer_manager.push_to_peer(
                     request_id=request_id,
                     dest_session_id=dest_session_id,
                     dest_addr=dest_addr,
                     transfer_size=transfer_size,
+                    transfer_id=transfer_id,
                 )
-                if success:
-                    self._transfer_manager.free_staged(request_id)
-
-                pushed_msg = TransferPushedMsg(request_id=request_id)
+                if not success:
+                    error = self._transfer_manager.last_error or "transfer push failed"
+            except Exception as exc:
+                success = False
+                error = str(exc)
+                logger.exception(
+                    "Transfer %s: push thread error for %s", role_name, request_id
+                )
+            finally:
+                self._transfer_manager.free_staged(request_id, transfer_id)
+                pushed_msg = TransferPushedMsg(
+                    request_id=request_id,
+                    transfer_id=transfer_id,
+                    error=error,
+                )
                 self._rdma_push_zmq.send_multipart(encode_transfer_msg(pushed_msg))
 
-                if not success:
-                    logger.error(
-                        "Transfer %s: RDMA push failed for %s", role_name, request_id
-                    )
-            except Exception:
-                logger.exception(
-                    "Transfer %s: RDMA push thread error for %s", role_name, request_id
+            log_disagg_receipt(
+                logger,
+                "tensor_wire_push",
+                request_id,
+                transfer_id=transfer_id,
+                role=role_name.lower(),
+                edge=(
+                    f"{self._disagg_role.value}_to_"
+                    f"{_DOWNSTREAM_ROLE[self._disagg_role].value}"
+                ),
+                backend=self._transfer_manager.backend_name,
+                payload_bytes=transfer_size,
+                wall_s=time.monotonic() - push_started,
+                status="ok" if success else "error",
+            )
+
+            if not success:
+                logger.error(
+                    "Transfer %s: push failed for %s: %s",
+                    role_name,
+                    request_id,
+                    error,
                 )
+
+    def _media_encode_loop(self: Scheduler) -> None:
+        """Encode staged CPU media without blocking the decoder GPU loop."""
+        client = MediaEncoderClient(
+            self.server_args.disagg_media_encoder_endpoint,
+            timeout_s=self.server_args.disagg_media_timeout,
+            retries=self.server_args.disagg_media_retries,
+            context=self.context,
+        )
+        result_socket, _ = get_zmq_socket(
+            self.context,
+            zmq.PUSH,
+            self.server_args.pool_result_endpoint,
+            bind=False,
+        )
+        try:
+            while True:
+                item = self._media_encode_queue.get()
+                if item is None:
+                    return
+                request_id = item.staged.request_id
+                media_started = time.monotonic()
+                scalar_fields = {
+                    "request_id": request_id,
+                    "_transfer_id": item.completed_transfer_id,
+                }
+                error = None
+                checksum_s = None
+                rpc_s = None
+                rpc_started = None
+                payload_bytes = None
+                output_bytes = None
+                try:
+                    checksum_started = time.monotonic()
+                    request = item.staged.request
+                    payload_bytes = request.payload_nbytes
+                    checksum_s = time.monotonic() - checksum_started
+                    rpc_started = time.monotonic()
+                    manifest = client.encode(request)
+                    rpc_s = time.monotonic() - rpc_started
+                    output_bytes = manifest.byte_size
+                    scalar_fields["media_manifest"] = manifest.to_dict()
+                except Exception as exc:
+                    error = str(exc)
+                    scalar_fields["error"] = error
+                    if rpc_started is not None:
+                        rpc_s = time.monotonic() - rpc_started
+                finally:
+                    item.staged.release()
+                    self._media_encode_queue.task_done()
+
+                try:
+                    send_tensors(result_socket, {}, scalar_fields)
+                except Exception:
+                    logger.exception(
+                        "Failed to return media completion for %s",
+                        request_id,
+                    )
+                    error = error or "failed to return media completion"
+
+                if self._disagg_metrics:
+                    if error:
+                        self._disagg_metrics.record_request_failed(request_id)
+                    else:
+                        self._disagg_metrics.record_request_complete(request_id)
+                    self._disagg_metrics.update_queue_depth(
+                        self._media_encode_queue.qsize()
+                    )
+                logger.info(
+                    "Decoder media completion for %s: compute=%.3fs "
+                    "materialize=%.3fs staging=%.3fs encode_rpc=%.3fs status=%s",
+                    request_id,
+                    item.decoder_compute_s,
+                    item.materialize_s,
+                    item.staging_s,
+                    time.monotonic() - media_started,
+                    "error" if error else "ok",
+                )
+                log_disagg_receipt(
+                    logger,
+                    "decoder_media_handoff",
+                    request_id,
+                    transfer_id=item.completed_transfer_id,
+                    decoder_compute_s=item.decoder_compute_s,
+                    materialize_s=item.materialize_s,
+                    shared_memory_stage_s=item.staging_s,
+                    checksum_finalize_s=checksum_s,
+                    media_rpc_s=rpc_s,
+                    payload_bytes=payload_bytes,
+                    output_bytes=output_bytes,
+                    total_background_s=time.monotonic() - media_started,
+                    status="error" if error else "ok",
+                )
+        finally:
+            result_socket.close(linger=0)
 
     def _recv_prefetch_loop(self: Scheduler):
         """Background thread: recv transfer messages and prefetch tensor loads.
@@ -721,11 +1062,14 @@ class SchedulerDisaggMixin:
         Called from the recv prefetch thread. Loads on _transfer_stream
         and builds the Req, so the main thread can start compute immediately.
 
-        Returns (req, load_event, request_id, prealloc_slot_id).
+        Returns (req, load_event, load_start_event, load_wall_started,
+        request_id, transfer_id, prealloc_slot_id, data_size).
         """
         request_id = msg["request_id"]
+        transfer_id = msg.get("transfer_id", "")
         manifest = msg.get("manifest", {})
         scalar_fields = msg.get("scalar_fields", {})
+        data_size = msg.get("data_size", 0)
 
         if self._disagg_metrics:
             self._disagg_metrics.record_request_start(request_id)
@@ -737,15 +1081,21 @@ class SchedulerDisaggMixin:
             and prealloc_slot_id in self._preallocated_slots
         ):
             slot = self._preallocated_slots[prealloc_slot_id]
-            self._transfer_manager.register_prealloc_as_receive(request_id, slot)
+            self._transfer_manager.register_prealloc_as_receive(
+                request_id, slot, data_size, transfer_id
+            )
 
         # Load tensors on transfer_stream (non-blocking)
         local_device = f"{current_platform.device_type}:{self.worker.local_rank}"
-        tensors, load_event = self._transfer_manager.load_tensors_async(
-            request_id,
-            manifest,
-            device=local_device,
-            stream=self._transfer_stream,
+        load_wall_started = time.monotonic()
+        tensors, load_event, load_start_event = (
+            self._transfer_manager.load_tensors_async(
+                request_id,
+                manifest,
+                device=local_device,
+                stream=self._transfer_stream,
+                transfer_id=transfer_id,
+            )
         )
 
         # NOTE: Do NOT free the receive slot here. The async load is still
@@ -761,7 +1111,16 @@ class SchedulerDisaggMixin:
         # running denoising loop on the main thread. Deferred to main thread
         # in _disagg_prefetch_event_loop, right before compute.
 
-        return req, load_event, request_id, prealloc_slot_id
+        return (
+            req,
+            load_event,
+            load_start_event,
+            load_wall_started,
+            request_id,
+            transfer_id,
+            prealloc_slot_id,
+            data_size,
+        )
 
     # ------------------------------------------------------------------
     # Broadcast
@@ -846,7 +1205,17 @@ class SchedulerDisaggMixin:
 
         if is_rank0:
             assert req is not None, "rank 0 must pass a loaded Req"
-            tensor_fields, scalar_fields = extract_transfer_fields(req)
+            role = self._disagg_role
+            source_role = _UPSTREAM_ROLE.get(role)
+            if source_role is None:
+                raise ValueError(
+                    f"cannot broadcast a rebuilt request for role {role.value!r}"
+                )
+            tensor_fields, scalar_fields = self._extract_disagg_transfer_fields(
+                req,
+                source_role=source_role,
+                destination_role=role,
+            )
             packed_tensors = _pack_tensor_fields_for_broadcast(tensor_fields)
         else:
             scalar_fields = None
@@ -929,20 +1298,40 @@ class SchedulerDisaggMixin:
 
                 if msg_type == "transfer_compute":
                     # Load already done by recv thread
-                    req, load_event, request_id, prealloc_slot_id = data
-                    # Wait for load to complete on compute stream
-                    if load_event is not None:
-                        torch.get_device_module().current_stream().wait_event(
-                            load_event
-                        )
-                    # Now safe to free the receive slot
-                    if prealloc_slot_id is not None:
-                        with self._transfer_manager._lock:
-                            self._transfer_manager._pending_receives.pop(
-                                request_id, None
-                            )
-                    else:
-                        self._transfer_manager.free_receive_slot(request_id)
+                    (
+                        req,
+                        load_event,
+                        load_start_event,
+                        load_wall_started,
+                        request_id,
+                        transfer_id,
+                        prealloc_slot_id,
+                        data_size,
+                    ) = data
+                    # The slot cannot be returned to the receive allocator until
+                    # the asynchronous H2D copy has completed; wait_event alone
+                    # would allow a new network receive to overwrite it.
+                    h2d_cuda_s = self._transfer_manager.complete_receive_copy(
+                        request_id,
+                        transfer_id,
+                        load_start_event,
+                        load_event,
+                    )
+                    log_disagg_receipt(
+                        logger,
+                        "tensor_h2d",
+                        request_id,
+                        transfer_id=transfer_id,
+                        role=role_name.lower(),
+                        edge=(
+                            f"{_UPSTREAM_ROLE[self._disagg_role].value}_to_"
+                            f"{self._disagg_role.value}"
+                        ),
+                        payload_bytes=data_size,
+                        cuda_s=h2d_cuda_s,
+                        wall_s=time.monotonic() - load_wall_started,
+                        status="ok",
+                    )
                     # Broadcast the full Req (scalar + tensor fields) to
                     # non-rank-0 ranks. Tensors ride NCCL on the SP/CFG/TP
                     # groups so downstream REPLICATED stages (e.g. denoising)
@@ -958,9 +1347,9 @@ class SchedulerDisaggMixin:
                         _init_disagg_request_scheduler(self, req)
                     # Run compute
                     if self._disagg_role == RoleType.DENOISER:
-                        self._disagg_denoiser_compute(req, request_id)
+                        self._disagg_denoiser_compute(req, request_id, transfer_id)
                     elif self._disagg_role == RoleType.DECODER:
-                        self._disagg_decoder_compute(req, request_id)
+                        self._disagg_decoder_compute(req, request_id, transfer_id)
 
                 elif msg_type == "transfer_control":
                     # alloc, push messages — handle on main thread (rank 0 only)
@@ -1146,6 +1535,7 @@ class SchedulerDisaggMixin:
 
     def _cleanup_disagg(self: Scheduler):
         """Clean up all pool mode resources (sockets, threads, transfer manager)."""
+        self._stop_disagg_registration_heartbeat()
         # Shutdown RDMA push thread
         if self._rdma_push_queue is not None:
             self._rdma_push_queue.put(None)
@@ -1156,6 +1546,21 @@ class SchedulerDisaggMixin:
         # Recv prefetch thread stops when self._running = False
         if self._recv_prefetch_thread is not None:
             self._recv_prefetch_thread.join(timeout=5)
+        # Drain media completions before closing the result endpoint and the
+        # shared ZMQ context. Each pending RPC remains bounded by its timeout.
+        if self._media_encode_queue is not None:
+            self._media_encode_queue.put(None)
+        if self._media_encode_thread is not None:
+            media_join_timeout = (
+                self.server_args.disagg_media_timeout
+                * (self.server_args.disagg_media_retries + 1)
+                + 5
+            )
+            self._media_encode_thread.join(timeout=media_join_timeout)
+            if self._media_encode_thread.is_alive():
+                logger.error("Timed out while draining decoder media handoff")
+        self._media_encode_queue = None
+        self._media_encode_thread = None
         if self._transfer_manager is not None:
             self._transfer_manager.cleanup()
         if self._pool_work_pull is not None:
@@ -1191,6 +1596,8 @@ class SchedulerDisaggMixin:
             self._handle_transfer_push(msg)
         elif msg_type == TransferMsgType.READY:
             self._handle_transfer_ready(msg)
+        elif msg_type == TransferMsgType.ABORT:
+            self._handle_transfer_abort(msg)
         else:
             logger.warning(
                 "Transfer %s: unknown message type %s",
@@ -1218,9 +1625,12 @@ class SchedulerDisaggMixin:
     def _handle_transfer_alloc(self: Scheduler, msg: dict) -> None:
         """Handle transfer_alloc: allocate a receive slot and reply with transfer_allocated."""
         request_id = msg["request_id"]
+        transfer_id = msg.get("transfer_id", "")
         data_size = msg.get("data_size", 0)
 
-        pending = self._transfer_manager.allocate_receive_slot(request_id, data_size)
+        pending = self._transfer_manager.allocate_receive_slot(
+            request_id, data_size, transfer_id
+        )
         if pending is None:
             logger.error(
                 "Transfer %s: failed to allocate receive slot for %s (%d bytes)",
@@ -1228,10 +1638,20 @@ class SchedulerDisaggMixin:
                 request_id,
                 data_size,
             )
+            allocated_msg = TransferAllocatedMsg(
+                request_id=request_id,
+                transfer_id=transfer_id,
+                transfer_backend=self._transfer_manager.backend_name,
+                error=self._transfer_manager.last_error
+                or "failed to allocate receive slot",
+            )
+            self._pool_result_push.send_multipart(encode_transfer_msg(allocated_msg))
             return
 
         allocated_msg = TransferAllocatedMsg(
             request_id=request_id,
+            transfer_id=transfer_id,
+            transfer_backend=self._transfer_manager.backend_name,
             session_id=self._transfer_manager.session_id,
             pool_ptr=self._transfer_manager.pool_data_ptr,
             slot_offset=pending.slot.offset,
@@ -1254,42 +1674,88 @@ class SchedulerDisaggMixin:
         Otherwise fall back to blocking push (e.g., during shutdown).
         """
         request_id = msg["request_id"]
+        transfer_id = msg.get("transfer_id", "")
         dest_session_id = msg.get("dest_session_id", "")
         dest_addr = msg.get("dest_addr", 0)
         transfer_size = msg.get("transfer_size", 0)
 
         if self._rdma_push_queue is not None:
             # Non-blocking: enqueue to RDMA push thread
-            self._rdma_push_queue.put(
-                (
-                    request_id,
-                    dest_session_id,
-                    dest_addr,
-                    transfer_size,
+            try:
+                self._rdma_push_queue.put_nowait(
+                    (
+                        request_id,
+                        transfer_id,
+                        dest_session_id,
+                        dest_addr,
+                        transfer_size,
+                    )
                 )
-            )
+            except queue.Full:
+                self._transfer_manager.free_staged(request_id, transfer_id)
+                pushed_msg = TransferPushedMsg(
+                    request_id=request_id,
+                    transfer_id=transfer_id,
+                    error="transfer push queue is full",
+                )
+                self._pool_result_push.send_multipart(encode_transfer_msg(pushed_msg))
             return
 
         # Fallback: blocking push on main thread
+        push_started = time.monotonic()
         success = self._transfer_manager.push_to_peer(
             request_id=request_id,
             dest_session_id=dest_session_id,
             dest_addr=dest_addr,
             transfer_size=transfer_size,
+            transfer_id=transfer_id,
         )
 
-        if success:
-            self._transfer_manager.free_staged(request_id)
-
-        pushed_msg = TransferPushedMsg(request_id=request_id)
+        self._transfer_manager.free_staged(request_id, transfer_id)
+        error = None if success else self._transfer_manager.last_error
+        pushed_msg = TransferPushedMsg(
+            request_id=request_id,
+            transfer_id=transfer_id,
+            error=error,
+        )
         self._pool_result_push.send_multipart(encode_transfer_msg(pushed_msg))
+
+        log_disagg_receipt(
+            logger,
+            "tensor_wire_push",
+            request_id,
+            transfer_id=transfer_id,
+            role=self._disagg_role.value,
+            edge=(
+                f"{self._disagg_role.value}_to_"
+                f"{_DOWNSTREAM_ROLE[self._disagg_role].value}"
+            ),
+            backend=self._transfer_manager.backend_name,
+            payload_bytes=transfer_size,
+            wall_s=time.monotonic() - push_started,
+            status="ok" if success else "error",
+        )
 
         if not success:
             logger.error(
-                "Transfer %s: RDMA push failed for %s",
+                "Transfer %s: push failed for %s: %s",
                 self._disagg_role.value.upper(),
                 request_id,
+                error,
             )
+
+    def _handle_transfer_abort(self: Scheduler, msg: dict) -> None:
+        """Release a dynamic receive slot after an upstream transfer failure."""
+        request_id = msg.get("request_id", "")
+        transfer_id = msg.get("transfer_id", "")
+        self._transfer_manager.free_staged(request_id, transfer_id)
+        self._transfer_manager.free_receive_slot(request_id, transfer_id)
+        logger.warning(
+            "Transfer %s: aborted receive for %s: %s",
+            self._disagg_role.value.upper(),
+            request_id,
+            msg.get("reason", ""),
+        )
 
     def _handle_transfer_ready(self: Scheduler, msg: dict) -> None:
         """Handle transfer_ready: load tensors from buffer, run compute, send result.
@@ -1304,8 +1770,10 @@ class SchedulerDisaggMixin:
         """
 
         request_id = msg["request_id"]
+        transfer_id = msg.get("transfer_id", "")
         manifest = msg.get("manifest", {})
         scalar_fields = msg.get("scalar_fields", {})
+        data_size = msg.get("data_size", 0)
         if self._disagg_metrics:
             self._disagg_metrics.record_request_start(request_id)
 
@@ -1316,15 +1784,21 @@ class SchedulerDisaggMixin:
             and prealloc_slot_id in self._preallocated_slots
         ):
             slot = self._preallocated_slots[prealloc_slot_id]
-            self._transfer_manager.register_prealloc_as_receive(request_id, slot)
+            self._transfer_manager.register_prealloc_as_receive(
+                request_id, slot, data_size, transfer_id
+            )
 
         # 1. Start load on transfer_stream (non-blocking)
         local_device = f"{current_platform.device_type}:{self.worker.local_rank}"
-        tensors, load_event = self._transfer_manager.load_tensors_async(
-            request_id,
-            manifest,
-            device=local_device,
-            stream=self._transfer_stream,
+        load_wall_started = time.monotonic()
+        tensors, load_event, load_start_event = (
+            self._transfer_manager.load_tensors_async(
+                request_id,
+                manifest,
+                device=local_device,
+                stream=self._transfer_stream,
+                transfer_id=transfer_id,
+            )
         )
 
         # 2. Build Req from scalar fields + tensors (CPU work, overlapped)
@@ -1334,29 +1808,40 @@ class SchedulerDisaggMixin:
         if self._disagg_role == RoleType.DENOISER:
             _init_disagg_request_scheduler(self, req)
 
-        # 4. Wait for load before compute (GPU must see the data)
-        if load_event is not None:
-            torch.get_device_module().current_stream().wait_event(load_event)
+        # 4. Complete H2D before returning its receive slot to the allocator.
+        h2d_cuda_s = self._transfer_manager.complete_receive_copy(
+            request_id,
+            transfer_id,
+            load_start_event,
+            load_event,
+        )
+        log_disagg_receipt(
+            logger,
+            "tensor_h2d",
+            request_id,
+            transfer_id=transfer_id,
+            role=self._disagg_role.value,
+            edge=(
+                f"{_UPSTREAM_ROLE[self._disagg_role].value}_to_"
+                f"{self._disagg_role.value}"
+            ),
+            payload_bytes=data_size,
+            cuda_s=h2d_cuda_s,
+            wall_s=time.monotonic() - load_wall_started,
+            status="ok",
+        )
 
-        # 5. Free receive slot after load completes (data is on compute GPU)
-        if prealloc_slot_id is not None:
-            # Pre-allocated slot: just remove from pending receives, don't free buffer
-            with self._transfer_manager._lock:
-                self._transfer_manager._pending_receives.pop(request_id, None)
-        else:
-            self._transfer_manager.free_receive_slot(request_id)
-
-        # 6. In multi-rank mode, broadcast the fully-loaded Req to the other
+        # 5. In multi-rank mode, broadcast the fully-loaded Req to the other
         # ranks so REPLICATED stages see identical inputs everywhere. See
         # the prefetch-loop variant for the matching receiver broadcast.
         if self._is_multi_rank():
             self._broadcast_req_to_all_ranks(req)
 
-        # 7. Run compute
+        # 6. Run compute
         if self._disagg_role == RoleType.DENOISER:
-            self._disagg_denoiser_compute(req, request_id)
+            self._disagg_denoiser_compute(req, request_id, transfer_id)
         elif self._disagg_role == RoleType.DECODER:
-            self._disagg_decoder_compute(req, request_id)
+            self._disagg_decoder_compute(req, request_id, transfer_id)
 
     # ------------------------------------------------------------------
     # Compute
@@ -1400,6 +1885,8 @@ class SchedulerDisaggMixin:
         """
         # Pop _trace_state before the generic setattr loop so it doesn't land
         # on the Req as a stray attribute.
+        scalar_fields, boundary_scalars = partition_boundary_fields(scalar_fields)
+        tensors, boundary_tensors = partition_boundary_fields(tensors)
         trace_state = scalar_fields.pop("_trace_state", None)
 
         req = object.__new__(Req)
@@ -1409,8 +1896,12 @@ class SchedulerDisaggMixin:
                 object.__setattr__(req, f.name, f.default)
             elif f.default_factory is not dataclasses.MISSING:
                 object.__setattr__(req, f.name, f.default_factory())
-        # Ensure sampling_params is not None so __getattr__ delegation works
-        object.__setattr__(req, "sampling_params", SamplingParams())
+        # Preserve model-specific sampling fields on their declared class. A
+        # base SamplingParams would make unknown fields land as dynamic Req
+        # attributes, while model stages read them from req.sampling_params.
+        pipeline = getattr(getattr(self, "worker", None), "pipeline", None)
+        sampling_params_cls = getattr(pipeline, "sampling_params_cls", SamplingParams)
+        object.__setattr__(req, "sampling_params", sampling_params_cls())
         # Restore _extra_* prefixed fields into req.extra dict
         extra_keys = [k for k in scalar_fields if k.startswith("_extra_")]
         for key in extra_keys:
@@ -1430,6 +1921,27 @@ class SchedulerDisaggMixin:
                 ]
             else:
                 req.generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        restore_hook = getattr(pipeline, "restore_disagg_boundary", None)
+        if restore_hook is not None:
+            destination_role = self._disagg_role
+            source_role = _UPSTREAM_ROLE.get(destination_role)
+            if source_role is None:
+                raise ValueError(
+                    "cannot restore a disaggregation boundary for role "
+                    f"{destination_role.value!r}"
+                )
+            restore_hook(
+                req,
+                source_role=source_role,
+                destination_role=destination_role,
+                tensor_fields=boundary_tensors,
+                scalar_fields=boundary_scalars,
+            )
+        elif boundary_tensors or boundary_scalars:
+            raise ValueError(
+                "received model-specific disaggregation boundary fields without "
+                "a pipeline restore hook"
+            )
         # Rebuild trace_ctx from the propagated __getstate__ dict so this role's
         # spans nest under the sender's trace (same mechanism SRT uses via pickle).
         if trace_state and trace_state.get("tracing_enable"):
@@ -1467,30 +1979,54 @@ class SchedulerDisaggMixin:
         with trace_slice(ctx, DiffStage.SCHEDULER_DISPATCH, thread_finish_flag=True):
             yield
 
-    def _disagg_denoiser_compute(self: Scheduler, req: Req, request_id: str) -> None:
+    def _disagg_denoiser_compute(
+        self: Scheduler, req: Req, request_id: str, completed_transfer_id: str
+    ) -> None:
         """Run denoiser compute in transfer mode, then stage output for decoder.
 
         Note: Scheduler timestep init is done in _handle_transfer_ready
         to overlap with tensor loading.
         """
+        # Bind opt-in model diagnostics to the concrete inbound transfer. This
+        # request-local field is removed by explicit boundary filters before
+        # the request is sent downstream.
+        req.extra[DISAGG_ATTEMPT_ID_EXTRA_KEY] = completed_transfer_id
+
         # Run denoising
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):
             result = self.worker.execute_forward([req], return_req=True)
         duration_s = time.monotonic() - start_time
+        log_disagg_receipt(
+            logger,
+            "role_compute",
+            request_id,
+            role="denoiser",
+            wall_s=duration_s,
+            status="ok" if isinstance(result, Req) else "error",
+        )
 
         if not isinstance(result, Req):
             error_msg = getattr(result, "error", "denoiser error")
-            done_msg = TransferDoneMsg(request_id=request_id, error=str(error_msg))
+            done_msg = TransferDoneMsg(
+                request_id=request_id,
+                completed_transfer_id=completed_transfer_id,
+                error=str(error_msg),
+            )
             self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
             if self._disagg_metrics:
                 self._disagg_metrics.record_request_failed(request_id)
             return
 
         # Stage denoiser output for decoder transfer (async staging)
-        tensor_fields, scalar_fields = extract_transfer_fields(result)
+        tensor_fields, scalar_fields = self._extract_disagg_transfer_fields(
+            result,
+            source_role=RoleType.DENOISER,
+            destination_role=RoleType.DECODER,
+        )
 
         # 1. Stage tensors on transfer_stream (non-blocking)
+        stage_wall_started = time.monotonic()
         staged, stage_event = self._transfer_manager.stage_tensors_async(
             request_id=request_id,
             tensor_fields=tensor_fields,
@@ -1501,6 +2037,7 @@ class SchedulerDisaggMixin:
         if staged is None:
             done_msg = TransferDoneMsg(
                 request_id=request_id,
+                completed_transfer_id=completed_transfer_id,
                 error="Failed to stage denoiser output for decoder",
             )
             self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
@@ -1512,19 +2049,34 @@ class SchedulerDisaggMixin:
         done_data = {
             "msg_type": "transfer_done",
             "request_id": request_id,
+            "completed_transfer_id": completed_transfer_id,
+            "transfer_id": staged.transfer_id,
             "staged_for_decoder": True,
+            "transfer_backend": self._transfer_manager.backend_name,
             "session_id": self._transfer_manager.session_id,
             "pool_ptr": self._transfer_manager.pool_data_ptr,
             "slot_offset": staged.slot.offset if staged.slot else 0,
-            "data_size": staged.slot.size if staged.slot else 0,
+            "data_size": staged.data_size,
             "manifest": staged.manifest,
             "scalar_fields": staged.scalar_fields,
         }
         msg_bytes = json.dumps(done_data, separators=(",", ":")).encode("utf-8")
 
         # 3. Wait for staging to complete before sending
-        if stage_event is not None:
-            stage_event.synchronize()
+        d2h_cuda_s = cuda_events_elapsed_s(staged.copy_start_event, stage_event)
+
+        log_disagg_receipt(
+            logger,
+            "tensor_d2h",
+            request_id,
+            transfer_id=staged.transfer_id,
+            role="denoiser",
+            edge="denoiser_to_decoder",
+            payload_bytes=staged.data_size,
+            cuda_s=d2h_cuda_s,
+            wall_s=time.monotonic() - stage_wall_started,
+            status="ok",
+        )
 
         # 4. Send transfer_done with staged info
         self._pool_result_push.send_multipart([TRANSFER_MAGIC, msg_bytes])
@@ -1596,13 +2148,10 @@ class SchedulerDisaggMixin:
             time.monotonic() - start_time,
         )
 
-    def _disagg_decoder_compute(self: Scheduler, req: Req, request_id: str) -> None:
-        """Run decoder compute in transfer mode, send result to DS.
-
-        Decoder result is sent as raw ZMQ multipart frames (same format as
-        relay mode) so DiffusionServer handles it via _handle_decoder_result_frames
-        without hex/JSON overhead.
-        """
+    def _disagg_decoder_compute(
+        self: Scheduler, req: Req, request_id: str, completed_transfer_id: str
+    ) -> None:
+        """Run decoder compute and return media completion to the head."""
 
         # Check for upstream error
         disagg_error = getattr(req, "_disagg_error", None)
@@ -1613,9 +2162,31 @@ class SchedulerDisaggMixin:
                     {},
                     {
                         "request_id": request_id,
+                        "_transfer_id": completed_transfer_id,
                         "error": f"Upstream error: {disagg_error}",
                     },
                 )
+            return
+
+        pipeline = getattr(self.worker, "pipeline", None)
+        is_minimax_h3 = getattr(pipeline, "pipeline_name", None) == "MiniMaxH3Pipeline"
+        if is_minimax_h3 and self._media_encode_queue is None:
+            error = (
+                "MiniMax H3 disaggregated decoder requires a co-located CPU "
+                "media encoder; raw frame return is forbidden"
+            )
+            if self._pool_result_push is not None:
+                send_tensors(
+                    self._pool_result_push,
+                    {},
+                    {
+                        "request_id": request_id,
+                        "_transfer_id": completed_transfer_id,
+                        "error": error,
+                    },
+                )
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_failed(request_id)
             return
 
         req.save_output = False
@@ -1625,15 +2196,96 @@ class SchedulerDisaggMixin:
         with self._disagg_trace_dispatch(req):
             output_batch = self.worker.execute_forward([req])
         duration_s = time.monotonic() - start_time
+        log_disagg_receipt(
+            logger,
+            "role_compute",
+            request_id,
+            role="decoder",
+            wall_s=duration_s,
+            status="ok" if output_batch.error is None else "error",
+        )
 
-        # Send result as raw ZMQ frames (no TRANSFER_MAGIC prefix).
-        # DiffusionServer will route it through _handle_decoder_result_frames,
-        # the same path as relay mode.
+        if self._media_encode_queue is not None and output_batch.error is None:
+            if not completed_transfer_id:
+                output_batch.error = "decoder media handoff requires a transfer ID"
+            elif output_batch.output is None or len(output_batch.output) != 1:
+                output_batch.error = (
+                    "decoder media handoff requires exactly one video output"
+                )
+            elif output_batch.audio is None or output_batch.audio_sample_rate is None:
+                output_batch.error = (
+                    "decoder media handoff requires audio and sample rate"
+                )
+            else:
+                staged = None
+                try:
+                    materialize_started = time.monotonic()
+                    sample = attach_audio_to_video_sample(
+                        output_batch.output[0], output_batch.audio, 0
+                    )
+                    materialized = materialize_output_sample(
+                        sample,
+                        req.data_type,
+                        req.fps,
+                    )
+                    audio = _normalize_audio_to_numpy(materialized.audio)
+                    if audio is None:
+                        raise ValueError("decoder audio could not be materialized")
+                    audio = np.ascontiguousarray(audio, dtype=np.float32)
+                    materialize_s = time.monotonic() - materialize_started
+                    staging_started = time.monotonic()
+                    staged = self._media_stager.stage(
+                        request_id=request_id,
+                        attempt_id=completed_transfer_id,
+                        frames=materialized.frames,
+                        audio=audio,
+                        fps=req.fps,
+                        audio_sample_rate=output_batch.audio_sample_rate,
+                        output_compression=req.output_compression,
+                        model_identity=getattr(
+                            self.worker.pipeline, "disagg_release_identity", None
+                        ),
+                    )
+                    staging_s = time.monotonic() - staging_started
+                    output_batch.output = None
+                    output_batch.audio = None
+                    materialized.sample = None
+                    materialized.frames.clear()
+                    materialized.audio = None
+                    self._media_encode_queue.put_nowait(
+                        _MediaEncodeQueueItem(
+                            staged=staged,
+                            completed_transfer_id=completed_transfer_id,
+                            decoder_compute_s=duration_s,
+                            materialize_s=materialize_s,
+                            staging_s=staging_s,
+                        )
+                    )
+                    if self._disagg_metrics:
+                        self._disagg_metrics.update_queue_depth(
+                            self._media_encode_queue.qsize()
+                        )
+                    logger.info(
+                        "Decoder staged %s for CPU media encoding in %.3fs",
+                        request_id,
+                        staging_s,
+                    )
+                    return
+                except Exception as exc:
+                    if staged is not None:
+                        staged.release()
+                    output_batch.error = f"decoder media staging failed: {exc}"
+
+        # Generic models retain the historical raw result path. MiniMax H3
+        # reaches this block only to report a decoder or staging error.
         tensor_fields = {}
-        scalar_fields = {"request_id": request_id}
-        if output_batch.output is not None:
+        scalar_fields = {
+            "request_id": request_id,
+            "_transfer_id": completed_transfer_id,
+        }
+        if output_batch.output is not None and not is_minimax_h3:
             tensor_fields["output"] = output_batch.output
-        if output_batch.audio is not None:
+        if output_batch.audio is not None and not is_minimax_h3:
             tensor_fields["audio"] = output_batch.audio
         if output_batch.audio_sample_rate is not None:
             scalar_fields["audio_sample_rate"] = output_batch.audio_sample_rate
@@ -1672,8 +2324,18 @@ class SchedulerDisaggMixin:
             self._disagg_metrics.record_request_start(request_id)
 
         # Run encoder stages
+        compute_started = time.monotonic()
         with self._disagg_trace_dispatch(req):
             req_result = self.worker.execute_forward(reqs, return_req=True)
+        compute_s = time.monotonic() - compute_started
+        log_disagg_receipt(
+            logger,
+            "role_compute",
+            request_id,
+            role="encoder",
+            wall_s=compute_s,
+            status="ok" if isinstance(req_result, Req) else "error",
+        )
 
         if not isinstance(req_result, Req):
             # Error — send error via scalar fields (rank 0 only)
@@ -1689,7 +2351,11 @@ class SchedulerDisaggMixin:
             return
 
         # Pack and send encoder output (rank 0 only sends)
-        tensor_fields, scalar_fields = extract_transfer_fields(req_result)
+        tensor_fields, scalar_fields = self._extract_disagg_transfer_fields(
+            req_result,
+            source_role=RoleType.ENCODER,
+            destination_role=RoleType.DENOISER,
+        )
 
         if self._pool_result_push is not None:
             if self._transfer_manager is not None:
@@ -1718,6 +2384,7 @@ class SchedulerDisaggMixin:
         Overlap staging with metadata JSON serialization.
         """
         # 1. Stage tensors on transfer_stream (non-blocking)
+        stage_wall_started = time.monotonic()
         staged, stage_event = self._transfer_manager.stage_tensors_async(
             request_id=request_id,
             tensor_fields=tensor_fields,
@@ -1739,7 +2406,9 @@ class SchedulerDisaggMixin:
         # 2. Build transfer metadata while staging runs (CPU work, overlapped)
         staged_msg = TransferStagedMsg(
             request_id=request_id,
-            data_size=staged.slot.size if staged.slot else 0,
+            transfer_id=staged.transfer_id,
+            data_size=staged.data_size,
+            transfer_backend=self._transfer_manager.backend_name,
             manifest=staged.manifest,
             session_id=self._transfer_manager.session_id,
             pool_ptr=self._transfer_manager.pool_data_ptr,
@@ -1748,8 +2417,20 @@ class SchedulerDisaggMixin:
         )
 
         # 3. Wait for staging to complete before sending (buffer must be ready)
-        if stage_event is not None:
-            stage_event.synchronize()
+        d2h_cuda_s = cuda_events_elapsed_s(staged.copy_start_event, stage_event)
+
+        log_disagg_receipt(
+            logger,
+            "tensor_d2h",
+            request_id,
+            transfer_id=staged.transfer_id,
+            role="encoder",
+            edge="encoder_to_denoiser",
+            payload_bytes=staged.data_size,
+            cuda_s=d2h_cuda_s,
+            wall_s=time.monotonic() - stage_wall_started,
+            status="ok",
+        )
 
         # 4. Send transfer staged message
         self._pool_result_push.send_multipart(encode_transfer_msg(staged_msg))

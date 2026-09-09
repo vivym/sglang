@@ -29,6 +29,8 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
     unpack_tensors,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
+    DISAGG_REGISTRATION_STALE_AFTER_S,
+    TransferAbortMsg,
     TransferAllocMsg,
     TransferMsgType,
     TransferPushMsg,
@@ -37,6 +39,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
+from sglang.multimodal_gen.runtime.media_encoder.protocol import MediaEncodeManifest
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -110,6 +113,10 @@ class _EncoderTTAEntry:
 
 @dataclass
 class _TransferRequestState:
+    transfer_id: str = ""
+    source_role: RoleType | None = None
+    destination_role: RoleType | None = None
+    sender_transfer_backend: str = ""
     sender_session_id: str = ""
     sender_pool_ptr: int = 0
     sender_slot_offset: int = 0
@@ -119,9 +126,15 @@ class _TransferRequestState:
     receiver_session_id: str = ""
     receiver_pool_ptr: int = 0
     receiver_slot_offset: int = 0
+    receiver_slot_size: int = 0
     sender_instance: int = -1
     receiver_instance: int = -1
     prealloc_slot_id: int | None = None
+    sender_capacity_released: bool = False
+    receiver_capacity_released: bool = False
+    push_completed: bool = False
+    ready_sent: bool = False
+    client_completed: bool = False
 
     def __post_init__(self):
         if self.manifest is None:
@@ -157,6 +170,9 @@ class DiffusionServer:
         denoiser_capacity_per_worker: int = 2,
         decoder_capacity: int = 4,
         p2p_mode: bool = True,
+        max_transfer_payload_bytes: int = 256 * 1024 * 1024,
+        max_pending_requests: int = 64,
+        control_queue_size: int = 64,
         server_args=None,
         glm_distributed_mode_enabled: bool = False,
     ):
@@ -172,6 +188,9 @@ class DiffusionServer:
         self._num_denoisers = len(denoiser_work_endpoints)
         self._num_decoders = len(decoder_work_endpoints)
         self._timeout_s = timeout_s
+        self._max_transfer_payload_bytes = max_transfer_payload_bytes
+        self._max_pending_requests = max_pending_requests
+        self._control_queue_size = control_queue_size
 
         self._tracker = RequestTracker()
         self._dispatcher = PoolDispatcher(
@@ -193,6 +212,7 @@ class DiffusionServer:
         self._encoder_free_slots = [encoder_capacity] * self._num_encoders
         self._denoiser_free_slots = [denoiser_capacity_per_worker] * self._num_denoisers
         self._decoder_free_slots = [decoder_capacity] * self._num_decoders
+        self._orphaned_compute_slots: dict[str, tuple[RoleType, int]] = {}
 
         # TTA queues per role type
         self._encoder_tta: deque[_EncoderTTAEntry] = deque()
@@ -277,6 +297,40 @@ class DiffusionServer:
         """Block until the event loop has bound all sockets, or *timeout* elapses."""
         return self._ready.wait(timeout=timeout)
 
+    def registration_readiness(self) -> dict:
+        """Return whether every configured role endpoint registered recently."""
+        now = time.monotonic()
+
+        def fresh_count(peers: dict[int, dict]) -> int:
+            return sum(
+                now - peer.get("registered_at", float("-inf"))
+                <= DISAGG_REGISTRATION_STALE_AFTER_S
+                for peer in peers.values()
+            )
+
+        roles = {
+            "encoder": {
+                "configured": self._num_encoders,
+                "registered": fresh_count(self._encoder_peers),
+            },
+            "denoiser": {
+                "configured": self._num_denoisers,
+                "registered": fresh_count(self._denoiser_peers),
+            },
+            "decoder": {
+                "configured": self._num_decoders,
+                "registered": fresh_count(self._decoder_peers),
+            },
+        }
+        ready = all(
+            counts["registered"] == counts["configured"] for counts in roles.values()
+        )
+        return {
+            "status": "ok" if ready else "not_ready",
+            "ready": ready,
+            "roles": roles,
+        }
+
     def stop(self) -> None:
         self._running = False
         if self._thread is not None:
@@ -289,18 +343,43 @@ class DiffusionServer:
 
     def _event_loop(self) -> None:
         frontend, _ = get_zmq_socket(
-            self._context, zmq.ROUTER, self._frontend_endpoint, bind=True
+            self._context,
+            zmq.ROUTER,
+            self._frontend_endpoint,
+            bind=True,
+            send_hwm=self._control_queue_size,
+            recv_hwm=self._max_pending_requests,
+            send_timeout_ms=0,
+            linger_ms=0,
         )
 
         encoder_pushes: list[zmq.Socket] = []
         for i, ep in enumerate(self._encoder_work_endpoints):
-            sock, _ = get_zmq_socket(self._context, zmq.PUSH, ep, bind=False)
+            sock, _ = get_zmq_socket(
+                self._context,
+                zmq.PUSH,
+                ep,
+                bind=False,
+                send_hwm=self._control_queue_size,
+                send_timeout_ms=0,
+                linger_ms=0,
+                immediate=True,
+            )
             encoder_pushes.append(sock)
 
         denoiser_pushes: list[zmq.Socket] = []
         denoiser_monitors: list[zmq.Socket] = []
         for i, ep in enumerate(self._denoiser_work_endpoints):
-            sock, _ = get_zmq_socket(self._context, zmq.PUSH, ep, bind=False)
+            sock, _ = get_zmq_socket(
+                self._context,
+                zmq.PUSH,
+                ep,
+                bind=False,
+                send_hwm=self._control_queue_size,
+                send_timeout_ms=0,
+                linger_ms=0,
+                immediate=True,
+            )
             denoiser_pushes.append(sock)
             if self._glm_distributed_state is not None:
                 denoiser_monitors.append(
@@ -311,17 +390,41 @@ class DiffusionServer:
 
         decoder_pushes: list[zmq.Socket] = []
         for i, ep in enumerate(self._decoder_work_endpoints):
-            sock, _ = get_zmq_socket(self._context, zmq.PUSH, ep, bind=False)
+            sock, _ = get_zmq_socket(
+                self._context,
+                zmq.PUSH,
+                ep,
+                bind=False,
+                send_hwm=self._control_queue_size,
+                send_timeout_ms=0,
+                linger_ms=0,
+                immediate=True,
+            )
             decoder_pushes.append(sock)
 
         encoder_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._encoder_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._encoder_result_endpoint,
+            bind=True,
+            recv_hwm=self._control_queue_size,
+            linger_ms=0,
         )
         denoiser_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._denoiser_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._denoiser_result_endpoint,
+            bind=True,
+            recv_hwm=self._control_queue_size,
+            linger_ms=0,
         )
         decoder_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._decoder_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._decoder_result_endpoint,
+            bind=True,
+            recv_hwm=self._control_queue_size,
+            linger_ms=0,
         )
 
         poller = zmq.Poller()
@@ -418,6 +521,13 @@ class DiffusionServer:
         disagg_error = scalar_fields.get("_disagg_error")
 
         if request_id and disagg_error:
+            if self._release_orphaned_compute_slot(request_id, role):
+                return
+            record = self._tracker.get(request_id)
+            if record is not None:
+                active_slot = self._active_compute_slot(record)
+                if active_slot is not None and active_slot[0] == role:
+                    self._release_role_capacity(*active_slot)
             logger.error(
                 "DiffusionServer: %s error for %s: %s",
                 role.value,
@@ -458,17 +568,29 @@ class DiffusionServer:
         if not isinstance(reqs, list):
             reqs = [reqs]
 
+        if not reqs:
+            self._send_rejection(frontend, client_identity, "request batch is empty")
+            return
         req = reqs[0]
 
-        if isinstance(req, dict) or not hasattr(req, "request_id"):
-            # Send empty reply so REQ socket doesn't hang
+        if isinstance(req, dict):
+            if req.get("method") == "disagg_registration_readiness":
+                response = self.registration_readiness()
+            elif req.get("method") == "ping":
+                response = {"status": "ok"}
+            else:
+                response = {"status": "ignored"}
             try:
                 frontend.send_multipart(
-                    [client_identity, b"", pickle.dumps({"status": "ignored"})],
+                    [client_identity, b"", pickle.dumps(response)],
                     zmq.NOBLOCK,
                 )
             except zmq.Again:
                 pass
+            return
+
+        if not hasattr(req, "request_id"):
+            self._send_rejection(frontend, client_identity, "unsupported request type")
             return
 
         request_id = getattr(req, "request_id", None)
@@ -479,9 +601,20 @@ class DiffusionServer:
             self._tracker.submit(request_id)
         except ValueError:
             logger.warning("DiffusionServer: duplicate request_id %s", request_id)
+            self._send_rejection(
+                frontend, client_identity, f"duplicate request_id {request_id!r}"
+            )
             return
 
         with self._lock:
+            if len(self._pending) >= self._max_pending_requests:
+                self._tracker.remove(request_id)
+                self._send_rejection(
+                    frontend,
+                    client_identity,
+                    "disaggregated serving admission queue is full",
+                )
+                return
             self._pending[request_id] = client_identity
 
         try:
@@ -515,6 +648,20 @@ class DiffusionServer:
             "DiffusionServer: queued %s to encoder_tta",
             request_id,
         )
+
+    @staticmethod
+    def _send_rejection(
+        frontend: zmq.Socket, client_identity: bytes, error: str
+    ) -> None:
+        try:
+            frontend.send_multipart(
+                [client_identity, b"", pickle.dumps(OutputBatch(error=error))],
+                zmq.NOBLOCK,
+            )
+        except zmq.ZMQError:
+            logger.warning(
+                "DiffusionServer: failed to send request rejection: %s", error
+            )
 
     def _dispatch_glm_ar_batch_if_ready(self) -> None:
         """Dispatch one compatible batch to the external AR server."""
@@ -761,17 +908,70 @@ class DiffusionServer:
             return
 
         logger.debug("DiffusionServer: decoder result %s", request_id)
+        tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
+        completed_transfer_id = scalar_fields.get("_transfer_id", "")
+        p2p = self._transfer_state.get(request_id)
+        if p2p is not None:
+            if (
+                p2p.destination_role != RoleType.DECODER
+                or completed_transfer_id != p2p.transfer_id
+            ):
+                logger.warning(
+                    "DiffusionServer transfer: stale decoder result for %s "
+                    "(transfer=%r)",
+                    request_id,
+                    completed_transfer_id,
+                )
+                return
+            self._release_transfer_receiver_capacity(p2p)
+            self._recycle_prealloc_slot(p2p, RoleType.DECODER)
+            if p2p.client_completed:
+                self._transfer_state.pop(request_id, None)
+                return
+        elif self._release_orphaned_compute_slot(request_id, RoleType.DECODER):
+            return
+
         record = self._tracker.get(request_id)
-        if record and record.decoder_instance is not None:
+        if p2p is None and record and record.decoder_instance is not None:
             self._decoder_free_slots[record.decoder_instance] += 1
 
-        tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
+        error = scalar_fields.get("error")
+        media_manifest = None
+        raw_manifest = scalar_fields.get("media_manifest")
+        if raw_manifest is not None:
+            try:
+                if error:
+                    raise ValueError(
+                        "decoder completion cannot contain both manifest and error"
+                    )
+                parsed_manifest = MediaEncodeManifest.from_dict(raw_manifest)
+                if (
+                    parsed_manifest.request_id != request_id
+                    or parsed_manifest.attempt_id != completed_transfer_id
+                ):
+                    raise ValueError(
+                        "media manifest identity does not match decoder completion"
+                    )
+                if tensor_fields:
+                    raise ValueError(
+                        "decoder completion cannot contain both media manifest and tensors"
+                    )
+                media_manifest = parsed_manifest.to_dict()
+            except ValueError as exc:
+                error = f"invalid decoder media manifest: {exc}"
+                media_manifest = None
+
+        if error:
+            tensor_fields = {}
+        elif media_manifest is None and not tensor_fields:
+            error = "decoder completion contains neither tensors nor media manifest"
 
         output_batch = OutputBatch(
             output=tensor_fields.get("output"),
             audio=tensor_fields.get("audio"),
             audio_sample_rate=scalar_fields.get("audio_sample_rate"),
-            error=scalar_fields.get("error"),
+            media_manifest=media_manifest,
+            error=error,
         )
 
         try:
@@ -842,7 +1042,10 @@ class DiffusionServer:
     def _drain_encoder_tta(self) -> None:
         while self._encoder_tta:
             idx = self._dispatcher.select_encoder_with_capacity(
-                self._encoder_free_slots
+                [
+                    slots if index in self._encoder_peers else 0
+                    for index, slots in enumerate(self._encoder_free_slots)
+                ]
             )
             if idx is None:
                 break
@@ -852,7 +1055,10 @@ class DiffusionServer:
     def _drain_denoiser_tta(self) -> None:
         while self._denoiser_tta:
             idx = self._dispatcher.select_denoiser_with_capacity(
-                self._denoiser_free_slots
+                [
+                    slots if index in self._denoiser_peers else 0
+                    for index, slots in enumerate(self._denoiser_free_slots)
+                ]
             )
             if idx is None:
                 break
@@ -864,7 +1070,10 @@ class DiffusionServer:
     def _drain_decoder_tta(self) -> None:
         while self._decoder_tta:
             idx = self._dispatcher.select_decoder_with_capacity(
-                self._decoder_free_slots
+                [
+                    slots if index in self._decoder_peers else 0
+                    for index, slots in enumerate(self._decoder_free_slots)
+                ]
             )
             if idx is None:
                 break
@@ -912,16 +1121,24 @@ class DiffusionServer:
     def _handle_timeouts(self) -> None:
         timed_out = self._tracker.find_timed_out(self._timeout_s)
         for request_id in timed_out:
-            # Free the slot for the timed-out request
             record = self._tracker.get(request_id)
-            if record:
-                self._free_slot_for_record(record)
-
-            self._complete_with_error(
-                request_id,
+            error = (
                 f"DiffusionServer timeout: request {request_id} "
-                f"not completed within {self._timeout_s}s",
+                f"not completed within {self._timeout_s}s"
             )
+            p2p = self._transfer_state.get(request_id)
+            if p2p is not None:
+                self._fail_active_transfer(request_id, p2p, error)
+                continue
+
+            if record is not None:
+                active_slot = self._active_compute_slot(record)
+                if active_slot is not None:
+                    # No cancellation acknowledgement exists for a role that is
+                    # still computing. Quarantine its capacity until a late
+                    # result proves the worker has actually finished.
+                    self._orphaned_compute_slots[request_id] = active_slot
+            self._complete_with_error(request_id, error)
 
         if timed_out:
             timed_set = set(timed_out)
@@ -954,23 +1171,32 @@ class DiffusionServer:
                         if request.worker_idx is not None:
                             self._denoiser_free_slots[request.worker_idx] = 1
 
-    def _free_slot_for_record(self, record) -> None:
+    @staticmethod
+    def _active_compute_slot(record) -> tuple[RoleType, int] | None:
         if (
-            record.state in (RequestState.ENCODER_RUNNING, RequestState.ENCODER_DONE)
+            record.state == RequestState.ENCODER_RUNNING
             and record.encoder_instance is not None
         ):
-            self._encoder_free_slots[record.encoder_instance] += 1
+            return RoleType.ENCODER, record.encoder_instance
         if (
-            record.state
-            in (RequestState.DENOISING_RUNNING, RequestState.DENOISING_DONE)
+            record.state == RequestState.DENOISING_RUNNING
             and record.denoiser_instance is not None
         ):
-            self._denoiser_free_slots[record.denoiser_instance] += 1
+            return RoleType.DENOISER, record.denoiser_instance
         if (
             record.state == RequestState.DECODER_RUNNING
             and record.decoder_instance is not None
         ):
-            self._decoder_free_slots[record.decoder_instance] += 1
+            return RoleType.DECODER, record.decoder_instance
+        return None
+
+    def _release_orphaned_compute_slot(self, request_id: str, role: RoleType) -> bool:
+        orphan = self._orphaned_compute_slots.get(request_id)
+        if orphan is None or orphan[0] != role:
+            return False
+        self._orphaned_compute_slots.pop(request_id, None)
+        self._release_role_capacity(*orphan)
+        return True
 
     def _handle_transfer_result(self, frames: list, role: RoleType) -> None:
         try:
@@ -984,11 +1210,11 @@ class DiffusionServer:
         if msg_type == TransferMsgType.REGISTER:
             self._handle_transfer_register(msg)
         elif msg_type == TransferMsgType.STAGED:
-            self._handle_transfer_staged(msg)
+            self._handle_transfer_staged(msg, role)
         elif msg_type == TransferMsgType.ALLOCATED:
-            self._handle_transfer_allocated(msg)
+            self._handle_transfer_allocated(msg, role)
         elif msg_type == TransferMsgType.PUSHED:
-            self._handle_transfer_pushed(msg)
+            self._handle_transfer_pushed(msg, role)
         elif msg_type == TransferMsgType.DONE:
             self._handle_transfer_done(msg, role)
         else:
@@ -1033,13 +1259,37 @@ class DiffusionServer:
             )
             return
 
+        registered_at = time.monotonic()
         info = {
+            "transfer_backend": msg.get("transfer_backend", ""),
             "session_id": msg.get("session_id", ""),
             "pool_ptr": msg.get("pool_ptr", 0),
             "pool_size": msg.get("pool_size", 0),
             "work_endpoint": work_endpoint,
+            "registered_at": registered_at,
         }
         prealloc = msg.get("preallocated_slots", [])
+        if info["transfer_backend"] not in {"mock", "mooncake", "relay", "tcp"}:
+            logger.error(
+                "DiffusionServer transfer: invalid backend in %s[%d] registration: %r",
+                role.value,
+                idx,
+                info["transfer_backend"],
+            )
+            return
+        current = peers.get(idx)
+        if current is not None and current.get("session_id") == info["session_id"]:
+            # A heartbeat must not resurrect receive slots currently assigned
+            # to active transfers. All other session state is immutable.
+            current["registered_at"] = registered_at
+            logger.debug(
+                "DiffusionServer transfer: refreshed %s[%d] session=%s",
+                role.value,
+                idx,
+                info["session_id"],
+            )
+            return
+
         info["free_preallocated_slots"] = list(prealloc)
         peers[idx] = info
         if role == RoleType.DENOISER and self._glm_distributed_state is not None:
@@ -1056,17 +1306,85 @@ class DiffusionServer:
             len(prealloc),
         )
 
-    def _handle_transfer_staged(self, msg: dict) -> None:
+    def _handle_transfer_staged(self, msg: dict, role: RoleType) -> None:
         request_id = msg["request_id"]
         logger.debug("DiffusionServer transfer: encoder staged %s", request_id)
+        transfer_id = msg.get("transfer_id", "")
+        if role != RoleType.ENCODER:
+            logger.warning(
+                "DiffusionServer transfer: ignoring staged message from %s for %s",
+                role.value,
+                request_id,
+            )
+            return
         record = self._tracker.get(request_id)
-        encoder_idx = record.encoder_instance if record else 0
+        if record is None or record.state != RequestState.ENCODER_RUNNING:
+            orphan = self._orphaned_compute_slots.pop(request_id, None)
+            if orphan is not None and orphan[0] == RoleType.ENCODER:
+                self._encoder_free_slots[orphan[1]] += 1
+                self._send_abort_best_effort(
+                    RoleType.ENCODER,
+                    orphan[1],
+                    request_id,
+                    transfer_id,
+                    "request completed before encoder staging finished",
+                )
+            else:
+                logger.warning(
+                    "DiffusionServer transfer: stale staged message for %s",
+                    request_id,
+                )
+            return
+        encoder_idx = record.encoder_instance
+        assert encoder_idx is not None
+        existing = self._transfer_state.get(request_id)
+        if existing is not None:
+            if existing.transfer_id == transfer_id:
+                logger.debug(
+                    "DiffusionServer transfer: duplicate staged message for %s",
+                    request_id,
+                )
+                return
+            self._fail_active_transfer(
+                request_id,
+                existing,
+                f"conflicting staged transfer for request {request_id!r}",
+            )
+            return
+        data_size = msg.get("data_size", 0)
+        if (
+            not isinstance(transfer_id, str)
+            or not transfer_id
+            or isinstance(data_size, bool)
+            or not isinstance(data_size, int)
+            or data_size <= 0
+            or data_size > self._max_transfer_payload_bytes
+        ):
+            if record and record.encoder_instance is not None:
+                self._encoder_free_slots[record.encoder_instance] += 1
+                if isinstance(transfer_id, str) and transfer_id:
+                    self._send_abort_best_effort(
+                        RoleType.ENCODER,
+                        record.encoder_instance,
+                        request_id,
+                        transfer_id,
+                        "invalid encoder staged transfer metadata",
+                    )
+            self._complete_with_error(
+                request_id,
+                "invalid encoder staged transfer metadata",
+            )
+            return
 
         p2p = _TransferRequestState(
+            transfer_id=transfer_id,
+            source_role=RoleType.ENCODER,
+            destination_role=RoleType.DENOISER,
+            sender_transfer_backend=msg.get("transfer_backend", ""),
             sender_session_id=msg.get("session_id", ""),
             sender_pool_ptr=msg.get("pool_ptr", 0),
             sender_slot_offset=msg.get("slot_offset", 0),
-            data_size=msg.get("data_size", 0),
+            data_size=data_size,
             manifest=msg.get("manifest", {}),
             scalar_fields=msg.get("scalar_fields", {}),
             sender_instance=encoder_idx,
@@ -1112,10 +1430,12 @@ class DiffusionServer:
         p2p.receiver_session_id = receiver_peer_info.get("session_id", "")
         p2p.receiver_pool_ptr = receiver_peer_info.get("pool_ptr", 0)
         p2p.receiver_slot_offset = slot_info["offset"]
+        p2p.receiver_slot_size = slot_info["size"]
         p2p.prealloc_slot_id = slot_info.get("slot_id")
 
         push_msg = TransferPushMsg(
             request_id=request_id,
+            transfer_id=p2p.transfer_id,
             dest_session_id=p2p.receiver_session_id,
             dest_addr=slot_info["addr"],
             transfer_size=p2p.data_size,
@@ -1148,6 +1468,7 @@ class DiffusionServer:
         """
         alloc_msg = TransferAllocMsg(
             request_id=request_id,
+            transfer_id=p2p.transfer_id,
             data_size=p2p.data_size,
             source_role=source_role,
         )
@@ -1169,6 +1490,16 @@ class DiffusionServer:
             pass
 
         peer_info = self._denoiser_peers.get(denoiser_idx, {})
+        receiver_backend = peer_info.get("transfer_backend")
+        if receiver_backend and receiver_backend != p2p.sender_transfer_backend:
+            self._fail_active_transfer(
+                request_id,
+                p2p,
+                "encoder and denoiser transfer backends differ: "
+                f"{p2p.sender_transfer_backend!r} != {receiver_backend!r}",
+                abort_receiver=False,
+            )
+            return
         if not self._try_fast_path_push(
             request_id=request_id,
             p2p=p2p,
@@ -1185,7 +1516,7 @@ class DiffusionServer:
                 source_role="encoder",
             )
 
-    def _handle_transfer_allocated(self, msg: dict) -> None:
+    def _handle_transfer_allocated(self, msg: dict, role: RoleType) -> None:
         request_id = msg["request_id"]
         p2p = self._transfer_state.get(request_id)
         if p2p is None:
@@ -1193,14 +1524,43 @@ class DiffusionServer:
                 "DiffusionServer transfer: no state for allocated %s", request_id
             )
             return
+        transfer_id = msg.get("transfer_id", "")
+        if transfer_id != p2p.transfer_id or role != p2p.destination_role:
+            logger.warning(
+                "DiffusionServer transfer: stale allocated message for %s "
+                "(transfer=%r role=%s)",
+                request_id,
+                transfer_id,
+                role.value,
+            )
+            return
+        error = msg.get("error")
+        if error:
+            self._fail_active_transfer(
+                request_id,
+                p2p,
+                f"receiver allocation failed: {error}",
+            )
+            return
 
         p2p.receiver_session_id = msg.get("session_id", "")
+        receiver_backend = msg.get("transfer_backend", "")
+        if receiver_backend != p2p.sender_transfer_backend:
+            self._fail_active_transfer(
+                request_id,
+                p2p,
+                "sender and receiver transfer backends differ: "
+                f"{p2p.sender_transfer_backend!r} != {receiver_backend!r}",
+            )
+            return
         p2p.receiver_pool_ptr = msg.get("pool_ptr", 0)
         p2p.receiver_slot_offset = msg.get("slot_offset", 0)
+        p2p.receiver_slot_size = msg.get("slot_size", 0)
 
         dest_addr = p2p.receiver_pool_ptr + p2p.receiver_slot_offset
         push_msg = TransferPushMsg(
             request_id=request_id,
+            transfer_id=p2p.transfer_id,
             dest_session_id=p2p.receiver_session_id,
             dest_addr=dest_addr,
             transfer_size=p2p.data_size,
@@ -1220,7 +1580,7 @@ class DiffusionServer:
                 encode_transfer_msg(push_msg)
             )
 
-    def _handle_transfer_pushed(self, msg: dict) -> None:
+    def _handle_transfer_pushed(self, msg: dict, role: RoleType) -> None:
         request_id = msg["request_id"]
         logger.debug("DiffusionServer transfer: pushed %s", request_id)
         p2p = self._transfer_state.get(request_id)
@@ -1229,50 +1589,59 @@ class DiffusionServer:
                 "DiffusionServer transfer: no state for pushed %s", request_id
             )
             return
+        transfer_id = msg.get("transfer_id", "")
+        if transfer_id != p2p.transfer_id or role != p2p.source_role:
+            logger.warning(
+                "DiffusionServer transfer: stale pushed message for %s "
+                "(transfer=%r role=%s)",
+                request_id,
+                transfer_id,
+                role.value,
+            )
+            return
+        if p2p.push_completed:
+            logger.debug(
+                "DiffusionServer transfer: duplicate pushed message for %s",
+                request_id,
+            )
+            return
+        error = msg.get("error")
+        if error:
+            self._fail_active_transfer(
+                request_id, p2p, f"tensor transfer failed: {error}"
+            )
+            return
 
-        # Use record state (not sender_idx) to determine sender role,
-        # because encoder and denoiser can share the same instance index.
-        record = self._tracker.get(request_id)
-        if record and record.state in (
-            RequestState.DENOISING_RUNNING,
-            RequestState.DENOISING_WAITING,
-            RequestState.DENOISING_DONE,
-        ):
-            if record.encoder_instance is not None:
-                self._encoder_free_slots[record.encoder_instance] += 1
-        elif record and record.state in (
-            RequestState.DECODER_RUNNING,
-            RequestState.DECODER_WAITING,
-        ):
-            if record.denoiser_instance is not None:
-                self._denoiser_free_slots[record.denoiser_instance] += 1
+        p2p.push_completed = True
+        self._release_transfer_sender_capacity(p2p)
 
         scalar_fields = dict(p2p.scalar_fields) if p2p.scalar_fields else {}
         if p2p.prealloc_slot_id is not None:
             scalar_fields["_prealloc_slot_id"] = p2p.prealloc_slot_id
         ready_msg = TransferReadyMsg(
             request_id=request_id,
+            transfer_id=p2p.transfer_id,
+            data_size=p2p.data_size,
             manifest=p2p.manifest,
             slot_offset=p2p.receiver_slot_offset,
             scalar_fields=scalar_fields,
         )
 
         receiver_idx = p2p.receiver_instance
-        record = self._tracker.get(request_id)
-        if record and record.state in (
-            RequestState.DENOISING_RUNNING,
-            RequestState.DENOISING_WAITING,
-        ):
+        if p2p.destination_role == RoleType.DENOISER:
             self._denoiser_pushes[receiver_idx].send_multipart(
                 encode_transfer_msg(ready_msg)
             )
-        elif record and record.state in (
-            RequestState.DECODER_RUNNING,
-            RequestState.DECODER_WAITING,
-        ):
+        elif p2p.destination_role == RoleType.DECODER:
             self._decoder_pushes[receiver_idx].send_multipart(
                 encode_transfer_msg(ready_msg)
             )
+        else:
+            self._fail_active_transfer(
+                request_id, p2p, "transfer has no valid receiver role"
+            )
+            return
+        p2p.ready_sent = True
 
         logger.debug(
             "DiffusionServer transfer: notified receiver for %s (data ready)",
@@ -1295,12 +1664,108 @@ class DiffusionServer:
         free_list.append(
             {
                 "offset": p2p.receiver_slot_offset,
-                "size": p2p.data_size,
+                "size": p2p.receiver_slot_size,
                 "slot_id": p2p.prealloc_slot_id,
                 "addr": p2p.receiver_pool_ptr + p2p.receiver_slot_offset,
             }
         )
         p2p.prealloc_slot_id = None
+
+    def _release_role_capacity(self, role: RoleType, instance: int) -> None:
+        if role == RoleType.ENCODER:
+            slots = self._encoder_free_slots
+        elif role == RoleType.DENOISER:
+            slots = self._denoiser_free_slots
+        elif role == RoleType.DECODER:
+            slots = self._decoder_free_slots
+        else:
+            return
+        if 0 <= instance < len(slots):
+            slots[instance] += 1
+
+    def _release_transfer_sender_capacity(self, p2p: _TransferRequestState) -> None:
+        if p2p.sender_capacity_released or p2p.source_role is None:
+            return
+        self._release_role_capacity(p2p.source_role, p2p.sender_instance)
+        p2p.sender_capacity_released = True
+
+    def _release_transfer_receiver_capacity(self, p2p: _TransferRequestState) -> None:
+        if p2p.receiver_capacity_released or p2p.destination_role is None:
+            return
+        self._release_role_capacity(p2p.destination_role, p2p.receiver_instance)
+        p2p.receiver_capacity_released = True
+
+    def _send_abort_best_effort(
+        self,
+        role: RoleType,
+        instance: int,
+        request_id: str,
+        transfer_id: str,
+        reason: str,
+    ) -> None:
+        pushes = {
+            RoleType.ENCODER: getattr(self, "_encoder_pushes", []),
+            RoleType.DENOISER: getattr(self, "_denoiser_pushes", []),
+            RoleType.DECODER: getattr(self, "_decoder_pushes", []),
+        }.get(role, [])
+        if not 0 <= instance < len(pushes):
+            return
+        abort = TransferAbortMsg(
+            request_id=request_id,
+            transfer_id=transfer_id,
+            reason=reason,
+        )
+        try:
+            pushes[instance].send_multipart(encode_transfer_msg(abort), zmq.NOBLOCK)
+        except zmq.ZMQError as exc:
+            logger.warning(
+                "DiffusionServer transfer: failed to send abort for %s to %s[%d]: %s",
+                request_id,
+                role.value,
+                instance,
+                exc,
+            )
+
+    def _fail_active_transfer(
+        self,
+        request_id: str,
+        p2p: _TransferRequestState,
+        error: str,
+        *,
+        abort_receiver: bool = True,
+    ) -> None:
+        """Fail one edge without making an active compute worker appear idle."""
+        if self._transfer_state.get(request_id) is not p2p or p2p.client_completed:
+            return
+
+        self._release_transfer_sender_capacity(p2p)
+        if p2p.source_role is not None:
+            self._send_abort_best_effort(
+                p2p.source_role,
+                p2p.sender_instance,
+                request_id,
+                p2p.transfer_id,
+                error,
+            )
+        if abort_receiver and p2p.destination_role is not None:
+            self._send_abort_best_effort(
+                p2p.destination_role,
+                p2p.receiver_instance,
+                request_id,
+                p2p.transfer_id,
+                error,
+            )
+
+        if p2p.ready_sent:
+            # The receiver may already be computing. Keep its slot quarantined
+            # until a matching DONE arrives instead of oversubscribing it.
+            p2p.client_completed = True
+        else:
+            self._release_transfer_receiver_capacity(p2p)
+            if p2p.destination_role is not None:
+                self._recycle_prealloc_slot(p2p, p2p.destination_role)
+            self._transfer_state.pop(request_id, None)
+        self._complete_with_error(request_id, error)
 
     def _handle_transfer_done(self, msg: dict, role: RoleType) -> None:
         request_id = msg.get("request_id", "")
@@ -1311,63 +1776,100 @@ class DiffusionServer:
         )
         error = msg.get("error")
         p2p = self._transfer_state.get(request_id)
+        completed_transfer_id = msg.get("completed_transfer_id", "")
+        if p2p is None and self._release_orphaned_compute_slot(request_id, role):
+            return
+        if (
+            p2p is None
+            or completed_transfer_id != p2p.transfer_id
+            or role != p2p.destination_role
+        ):
+            logger.warning(
+                "DiffusionServer transfer: stale done message for %s "
+                "(transfer=%r role=%s)",
+                request_id,
+                completed_transfer_id,
+                role.value,
+            )
+            return
+
+        self._recycle_prealloc_slot(p2p, role)
+        if p2p.client_completed:
+            self._release_transfer_receiver_capacity(p2p)
+            self._transfer_state.pop(request_id, None)
+            return
+
+        if error:
+            self._release_transfer_receiver_capacity(p2p)
+            self._transfer_state.pop(request_id, None)
+            self._complete_with_error(request_id, f"{role.value} error: {error}")
+            return
 
         if role == RoleType.DENOISER:
-            record = self._tracker.get(request_id)
-
-            if p2p is not None:
-                self._recycle_prealloc_slot(p2p, RoleType.DENOISER)
-
-            if error:
-                if record and record.denoiser_instance is not None:
-                    self._denoiser_free_slots[record.denoiser_instance] += 1
-                self._complete_with_error(request_id, f"Denoiser error: {error}")
-                return
-
             try:
                 self._tracker.transition(request_id, RequestState.DENOISING_DONE)
             except ValueError:
                 pass
 
-            if p2p is not None and msg.get("staged_for_decoder"):
-                # Denoiser slot freed later in _handle_transfer_pushed
-                p2p.sender_session_id = msg.get("session_id", "")
-                p2p.sender_pool_ptr = msg.get("pool_ptr", 0)
-                p2p.sender_slot_offset = msg.get("slot_offset", 0)
-                p2p.data_size = msg.get("data_size", 0)
-                p2p.manifest = msg.get("manifest", {})
-                p2p.scalar_fields = msg.get("scalar_fields", {})
-                p2p.sender_instance = record.denoiser_instance if record else 0
+            if not msg.get("staged_for_decoder"):
+                self._release_transfer_receiver_capacity(p2p)
+                self._transfer_state.pop(request_id, None)
+                return
 
-                try:
-                    self._tracker.transition(request_id, RequestState.DECODER_WAITING)
-                except ValueError:
-                    pass
-                self._decoder_tta.append(
-                    _RoleTTAEntry(request_id=request_id, transfer_state=p2p)
+            next_transfer_id = msg.get("transfer_id", "")
+            data_size = msg.get("data_size", 0)
+            if (
+                not isinstance(next_transfer_id, str)
+                or not next_transfer_id
+                or isinstance(data_size, bool)
+                or not isinstance(data_size, int)
+                or data_size <= 0
+                or data_size > self._max_transfer_payload_bytes
+            ):
+                self._release_transfer_receiver_capacity(p2p)
+                self._send_abort_best_effort(
+                    RoleType.DENOISER,
+                    p2p.receiver_instance,
+                    request_id,
+                    next_transfer_id,
+                    "invalid denoiser staged transfer metadata",
                 )
-            else:
-                if record and record.denoiser_instance is not None:
-                    self._denoiser_free_slots[record.denoiser_instance] += 1
+                self._transfer_state.pop(request_id, None)
+                self._complete_with_error(
+                    request_id, "invalid denoiser staged transfer metadata"
+                )
+                return
 
-        elif role == RoleType.DECODER:
-            if p2p is not None:
-                self._recycle_prealloc_slot(p2p, RoleType.DECODER)
+            next_p2p = _TransferRequestState(
+                transfer_id=next_transfer_id,
+                source_role=RoleType.DENOISER,
+                destination_role=RoleType.DECODER,
+                sender_transfer_backend=msg.get("transfer_backend", ""),
+                sender_session_id=msg.get("session_id", ""),
+                sender_pool_ptr=msg.get("pool_ptr", 0),
+                sender_slot_offset=msg.get("slot_offset", 0),
+                data_size=data_size,
+                manifest=msg.get("manifest", {}),
+                scalar_fields=msg.get("scalar_fields", {}),
+                sender_instance=p2p.receiver_instance,
+            )
+            self._transfer_state[request_id] = next_p2p
+            try:
+                self._tracker.transition(request_id, RequestState.DECODER_WAITING)
+            except ValueError:
+                pass
+            self._decoder_tta.append(
+                _RoleTTAEntry(request_id=request_id, transfer_state=next_p2p)
+            )
+            return
 
-            record = self._tracker.get(request_id)
-            if record and record.decoder_instance is not None:
-                self._decoder_free_slots[record.decoder_instance] += 1
-
-            if error:
-                self._complete_with_error(request_id, f"Decoder error: {error}")
-            else:
-                try:
-                    self._tracker.transition(request_id, RequestState.DONE)
-                except ValueError:
-                    pass
-
-                self._transfer_return_to_client_from_msg(request_id, msg)
-
+        if role == RoleType.DECODER:
+            self._release_transfer_receiver_capacity(p2p)
+            try:
+                self._tracker.transition(request_id, RequestState.DONE)
+            except ValueError:
+                pass
+            self._transfer_return_to_client_from_msg(request_id, msg)
             self._transfer_state.pop(request_id, None)
 
     def _transfer_dispatch_to_decoder(
@@ -1386,6 +1888,16 @@ class DiffusionServer:
             pass
 
         peer_info = self._decoder_peers.get(decoder_idx, {})
+        receiver_backend = peer_info.get("transfer_backend")
+        if receiver_backend and receiver_backend != p2p.sender_transfer_backend:
+            self._fail_active_transfer(
+                request_id,
+                p2p,
+                "denoiser and decoder transfer backends differ: "
+                f"{p2p.sender_transfer_backend!r} != {receiver_backend!r}",
+                abort_receiver=False,
+            )
+            return
         if not self._try_fast_path_push(
             request_id=request_id,
             p2p=p2p,

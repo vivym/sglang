@@ -45,6 +45,39 @@ class TestLaunchServerShutdown(unittest.TestCase):
         set_signal.assert_called_once_with(signal.SIGINT, signal.SIG_IGN)
         entrypoint.assert_called_once_with("worker-arg")
 
+    def test_disagg_role_forwards_scheduler_keyword_arguments(self):
+        server_args = SimpleNamespace(master_port=23456)
+        pipe_writer = object()
+        task_pipes = [object()]
+        result_pipes = [object()]
+
+        with (
+            patch.object(ls.signal, "signal") as set_signal,
+            patch.object(ls, "_run_scheduler_process_entrypoint") as entrypoint,
+        ):
+            ls._run_disagg_role_process(
+                gpu_id=3,
+                _local_rank=0,
+                rank=0,
+                server_args=server_args,
+                pipe_writer=pipe_writer,
+                task_pipes=task_pipes,
+                result_pipes=result_pipes,
+            )
+
+        set_signal.assert_called_once_with(signal.SIGINT, signal.SIG_IGN)
+        entrypoint.assert_called_once_with(
+            local_rank=3,
+            rank=0,
+            master_port=23456,
+            server_args=server_args,
+            pipe_writer=pipe_writer,
+            task_pipe_r=None,
+            result_pipe_w=None,
+            task_pipes_to_slaves=task_pipes,
+            result_pipes_from_slaves=result_pipes,
+        )
+
     def test_monolithic_shutdown_requests_scheduler_then_forces_worker(self):
         process = _FakeProcess()
         server_args = SimpleNamespace(disagg_role=RoleType.MONOLITHIC)

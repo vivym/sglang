@@ -251,6 +251,55 @@ class ComposedPipelineBase(ABC):
         """Validate whether the requested disaggregation role is supported."""
         return
 
+    def export_disagg_boundary(
+        self,
+        req: Req,
+        *,
+        source_role: RoleType,
+        destination_role: RoleType,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return model-specific tensor and scalar fields for one role edge.
+
+        Keys must use the reserved disaggregation-boundary namespace. The
+        default keeps existing pipelines on the generic ``Req`` field codec.
+        """
+        del req, source_role, destination_role
+        return {}, {}
+
+    def filter_disagg_transfer_fields(
+        self,
+        req: Req,
+        *,
+        source_role: RoleType,
+        destination_role: RoleType,
+        tensor_fields: dict[str, Any],
+        scalar_fields: dict[str, Any],
+    ) -> None:
+        """Optionally remove generic fields before adding a model boundary.
+
+        Existing pipelines retain the complete generic transfer contract. A
+        model with an explicit boundary schema can narrow that contract without
+        teaching the shared scheduler about model-specific field names.
+        """
+        del req, source_role, destination_role, tensor_fields, scalar_fields
+
+    def restore_disagg_boundary(
+        self,
+        req: Req,
+        *,
+        source_role: RoleType,
+        destination_role: RoleType,
+        tensor_fields: dict[str, Any],
+        scalar_fields: dict[str, Any],
+    ) -> None:
+        """Restore model-specific state after the generic ``Req`` rebuild."""
+        del req, source_role, destination_role
+        if tensor_fields or scalar_fields:
+            raise ValueError(
+                f"{type(self).__name__} received unsupported model-specific "
+                "disaggregation boundary fields"
+            )
+
     def _get_extra_allowed_modules_for_role(
         self, role: RoleType, task_name: str
     ) -> set[str]:

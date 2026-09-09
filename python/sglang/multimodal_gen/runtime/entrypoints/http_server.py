@@ -187,6 +187,17 @@ async def health(request: Request):
     """Report readiness for normal inference traffic."""
     if not request.app.state.server_warmup_done.is_set():
         return Response(status_code=503)
+    server_args = getattr(request.app.state, "server_args", None)
+    if server_args is not None:
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        if server_args.disagg_role == RoleType.SERVER:
+            from sglang.multimodal_gen.runtime.scheduler_client import (
+                async_scheduler_client,
+            )
+
+            if not await async_scheduler_client.disagg_registration_ready():
+                return Response(status_code=503)
     return {"status": "ok"}
 
 
@@ -321,6 +332,9 @@ def _runtime_config_for_server_info(server_args: ServerArgs) -> dict:
             "force_vae_resident": os.environ.get("MINIMAX_H3_FORCE_VAE_RESIDENT", "1"),
             "convrot_assertion": os.environ.get("MINIMAX_H3_CONVROT"),
             "latent_dump_path_template": os.environ.get("MINIMAX_H3_DUMP_LATENTS_PATH"),
+            "debug_tensor_dump_root": os.environ.get(
+                "MINIMAX_H3_DEBUG_TENSOR_DUMP_ROOT"
+            ),
             "reuse_text_embeddings": os.environ.get(
                 "MINIMAX_H3_DEBUG_REUSE_TEXT_EMBEDDINGS", "0"
             ),
@@ -439,9 +453,17 @@ async def forward_to_scheduler(
     """Forwards request to scheduler and processes the result."""
     try:
         response = await async_scheduler_client.forward(req_obj)
-        if response.output is None and response.output_file_paths is None:
+        if (
+            response.output is None
+            and response.output_file_paths is None
+            and response.media_manifest is None
+        ):
             raise RuntimeError("Model generation returned no output.")
 
+        if response.media_manifest is not None:
+            data = dict(vars(response))
+            data["output"] = None
+            return make_serializable(data)
         if response.output_file_paths:
             output_file_path = response.output_file_paths[0]
         else:

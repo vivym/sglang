@@ -130,8 +130,8 @@ class DisaggCluster:
     def __enter__(self) -> DisaggCluster:
         for attempt in range(3):
             try:
-                self._launch_roles()
                 self._launch_server_head()
+                self._launch_roles()
                 self._warmup()
                 return self
             except Exception as e:
@@ -151,14 +151,21 @@ class DisaggCluster:
 
     # -- internals -----------------------------------------------------------
 
-    def _start_proc(self, cmd: list[str], log_path: Path) -> subprocess.Popen:
+    def _start_proc(
+        self,
+        cmd: list[str],
+        log_path: Path,
+        env_overrides: dict[str, str] | None = None,
+    ) -> subprocess.Popen:
         fh = open(log_path, "w")
+        env = os.environ.copy()
+        env.update(env_overrides or {})
         proc = subprocess.Popen(
             cmd,
             stdout=fh,
             stderr=subprocess.STDOUT,
             preexec_fn=os.setsid,
-            env=os.environ.copy(),
+            env=env,
         )
         self._procs.append(proc)
         self._fhs.append(fh)
@@ -202,10 +209,6 @@ class DisaggCluster:
     def _launch_server_head(self) -> None:
         log = _LOG_DIR / f"disagg_{self.name}_server.log"
         self._logs["server"] = log
-        # Role processes register their transfer work_endpoint with the
-        # derived value ``tcp://0.0.0.0:<port>`` (see disagg_args.py). The
-        # server head must advertise the same literal so ``_handle_register``'s
-        # endpoint_to_idx exact-string match succeeds.
         cmd = [
             "sglang",
             "serve",
@@ -214,24 +217,26 @@ class DisaggCluster:
             "--disagg-role",
             "server",
             "--encoder-urls",
-            f"tcp://0.0.0.0:{self._role_ports['encoder']}",
+            f"tcp://{HOST}:{self._role_ports['encoder']}",
             "--denoiser-urls",
-            f"tcp://0.0.0.0:{self._role_ports['denoiser']}",
+            f"tcp://{HOST}:{self._role_ports['denoiser']}",
             "--decoder-urls",
-            f"tcp://0.0.0.0:{self._role_ports['decoder']}",
+            f"tcp://{HOST}:{self._role_ports['decoder']}",
             "--scheduler-port",
             str(self.base_port),
             "--port",
             str(self.api_port),
             "--host",
             HOST,
+            "--performance-mode",
+            "manual",
             "--disagg-timeout",
             "120",
             "--log-level",
             "info",
             *self.extra_role_args.get("server", []),
         ]
-        self._start_proc(cmd, log)
+        self._start_proc(cmd, log, {"CUDA_VISIBLE_DEVICES": ""})
         try:
             wait_for_server_health(
                 f"http://{HOST}:{self.api_port}",

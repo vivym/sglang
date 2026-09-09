@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.debug_tensor_dump import (
+    write_minimax_h3_debug_tensor_dump,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
 )
@@ -473,6 +476,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         self._minimax_h3_quality = "lossless"
         self._minimax_h3_cache_mode: str | None = None
 
+    def _pipeline_for_debug_dump(self):
+        return self.pipeline() if self.pipeline is not None else None
+
     def _owns_compile_warmup_lifecycle(self) -> bool:
         return True
 
@@ -745,10 +751,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             emb,
             include_video_pos=subblock_enabled,
         )
-        tags = packed["token_tags"]
-        tags[packed["text_pos"].view(-1)] = (
-            emb["text_token_tags"].view(-1).to(torch.long)
-        )
+        tags = _materialize_text_token_tags(packed, emb, device=device)
         video_query_indices = None
         if subblock_enabled:
             text_video_token_mask = emb.get("text_video_token_mask")
@@ -889,6 +892,24 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             video_rows=video_rows,
             audio_rows=audio_rows,
         )
+        debug_dump_path = write_minimax_h3_debug_tensor_dump(
+            batch=batch,
+            tensors={
+                "latents": batch.latents,
+                "audio_latents": batch.audio_latents,
+                "initial_video_rows": ctx.state["initial_video_rows"],
+                "initial_audio_rows": ctx.state["initial_audio_rows"],
+                "text_hidden_states": ctx.embeddings["positive"]["hidden_states"],
+                "refined_prompt_embeds": positive.static_kwargs["prompt_embeds"],
+            },
+            server_args=server_args,
+            pipeline=self._pipeline_for_debug_dump(),
+        )
+        if debug_dump_path is not None:
+            logger.info(
+                "Saved identity-bound MiniMax H3 debug tensors to %s",
+                debug_dump_path,
+            )
 
     def _record_cache_dit_metrics(self, model: Any, batch: Req) -> None:
         if not self._cache_dit_enabled or batch.metrics is None:
@@ -1230,6 +1251,35 @@ def _build_packed_layout(
             include_video_pos=include_video_pos,
         )
     return packed
+
+
+def _materialize_text_token_tags(
+    packed: dict[str, torch.Tensor],
+    embeddings: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Apply encoder-provided text tags using one worker-local device.
+
+    Packed structural tensors can be created under either the process default
+    device or CPU, while the explicit encoder boundary tensors are restored
+    from the transport buffer.  Normalize both the index and source values
+    before the in-place assignment so a disaggregated DiT does not depend on
+    those unrelated device choices.
+    """
+    tags = packed["token_tags"].view(-1).to(device=device, dtype=torch.long)
+    text_pos = packed["text_pos"].view(-1).to(device=device, dtype=torch.long)
+    text_tags = (
+        embeddings["text_token_tags"].view(-1).to(device=device, dtype=torch.long)
+    )
+    if text_pos.numel() != text_tags.numel():
+        raise ValueError(
+            "MiniMax H3 text token tag length does not match packed text positions"
+        )
+    tags[text_pos] = text_tags
+    packed["token_tags"] = tags
+    packed["text_pos"] = text_pos
+    return tags
 
 
 def _condition_audio_lengths(ctx: _FullLoopContext) -> list[int]:

@@ -247,6 +247,7 @@ class GenerationResult:
     trajectory_decoded: Any = None
     prompt_index: int = 0
     output_file_path: str | None = None
+    media_manifest: dict[str, Any] | None = None
 
 
 @dataclass

@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sample.sampling_params import QUALITY_LEVELS
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
@@ -373,7 +374,13 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         task = None if batch.sampling_params is None else batch.sampling_params.task
         if not isinstance(task, str) or not task.strip():
             raise ValueError("MiniMax H3 request task must be a non-empty string")
-        self.metadata.canonical_task(task)
+        canonical_task = self.metadata.canonical_task(task)
+        disagg_role = getattr(server_args, "disagg_role", RoleType.MONOLITHIC)
+        if disagg_role != RoleType.MONOLITHIC and canonical_task != "t2va":
+            raise ValueError(
+                "MiniMax H3 disaggregation boundary v1 supports text-only t2va; "
+                f"task {canonical_task!r} requires a later boundary schema"
+            )
         if batch.num_inference_steps < 2:
             raise ValueError(
                 "MiniMax H3 requires num_inference_steps >= 2 because its "

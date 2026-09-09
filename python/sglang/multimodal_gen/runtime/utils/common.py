@@ -209,6 +209,11 @@ def get_zmq_socket(
     bind: bool,
     max_bind_retries: int = 10,
     same_port: bool = False,
+    send_hwm: int | None = None,
+    recv_hwm: int | None = None,
+    send_timeout_ms: int | None = None,
+    linger_ms: int | None = None,
+    immediate: bool | None = None,
 ) -> tuple[zmq.Socket, str]:
     """
     Create and configure a ZMQ socket.
@@ -222,6 +227,11 @@ def get_zmq_socket(
         same_port: If True, retry on the same port instead of incrementing.
             Useful when the port must be fixed (e.g., disagg sockets where
             DiffusionServer connects to a pre-determined port).
+        send_hwm: Optional outbound message high-water mark.
+        recv_hwm: Optional inbound message high-water mark.
+        send_timeout_ms: Optional outbound send timeout in milliseconds.
+        linger_ms: Optional close linger timeout in milliseconds.
+        immediate: Optional ZMQ_IMMEDIATE setting for connection-oriented sockets.
 
     Returns:
         A tuple of (socket, actual_endpoint). The actual_endpoint may differ from the
@@ -235,27 +245,37 @@ def get_zmq_socket(
     else:
         buf_size = -1
 
-    socket = context.socket(socket_type)
-    if endpoint.find("[") != -1:
-        socket.setsockopt(zmq.IPV6, 1)
-
     def set_send_opt():
-        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDHWM, 0 if send_hwm is None else send_hwm)
         socket.setsockopt(zmq.SNDBUF, buf_size)
 
     def set_recv_opt():
-        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVHWM, 0 if recv_hwm is None else recv_hwm)
         socket.setsockopt(zmq.RCVBUF, buf_size)
 
-    if socket_type == zmq.PUSH:
-        set_send_opt()
-    elif socket_type == zmq.PULL:
-        set_recv_opt()
-    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP, zmq.ROUTER]:
-        set_send_opt()
-        set_recv_opt()
-    else:
-        raise ValueError(f"Unsupported socket type: {socket_type}")
+    def configure_socket() -> None:
+        if endpoint.find("[") != -1:
+            socket.setsockopt(zmq.IPV6, 1)
+
+        if socket_type == zmq.PUSH:
+            set_send_opt()
+        elif socket_type == zmq.PULL:
+            set_recv_opt()
+        elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP, zmq.ROUTER]:
+            set_send_opt()
+            set_recv_opt()
+        else:
+            raise ValueError(f"Unsupported socket type: {socket_type}")
+
+        if send_timeout_ms is not None:
+            socket.setsockopt(zmq.SNDTIMEO, send_timeout_ms)
+        if linger_ms is not None:
+            socket.setsockopt(zmq.LINGER, linger_ms)
+        if immediate is not None:
+            socket.setsockopt(zmq.IMMEDIATE, int(immediate))
+
+    socket = context.socket(socket_type)
+    configure_socket()
 
     if bind:
         # Parse port from endpoint for retry logic
@@ -307,15 +327,7 @@ def get_zmq_socket(
                         # Re-create socket since ZMQ socket state may be invalid after failed bind
                         socket.close()
                         socket = context.socket(socket_type)
-                        if endpoint.find("[") != -1:
-                            socket.setsockopt(zmq.IPV6, 1)
-                        if socket_type == zmq.PUSH:
-                            set_send_opt()
-                        elif socket_type == zmq.PULL:
-                            set_recv_opt()
-                        elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP, zmq.ROUTER]:
-                            set_send_opt()
-                            set_recv_opt()
+                        configure_socket()
                         continue
                     elif attempt == max_bind_retries - 1:
                         # Last attempt failed
