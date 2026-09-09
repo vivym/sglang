@@ -844,6 +844,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         output_metrics = self._iter_output_metrics(output_batch)
         stage_recorder = None
+        metadata_recorder = None
         if output_metrics and (
             getattr(req, "perf_dump_path", None) is not None
             or envs.SGLANG_DIFFUSION_STAGE_LOGGING
@@ -852,6 +853,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             def stage_recorder(stage_name: str, duration_s: float) -> None:
                 for metrics in output_metrics:
                     metrics.record_stage(stage_name, duration_s)
+
+            def metadata_recorder(name: str, value: Any) -> None:
+                for metrics in output_metrics:
+                    metrics.record_metadata(name, value)
 
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
@@ -870,6 +875,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
             stage_recorder=stage_recorder,
+            metadata_recorder=metadata_recorder,
         )
 
     def _can_persist_output_asynchronously(

@@ -21,7 +21,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Sequence, Union
+from pathlib import Path
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Union
 
 import imageio
 import numpy as np
@@ -53,6 +54,11 @@ logger = init_logger(__name__)
 _MAX_CACHED_CUDA_VIDEO_BUFFER_BYTES = 1024 * 1024 * 1024
 _MAX_CUDA_VIDEO_CONVERSION_CHUNK_BYTES = 128 * 1024 * 1024
 _MAX_PARALLEL_CUDA_VIDEO_SAVES = 2
+_SYSFS_ROOT = Path("/sys")
+try:
+    _INHERITED_PROCESS_CPU_AFFINITY = frozenset(os.sched_getaffinity(0))
+except (AttributeError, OSError):
+    _INHERITED_PROCESS_CPU_AFFINITY = None
 _cuda_video_buffer_cache_lock = threading.Lock()
 _cached_cuda_video_buffer: "_CudaMemfdVideoBuffer | None" = None
 
@@ -68,6 +74,19 @@ def _record_output_timing(
         stage_recorder(stage_name, duration_s)
     except Exception:
         logger.debug("Output timing recorder failed for %s", stage_name, exc_info=True)
+
+
+def _record_output_metadata(
+    metadata_recorder: Callable[[str, Any], None] | None,
+    name: str,
+    value: Any,
+) -> None:
+    if metadata_recorder is None:
+        return
+    try:
+        metadata_recorder(name, value)
+    except Exception:
+        logger.debug("Output metadata recorder failed for %s", name, exc_info=True)
 
 
 class _CudaMemfdVideoBuffer:
@@ -270,6 +289,7 @@ class MaterializedOutput:
     frames: list[Any]
     audio: Any = None
     fps: int = 0
+    video_encoder_cpu_affinity: frozenset[int] | None = None
 
 
 def normalize_output_seeds(
@@ -471,16 +491,205 @@ def _resolve_ffmpeg_exe() -> str:
     return ffmpeg_exe
 
 
-def _x264_auto_thread_count(height: int) -> int:
+def _x264_auto_thread_count(height: int, *, cpu_count: int | None = None) -> int:
     """Match x264's auto frame-thread count for progressive video."""
-    try:
-        cpu_count = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        cpu_count = os.cpu_count() or 1
+    if cpu_count is None:
+        try:
+            cpu_count = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            cpu_count = os.cpu_count() or 1
     cpu_limit = max(1, cpu_count * 3 // 2)
     macroblock_rows = max(1, (height + 15) // 16)
     row_limit = max(1, macroblock_rows // 2)
     return min(cpu_limit, row_limit, 128)
+
+
+def _video_encoder_cpu_count(cpu_affinity: frozenset[int] | None) -> int:
+    if cpu_affinity is not None:
+        return max(1, len(cpu_affinity))
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+def _parse_linux_cpu_list(value: str) -> set[int]:
+    cpus: set[int] = set()
+    for item in value.strip().split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_text, end_text = item.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            if start < 0 or end < start:
+                raise ValueError(f"invalid CPU range: {item}")
+            cpus.update(range(start, end + 1))
+        else:
+            cpu = int(item)
+            if cpu < 0:
+                raise ValueError(f"invalid CPU index: {item}")
+            cpus.add(cpu)
+    if not cpus:
+        raise ValueError("CPU list is empty")
+    return cpus
+
+
+def _format_linux_cpu_list(cpus: Iterable[int]) -> str:
+    values = sorted(set(cpus))
+    if not values:
+        return ""
+    ranges: list[str] = []
+    start = previous = values[0]
+    for cpu in values[1:]:
+        if cpu == previous + 1:
+            previous = cpu
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = cpu
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def _record_cpu_set(receipt: dict[str, Any], name: str, cpus: Iterable[int]) -> None:
+    values = frozenset(cpus)
+    receipt[name] = {
+        "count": len(values),
+        "cpulist": _format_linux_cpu_list(values),
+    }
+
+
+def _cuda_device_numa_cpu_affinity(
+    device: torch.device | str | int,
+    *,
+    receipt: dict[str, Any] | None = None,
+) -> frozenset[int] | None:
+    """Resolve CPUs local to a CUDA device without depending on NVML."""
+    if receipt is not None:
+        receipt["cuda_device"] = str(device)
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        if receipt is not None:
+            receipt["resolver_status"] = "unsupported"
+        return None
+    try:
+        properties = torch.cuda.get_device_properties(device)
+        pci_address = (
+            f"{properties.pci_domain_id:04x}:{properties.pci_bus_id:02x}:"
+            f"{properties.pci_device_id:02x}.0"
+        )
+        if receipt is not None:
+            receipt["pci_address"] = pci_address
+        numa_node = int(
+            (_SYSFS_ROOT / "bus/pci/devices" / pci_address / "numa_node")
+            .read_text(encoding="ascii")
+            .strip()
+        )
+        if receipt is not None:
+            receipt["numa_node"] = numa_node
+        if numa_node < 0:
+            if receipt is not None:
+                receipt["resolver_status"] = "numa_unavailable"
+            return None
+        local_cpus = _parse_linux_cpu_list(
+            (
+                _SYSFS_ROOT / "devices/system/node" / f"node{numa_node}" / "cpulist"
+            ).read_text(encoding="ascii")
+        )
+        current_cpus = frozenset(os.sched_getaffinity(0))
+        available_cpus = _INHERITED_PROCESS_CPU_AFFINITY or current_cpus
+        affinity = frozenset(local_cpus & available_cpus)
+        if receipt is not None:
+            _record_cpu_set(receipt, "calling_thread_cpu_affinity", current_cpus)
+            _record_cpu_set(receipt, "inherited_cpu_affinity", available_cpus)
+            _record_cpu_set(receipt, "numa_local_cpu_affinity", local_cpus)
+            _record_cpu_set(receipt, "target_cpu_affinity", affinity)
+        if not affinity:
+            if receipt is not None:
+                receipt["resolver_status"] = "empty_intersection"
+            return None
+        if affinity == current_cpus:
+            if receipt is not None:
+                receipt["resolver_status"] = "already_local"
+            return None
+        if receipt is not None:
+            receipt["resolver_status"] = "target_resolved"
+        logger.info_once(
+            f"Binding video encoding to GPU-local CPUs: pci={pci_address}, "
+            f"numa_node={numa_node}, cpu_count={len(affinity)}, "
+            f"calling_thread_cpu_count={len(current_cpus)}"
+        )
+        return affinity
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        if receipt is not None:
+            receipt["resolver_status"] = "error"
+            receipt["resolver_error_type"] = type(error).__name__
+        logger.debug(
+            "Could not resolve GPU-local CPUs for video encoding",
+            exc_info=True,
+        )
+        return None
+
+
+@contextmanager
+def _temporary_cpu_affinity(
+    cpu_affinity: frozenset[int] | None,
+    *,
+    receipt: dict[str, Any] | None = None,
+):
+    if cpu_affinity is None:
+        if receipt is not None:
+            receipt["bind_status"] = "not_requested"
+        yield
+        return
+
+    original_affinity = frozenset(os.sched_getaffinity(0))
+    if receipt is not None:
+        _record_cpu_set(receipt, "pre_bind_cpu_affinity", original_affinity)
+    allowed_affinity = _INHERITED_PROCESS_CPU_AFFINITY or original_affinity
+    target_affinity = frozenset(cpu_affinity & allowed_affinity)
+    if not target_affinity:
+        if receipt is not None:
+            receipt["bind_status"] = "empty_intersection"
+        yield
+        return
+    if target_affinity == original_affinity:
+        if receipt is not None:
+            receipt["bind_status"] = "already_bound"
+            _record_cpu_set(receipt, "bound_cpu_affinity", original_affinity)
+        yield
+        return
+
+    try:
+        os.sched_setaffinity(0, target_affinity)
+        bound_affinity = frozenset(os.sched_getaffinity(0))
+        if receipt is not None:
+            receipt["bind_status"] = "bound"
+            _record_cpu_set(receipt, "bound_cpu_affinity", bound_affinity)
+    except OSError as error:
+        if receipt is not None:
+            receipt["bind_status"] = "error"
+            receipt["bind_error_type"] = type(error).__name__
+        logger.debug("Could not bind the video encoder CPU affinity", exc_info=True)
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            os.sched_setaffinity(0, original_affinity)
+            restored_affinity = frozenset(os.sched_getaffinity(0))
+            if receipt is not None:
+                receipt["restore_status"] = "restored"
+                _record_cpu_set(receipt, "restored_cpu_affinity", restored_affinity)
+        except OSError as error:
+            if receipt is not None:
+                receipt["restore_status"] = "error"
+                receipt["restore_error_type"] = type(error).__name__
+            logger.warning(
+                "Could not restore the video encoder thread's CPU affinity",
+                exc_info=True,
+            )
 
 
 def _cuda_video_conversion_chunk_frames(video: torch.Tensor) -> int:
@@ -510,6 +719,7 @@ def _try_save_cuda_video_direct(
     audio_sample_rate: Optional[int],
     output_compression: Optional[int],
     stage_recorder: Callable[[str, float], None] | None = None,
+    metadata_recorder: Callable[[str, Any], None] | None = None,
 ) -> bool:
     """Stream CUDA RGB chunks to ffmpeg through a registered memfd."""
     if not hasattr(os, "memfd_create") or not hasattr(os, "sendfile"):
@@ -533,6 +743,25 @@ def _try_save_cuda_video_direct(
 
     _, num_frames, height, width = video.shape
     chunk_frames = _cuda_video_conversion_chunk_frames(video)
+    encoder_receipt: dict[str, Any] = {
+        "schema": "sglang.video-encoder/v1",
+        "status": "attempted",
+        "output_path": save_file_path,
+        "input": {
+            "device": str(video.device),
+            "dtype": str(video.dtype),
+            "shape": list(video.shape),
+            "stride": list(video.stride()),
+            "chunk_frames": chunk_frames,
+        },
+        "affinity": {},
+    }
+    affinity_receipt = encoder_receipt["affinity"]
+    encoder_cpu_affinity = _cuda_device_numa_cpu_affinity(
+        video.device,
+        receipt=affinity_receipt,
+    )
+    encoder_cpu_count = _video_encoder_cpu_count(encoder_cpu_affinity)
 
     quality = output_compression / 10 if output_compression is not None else 5
     if not 1 <= quality <= 10:
@@ -565,6 +794,10 @@ def _try_save_cuda_video_direct(
         audio_prepare_s = time.perf_counter() - audio_started
 
         ffmpeg_exe = _resolve_ffmpeg_exe()
+        encoder_threads = _x264_auto_thread_count(
+            height,
+            cpu_count=encoder_cpu_count,
+        )
         command = [
             ffmpeg_exe,
             "-y",
@@ -608,7 +841,10 @@ def _try_save_cuda_video_direct(
             )
             command += ["-vf", f"scale={output_width}:{output_height}"]
 
-        command += ["-threads", str(_x264_auto_thread_count(height))]
+        command += [
+            "-threads",
+            str(encoder_threads),
+        ]
         if tmp_wav_path is not None:
             command += [
                 "-acodec",
@@ -619,73 +855,97 @@ def _try_save_cuda_video_direct(
                 "1:a:0",
             ]
         command += ["-v", "warning", save_file_path]
+        encoder_receipt["ffmpeg"] = {
+            "executable": ffmpeg_exe,
+            "threads": encoder_threads,
+            "command": command,
+        }
 
-        with tempfile.TemporaryFile() as stderr_file:
-            process_started = time.perf_counter()
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_file,
-            )
-            process_start_s = time.perf_counter() - process_started
-            try:
-                if process.stdin is None:
-                    raise RuntimeError("ffmpeg stdin pipe was not created")
-                buffer_started = time.perf_counter()
-                with _acquire_cuda_video_buffer(
-                    (chunk_frames, height, width, 3)
-                ) as buffer:
-                    buffer_acquire_s = time.perf_counter() - buffer_started
-                    assert buffer.tensor is not None
-                    for start in range(0, num_frames, chunk_frames):
-                        end = min(start + chunk_frames, num_frames)
-                        with maybe_record_function(
-                            f"VIDEO_CHUNK frames {start}-{end} convert+pipe_to_x264"
-                        ):
-                            convert_started = time.perf_counter()
-                            frames = (
-                                (video[:, start:end] * 255)
-                                .clamp_(0, 255)
-                                .to(torch.uint8)
-                            )
-                            frames = frames.permute(1, 2, 3, 0).contiguous()
-                            buffer.tensor[: end - start].copy_(
-                                frames, non_blocking=True
-                            )
-                            torch.cuda.current_stream(video.device).synchronize()
-                            cuda_convert_d2h_s += (
-                                time.perf_counter() - convert_started
-                            )
-                            del frames
-                            pipe_started = time.perf_counter()
-                            _sendfile_all(
-                                process.stdin.fileno(),
-                                buffer.fd,
-                                (end - start) * height * width * 3,
-                            )
-                            pipe_write_s += time.perf_counter() - pipe_started
-                with maybe_record_function("FFMPEG_FLUSH stdin_close+wait"):
-                    flush_started = time.perf_counter()
-                    process.stdin.close()
-                    process.stdin = None
-                    returncode = process.wait()
-                    ffmpeg_flush_wait_s = time.perf_counter() - flush_started
-            finally:
-                if process.stdin is not None:
-                    process.stdin.close()
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
-            if returncode:
-                stderr_file.seek(0)
-                raise subprocess.CalledProcessError(
-                    returncode,
+        with _temporary_cpu_affinity(
+            encoder_cpu_affinity,
+            receipt=affinity_receipt,
+        ):
+            with tempfile.TemporaryFile() as stderr_file:
+                process_started = time.perf_counter()
+                process = subprocess.Popen(
                     command,
-                    stderr=stderr_file.read(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
                 )
+                process_start_s = time.perf_counter() - process_started
+                try:
+                    child_pid = process.pid
+                    affinity_receipt["child_pid"] = child_pid
+                    _record_cpu_set(
+                        affinity_receipt,
+                        "ffmpeg_child_cpu_affinity",
+                        os.sched_getaffinity(child_pid),
+                    )
+                    affinity_receipt["child_affinity_status"] = "captured"
+                except (AttributeError, OSError) as error:
+                    affinity_receipt["child_affinity_status"] = "unavailable"
+                    affinity_receipt["child_affinity_error_type"] = type(error).__name__
+                try:
+                    if process.stdin is None:
+                        raise RuntimeError("ffmpeg stdin pipe was not created")
+                    buffer_started = time.perf_counter()
+                    with _acquire_cuda_video_buffer(
+                        (chunk_frames, height, width, 3)
+                    ) as buffer:
+                        buffer_acquire_s = time.perf_counter() - buffer_started
+                        assert buffer.tensor is not None
+                        for start in range(0, num_frames, chunk_frames):
+                            end = min(start + chunk_frames, num_frames)
+                            with maybe_record_function(
+                                f"VIDEO_CHUNK frames {start}-{end} convert+pipe_to_x264"
+                            ):
+                                convert_started = time.perf_counter()
+                                frames = (
+                                    (video[:, start:end] * 255)
+                                    .clamp_(0, 255)
+                                    .to(torch.uint8)
+                                )
+                                frames = frames.permute(1, 2, 3, 0).contiguous()
+                                buffer.tensor[: end - start].copy_(
+                                    frames, non_blocking=True
+                                )
+                                torch.cuda.current_stream(video.device).synchronize()
+                                cuda_convert_d2h_s += (
+                                    time.perf_counter() - convert_started
+                                )
+                                del frames
+                                pipe_started = time.perf_counter()
+                                _sendfile_all(
+                                    process.stdin.fileno(),
+                                    buffer.fd,
+                                    (end - start) * height * width * 3,
+                                )
+                                pipe_write_s += time.perf_counter() - pipe_started
+                    with maybe_record_function("FFMPEG_FLUSH stdin_close+wait"):
+                        flush_started = time.perf_counter()
+                        process.stdin.close()
+                        process.stdin = None
+                        returncode = process.wait()
+                        ffmpeg_flush_wait_s = time.perf_counter() - flush_started
+                finally:
+                    if process.stdin is not None:
+                        process.stdin.close()
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                if returncode:
+                    stderr_file.seek(0)
+                    raise subprocess.CalledProcessError(
+                        returncode,
+                        command,
+                        stderr=stderr_file.read(),
+                    )
+        encoder_receipt["status"] = "success"
         return True
-    except Exception:
+    except Exception as error:
+        encoder_receipt["status"] = "fallback"
+        encoder_receipt["error_type"] = type(error).__name__
         logger.warning_once(
             "Direct CUDA video save failed; falling back to imageio. "
             "Enable debug logging for exception details."
@@ -693,6 +953,8 @@ def _try_save_cuda_video_direct(
         logger.debug("Direct CUDA video save failure", exc_info=True)
         return False
     finally:
+        if encoder_receipt["status"] == "attempted":
+            encoder_receipt["status"] = "fallback"
         for stage_name, duration_s in (
             ("OutputSave.direct.audio_prepare", audio_prepare_s),
             ("OutputSave.direct.process_start", process_start_s),
@@ -703,6 +965,15 @@ def _try_save_cuda_video_direct(
             ("OutputSave.direct.total", time.perf_counter() - direct_started),
         ):
             _record_output_timing(stage_recorder, stage_name, duration_s)
+        _record_output_metadata(
+            metadata_recorder,
+            "video_encoder",
+            encoder_receipt,
+        )
+        logger.info(
+            "SGLANG_VIDEO_ENCODER_RECEIPT %s",
+            json.dumps(encoder_receipt, sort_keys=True),
+        )
         if tmp_wav_path:
             try:
                 os.remove(tmp_wav_path)
@@ -759,12 +1030,13 @@ def _try_save_cuda_videos_direct(
         return None
     if sum(temporary_bytes) > int(free_bytes) // 4:
         return None
-    try:
-        available_cpus = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        available_cpus = os.cpu_count() or 1
+    encoder_cpu_affinity = _cuda_device_numa_cpu_affinity(videos[0].device)
+    available_cpus = _video_encoder_cpu_count(encoder_cpu_affinity)
     encoder_threads = sorted(
-        (_x264_auto_thread_count(int(video.shape[-2])) for video in videos),
+        (
+            _x264_auto_thread_count(int(video.shape[-2]), cpu_count=available_cpus)
+            for video in videos
+        ),
         reverse=True,
     )[:_MAX_PARALLEL_CUDA_VIDEO_SAVES]
     if sum(encoder_threads) > available_cpus:
@@ -1087,6 +1359,14 @@ def materialize_output_sample(
 ) -> MaterializedOutput:
     """materialize samples, apply postprocessing if applicable"""
     sample_without_audio, audio = _split_sample_audio(sample)
+    video_encoder_cpu_affinity = None
+    if (
+        isinstance(sample_without_audio, torch.Tensor)
+        and sample_without_audio.device.type == "cuda"
+    ):
+        video_encoder_cpu_affinity = _cuda_device_numa_cpu_affinity(
+            sample_without_audio.device
+        )
     frames = _sample_to_uint8_frames(sample_without_audio)
 
     # frames are uint8 numpy arrays in THWC format at this point
@@ -1112,7 +1392,13 @@ def materialize_output_sample(
             scale=upscaling_scale,
         )
 
-    return MaterializedOutput(sample=sample, frames=frames, audio=audio, fps=fps)
+    return MaterializedOutput(
+        sample=sample,
+        frames=frames,
+        audio=audio,
+        fps=fps,
+        video_encoder_cpu_affinity=video_encoder_cpu_affinity,
+    )
 
 
 def save_materialized_output(
@@ -1132,34 +1418,35 @@ def save_materialized_output(
 
     os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
     if data_type == DataType.VIDEO:
-        quality = output_compression / 10 if output_compression is not None else 5
-        output_format = data_type.get_default_extension()
-        saved_with_audio = _try_save_video_with_audio(
-            save_file_path=save_file_path,
-            frames=materialized.frames,
-            fps=materialized.fps,
-            audio=materialized.audio,
-            audio_sample_rate=audio_sample_rate,
-            output_format=output_format,
-            quality=quality,
-        )
-        if not saved_with_audio:
-            imageio.mimsave(
-                save_file_path,
-                materialized.frames,
-                fps=materialized.fps,
-                format=output_format,
-                codec="libx264",
-                quality=quality,
-            )
-
-            _maybe_mux_audio_into_mp4(
+        with _temporary_cpu_affinity(materialized.video_encoder_cpu_affinity):
+            quality = output_compression / 10 if output_compression is not None else 5
+            output_format = data_type.get_default_extension()
+            saved_with_audio = _try_save_video_with_audio(
                 save_file_path=save_file_path,
-                audio=materialized.audio,
                 frames=materialized.frames,
                 fps=materialized.fps,
+                audio=materialized.audio,
                 audio_sample_rate=audio_sample_rate,
+                output_format=output_format,
+                quality=quality,
             )
+            if not saved_with_audio:
+                imageio.mimsave(
+                    save_file_path,
+                    materialized.frames,
+                    fps=materialized.fps,
+                    format=output_format,
+                    codec="libx264",
+                    quality=quality,
+                )
+
+                _maybe_mux_audio_into_mp4(
+                    save_file_path=save_file_path,
+                    audio=materialized.audio,
+                    frames=materialized.frames,
+                    fps=materialized.fps,
+                    audio_sample_rate=audio_sample_rate,
+                )
     else:
         quality = output_compression if output_compression is not None else 75
         if len(materialized.frames) > 1:
@@ -1213,6 +1500,7 @@ def save_outputs(
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
     stage_recorder: Callable[[str, float], None] | None = None,
+    metadata_recorder: Callable[[str, Any], None] | None = None,
 ) -> list[str]:
     output_paths: list[str] = []
     samples = (
@@ -1277,6 +1565,9 @@ def save_outputs(
                         audio_sample_rate=audio_sample_rate,
                         output_compression=output_compression,
                         stage_recorder=(stage_recorder if len(outputs) == 1 else None),
+                        metadata_recorder=(
+                            metadata_recorder if len(outputs) == 1 else None
+                        ),
                     )
                 if direct_saved:
                     if samples_out is not None:

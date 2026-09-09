@@ -123,6 +123,48 @@ def test_worker_records_output_and_total_through_output_timings(monkeypatch):
     assert metrics.stages["GPUWorker.total_through_output"] >= metrics.total_duration_ms
 
 
+def test_worker_records_video_encoder_metadata(monkeypatch, tmp_path):
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.is_output_rank = True
+    worker.server_args = SimpleNamespace(scheduler_endpoint="tcp://127.0.0.1:30000")
+    worker._output_persistence_executor = None
+    worker._output_persistence_slots = None
+    metrics = RequestMetrics("request")
+    output = OutputBatch(output=[torch.zeros((3, 1, 2, 2))], metrics=metrics)
+    request = SimpleNamespace(
+        data_type=gpu_worker_module.DataType.VIDEO,
+        fps=24,
+        extra={},
+        perf_dump_path="metrics.json",
+        output_compression=None,
+        enable_frame_interpolation=False,
+        frame_interpolation_exp=1,
+        frame_interpolation_scale=1.0,
+        frame_interpolation_model_path=None,
+        enable_upscaling=False,
+        upscaling_model_path=None,
+        upscaling_scale=4,
+        output_file_path=lambda _count, _index: str(tmp_path / "output.mp4"),
+    )
+
+    def save_outputs_spy(*_args, metadata_recorder=None, **_kwargs):
+        assert metadata_recorder is not None
+        metadata_recorder(
+            "video_encoder",
+            {"schema": "sglang.video-encoder/v1", "status": "success"},
+        )
+        return [str(tmp_path / "output.mp4")]
+
+    monkeypatch.setattr(gpu_worker_module, "save_outputs", save_outputs_spy)
+
+    worker._save_output_paths(request, output)
+
+    assert metrics.metadata["video_encoder"] == {
+        "schema": "sglang.video-encoder/v1",
+        "status": "success",
+    }
+
+
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
     path = tmp_path / "baseline.json"
     path.write_text(
